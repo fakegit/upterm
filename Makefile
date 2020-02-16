@@ -11,6 +11,10 @@ docs:
 
 proto:
 	protoc \
+		-I redislistener \
+		--go_out=plugins=grpc:redislistener \
+		./redislistener/model.proto
+	protoc \
 		-I host/api \
 		-I $$(go env GOPATH)/src/github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis \
 		--go_out=plugins=grpc:host/api \

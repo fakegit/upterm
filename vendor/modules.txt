@@ -71,6 +71,8 @@ github.com/go-openapi/swag
 github.com/go-openapi/validate
 # github.com/go-stack/stack v1.8.0
 github.com/go-stack/stack
+# github.com/go4org/go4 v0.0.0-20200104003542-c7e774b10ea0
+github.com/go4org/go4/syncutil
 # github.com/golang/protobuf v1.3.2
 github.com/golang/protobuf/descriptor
 github.com/golang/protobuf/jsonpb
@@ -94,6 +96,10 @@ github.com/google/shlex
 github.com/grpc-ecosystem/grpc-gateway/internal
 github.com/grpc-ecosystem/grpc-gateway/runtime
 github.com/grpc-ecosystem/grpc-gateway/utilities
+# github.com/hashicorp/errwrap v1.0.0
+github.com/hashicorp/errwrap
+# github.com/hashicorp/go-multierror v1.0.0
+github.com/hashicorp/go-multierror
 # github.com/heroku/rollrus v0.1.1
 github.com/heroku/rollrus
 # github.com/inconshreveable/mousetrap v1.0.0
@@ -114,6 +120,12 @@ github.com/mailru/easyjson/jwriter
 github.com/mattn/go-runewidth
 # github.com/matttproud/golang_protobuf_extensions v1.0.1
 github.com/matttproud/golang_protobuf_extensions/pbutil
+# github.com/mediocregopher/radix/v3 v3.4.2
+github.com/mediocregopher/radix/v3
+github.com/mediocregopher/radix/v3/internal/bytesutil
+github.com/mediocregopher/radix/v3/resp
+github.com/mediocregopher/radix/v3/resp/resp2
+github.com/mediocregopher/radix/v3/trace
 # github.com/mitchellh/mapstructure v1.1.2
 github.com/mitchellh/mapstructure
 # github.com/oklog/run v1.0.0
@@ -184,6 +196,9 @@ golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
 golang.org/x/text/width
+# golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898
+golang.org/x/xerrors
+golang.org/x/xerrors/internal
 # google.golang.org/genproto v0.0.0-20191206224255-0243a4be9c8f
 google.golang.org/genproto/googleapis/api/annotations
 google.golang.org/genproto/googleapis/api/httpbody

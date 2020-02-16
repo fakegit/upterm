@@ -15,3 +15,6 @@ jobs:
     - stage: test
       name: Docker Build
       script: make docker_build
+
+services:
+  - redis-server

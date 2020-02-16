@@ -16,12 +16,15 @@ require (
 	github.com/go-openapi/runtime v0.19.5
 	github.com/go-openapi/strfmt v0.19.3
 	github.com/go-openapi/swag v0.19.5
+	github.com/go4org/go4 v0.0.0-20200104003542-c7e774b10ea0
 	github.com/golang/protobuf v1.3.2
 	github.com/google/go-cmp v0.3.1
 	github.com/google/shlex v0.0.0-20181106134648-c34317bd91bf
 	github.com/grpc-ecosystem/grpc-gateway v1.12.1
+	github.com/hashicorp/go-multierror v1.0.0
 	github.com/heroku/rollrus v0.1.1
 	github.com/influxdata/influxdb1-client v0.0.0-20191209144304-8bf82d3c094d // indirect
+	github.com/mediocregopher/radix/v3 v3.4.2
 	github.com/oklog/run v1.0.0
 	github.com/olekukonko/tablewriter v0.0.4
 	github.com/pborman/ansi v0.0.0-20160920233902-86f499584b0a
@@ -31,11 +34,13 @@ require (
 	github.com/sirupsen/logrus v1.4.2
 	github.com/spf13/cobra v0.0.5
 	github.com/spf13/pflag v1.0.5 // indirect
+	go4.org v0.0.0-20200104003542-c7e774b10ea0 // indirect
 	golang.org/x/crypto v0.0.0-20191029031824-8986dd9e96cf
 	golang.org/x/net v0.0.0-20191209160850-c0dbc17a3553 // indirect
 	golang.org/x/sys v0.0.0-20200117145432-59e60aa80a0c // indirect
 	google.golang.org/genproto v0.0.0-20191206224255-0243a4be9c8f
 	google.golang.org/grpc v1.25.1
+	gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15 // indirect
 	gopkg.in/yaml.v2 v2.2.7 // indirect
 )
 
