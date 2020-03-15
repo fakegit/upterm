@@ -187,7 +187,7 @@ func (s *Server) start() error {
 		Logger:          logger,
 	}
 
-	return s.Server.ServeWithContext(context.Background(), s.sshln, s.wsln)
+	return s.Server.ServeWithContext(context.Background(), s.sshln, s.wsln, nil)
 }
 
 func (s *Server) SSHAddr() string {

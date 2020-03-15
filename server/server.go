@@ -28,6 +28,8 @@ type DialNodeAddrFunc func(id api.Identifier) (net.Conn, error)
 type Opt struct {
 	SSHAddr    string
 	WSAddr     string
+	WSSAddr    string
+	WSSHost    string
 	KeyFiles   []string
 	Network    string
 	NetworkOpt []string
@@ -35,6 +37,10 @@ type Opt struct {
 }
 
 func Start(opt Opt) error {
+	if opt.WSSAddr != "" && opt.WSSHost == "" {
+		return fmt.Errorf("missing wss host name for wss address %s", opt.WSAddr)
+	}
+
 	network := networks.Get(opt.Network)
 	if network == nil {
 		return fmt.Errorf("unsupport network provider %q", opt.Network)
@@ -58,10 +64,14 @@ func Start(opt Opt) error {
 	if nodeAddr == "" {
 		nodeAddr = opt.WSAddr
 	}
+	if nodeAddr == "" {
+		nodeAddr = opt.WSSAddr
+	}
 
 	var (
 		sshln net.Listener
 		wsln  net.Listener
+		wssln net.Listener
 	)
 
 	if opt.SSHAddr != "" {
@@ -73,6 +83,13 @@ func Start(opt Opt) error {
 
 	if opt.WSAddr != "" {
 		wsln, err = net.Listen("tcp", opt.WSAddr)
+		if err != nil {
+			return err
+		}
+	}
+
+	if opt.WSSAddr != "" {
+		wssln, err = net.Listen("tcp", opt.WSSAddr)
 		if err != nil {
 			return err
 		}
@@ -99,6 +116,7 @@ func Start(opt Opt) error {
 		}
 
 		s := &Server{
+			WSSHost:          opt.WSSHost,
 			NodeAddr:         nodeAddr,
 			HostSigners:      signers,
 			NetworkProvider:  network,
@@ -107,7 +125,7 @@ func Start(opt Opt) error {
 			MetricsProvider:  mp,
 		}
 		g.Add(func() error {
-			return s.ServeWithContext(context.Background(), sshln, wsln)
+			return s.ServeWithContext(context.Background(), sshln, wsln, wssln)
 		}, func(err error) {
 			s.Shutdown()
 		})
@@ -135,6 +153,7 @@ func parseNetworkOpt(opts []string) NetworkOptions {
 }
 
 type Server struct {
+	WSSHost          string
 	NodeAddr         string
 	HostSigners      []ssh.Signer
 	NetworkProvider  NetworkProvider
@@ -144,6 +163,7 @@ type Server struct {
 
 	sshln net.Listener
 	wsln  net.Listener
+	wssln net.Listener
 
 	mux    sync.Mutex
 	ctx    context.Context
@@ -167,9 +187,9 @@ func (s *Server) Shutdown() {
 	}
 }
 
-func (s *Server) ServeWithContext(ctx context.Context, sshln net.Listener, wsln net.Listener) error {
+func (s *Server) ServeWithContext(ctx context.Context, sshln net.Listener, wsln net.Listener, wssln net.Listener) error {
 	s.mux.Lock()
-	s.sshln, s.wsln = sshln, wsln
+	s.sshln, s.wsln, s.wssln = sshln, wsln, wssln
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.mux.Unlock()
 
@@ -216,6 +236,19 @@ func (s *Server) ServeWithContext(ctx context.Context, sshln net.Listener, wsln 
 			}
 			g.Add(func() error {
 				return ws.Serve(wsln)
+			}, func(err error) {
+				_ = ws.Shutdown()
+			})
+		}
+	}
+	{
+		if wssln != nil {
+			ws := &WebSocketProxy{
+				ConnDialer: cd,
+				Logger:     s.Logger.WithField("componet", "wss-proxy"),
+			}
+			g.Add(func() error {
+				return ws.ServeTLS(wssln, s.WSSHost)
 			}, func(err error) {
 				_ = ws.Shutdown()
 			})

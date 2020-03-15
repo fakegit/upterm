@@ -15,6 +15,7 @@ import (
 	"github.com/jingweno/upterm/ws"
 	"github.com/oklog/run"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 type WebSocketProxy struct {
@@ -36,6 +37,25 @@ func (s *WebSocketProxy) Serve(ln net.Listener) error {
 	s.mux.Unlock()
 
 	return s.srv.Serve(ln)
+}
+
+func (s *WebSocketProxy) ServeTLS(ln net.Listener, host string) error {
+	s.mux.Lock()
+	m := &autocert.Manager{
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(host),
+		Cache:      autocert.DirCache("."), // TODO: a new dir
+	}
+	s.srv = &http.Server{
+		Handler: m.HTTPHandler(&wsHandler{
+			ConnDialer: s.ConnDialer,
+			Logger:     s.Logger,
+		}),
+		TLSConfig: m.TLSConfig(),
+	}
+	s.mux.Unlock()
+
+	return s.srv.ServeTLS(ln, "", "")
 }
 
 func (s *WebSocketProxy) Shutdown() error {
