@@ -1,0 +1,1102 @@
+package command
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/owenthereal/upterm/cmd/upterm/command/internal/bootstrap"
+	"github.com/owenthereal/upterm/host"
+	"github.com/owenthereal/upterm/host/api"
+	"github.com/owenthereal/upterm/host/sessiondir"
+	"github.com/owenthereal/upterm/internal/registration"
+	"github.com/owenthereal/upterm/internal/testhelpers/fakerelay"
+	"github.com/owenthereal/upterm/internal/version"
+	"github.com/owenthereal/upterm/server"
+	"github.com/owenthereal/upterm/utils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
+	"google.golang.org/protobuf/proto"
+)
+
+// daemonTestRoots points the session directories at a socket-safe temp root,
+// and flagKnownHostsFilename at a file under it. Production always reaches
+// buildDaemonHost through hostCmd(), whose flag registration gives that
+// global a real default; a unit test that calls runDaemonProcess directly
+// never runs that registration; without this, the relay key check's
+// createFileIfNotExist("") fails every case here with "open : no such file
+// or directory".
+//
+// It also resets suppliedFlags: a real daemon is a fresh process, whose own
+// Root().Execute() populates that package var from its own os.Args before
+// shareRunE ever runs. These tests call runDaemonProcess directly, bypassing
+// Root() entirely, so nothing here ever sets it — it is whatever the last
+// cobra command executed in this test binary left behind. At -count=1 that
+// is always the zero value, since daemon_test.go sorts before host_test.go
+// and nothing runs first; at -count=2 or higher, a later iteration
+// otherwise inherits Test_hostCmd_*'s leftover flags and authorizationRequested
+// spuriously refuses every one of these sessions.
+func daemonTestRoots(t *testing.T) {
+	t.Helper()
+	root := "/tmp"
+	if runtime.GOOS == "windows" {
+		root = ""
+	}
+	dir, err := os.MkdirTemp(root, "up")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("XDG_STATE_HOME", dir)
+
+	origKnownHosts := flagKnownHostsFilename
+	flagKnownHostsFilename = filepath.Join(dir, "known_hosts")
+	t.Cleanup(func() { flagKnownHostsFilename = origKnownHosts })
+
+	origSupplied, origCommandLine := suppliedFlags, commandLineFlags
+	suppliedFlags, commandLineFlags = map[string]bool{}, map[string]bool{}
+	t.Cleanup(func() { suppliedFlags, commandLineFlags = origSupplied, origCommandLine })
+
+	// The developer's own SSH identities stay out of it. hostCmd resets
+	// --private-key to whichever ~/.ssh files exist, and with no agent to
+	// hold an encrypted one, building the daemon's host asks the parent for
+	// its passphrase over a pipe nobody reads: the test hangs. With no key
+	// listed and no agent, the daemon generates one. A test about
+	// identities sets its own after this.
+	t.Setenv("SSH_AUTH_SOCK", "")
+	origKeys := flagPrivateKeys
+	flagPrivateKeys = nil
+	t.Cleanup(func() { flagPrivateKeys = origKeys })
+}
+
+// readyPublishGap is how long fakeRun leaves between the command starting
+// and the record saying ready.
+//
+// The real Host has that gap for real: the command's start is one of the two
+// facts readiness is made of, and the readiness actor writes the record only
+// once it has both. Modelled here rather than left to chance so that
+// TestRunDaemonProcessSpeaksTheExchange pins the order of the two rather
+// than which goroutine happened to run first — a daemon that told its parent
+// "started" from CommandStartedCallback would still be caught by the record
+// read, and be caught every time.
+const readyPublishGap = 100 * time.Millisecond
+
+// fakeRun stands in for Host.Run: it drives the callbacks the exchange is
+// wired to, in the order Run calls them, against a directory it claims for
+// real so SessionClaimedCallback has something to report — including the
+// ready record, which the readiness actor writes before it calls back and
+// which is therefore part of the order.
+//
+// It runs on runDaemonProcess's own goroutine, not the test's, so a failed
+// require here would call t.FailNow off the test goroutine and hang the
+// test on <-done instead of failing it; assert.NoError plus an explicit
+// return surfaces the failure through runDaemonProcess's own return value.
+func fakeRun(t *testing.T, sessionID string, result error) func(context.Context, *host.Host) error {
+	return func(ctx context.Context, h *host.Host) error {
+		if errors.Is(result, sessiondir.ErrNameInUse) {
+			return result
+		}
+		dir, err := sessiondir.Claim(ctx, sessiondir.ClaimOptions{
+			RuntimeRoot: utils.UptermRuntimeDir(), StateRoot: utils.UptermStateDir(),
+			Name: h.Name, Command: h.Command,
+		})
+		assert.NoError(t, err)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = dir.Release(context.Background()) }()
+		if h.SessionClaimedCallback != nil {
+			h.SessionClaimedCallback(dir)
+		}
+		if h.SessionCreatedCallback != nil {
+			if err := h.SessionCreatedCallback(ctx, &api.GetSessionResponse{SessionId: sessionID, Host: "ssh://127.0.0.1:2222", NodeAddr: "127.0.0.1:2222", Command: h.Command}); err != nil {
+				return err
+			}
+		}
+		if h.AttachListeningCallback != nil {
+			h.AttachListeningCallback(dir.AttachSocket())
+		}
+		if result != nil {
+			return result
+		}
+		if h.CommandStartedCallback != nil {
+			h.CommandStartedCallback()
+		}
+		time.Sleep(readyPublishGap)
+		// The status is read back out of the record rather than assumed, as
+		// the readiness actor reads it back out of the mutation it ran: what
+		// the callback carries is what a reader would find.
+		published := ""
+		err = dir.Update(func(r *sessiondir.Record) {
+			r.SessionID = sessionID
+			r.Status = sessiondir.StatusReady
+			published = r.Status
+		})
+		assert.NoError(t, err)
+		if err != nil {
+			return err
+		}
+		if h.SessionReadyCallback != nil {
+			h.SessionReadyCallback(published)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+			return nil
+		}
+	}
+}
+
+func testHostOptions() hostOptions {
+	return hostOptions{command: []string{"sh"}, term: "xterm"}
+}
+
+func TestRunDaemonProcessSpeaksTheExchange(t *testing.T) {
+	daemonTestRoots(t)
+	a, b := net.Pipe()
+	defer func() { _ = a.Close() }()
+	parent := bootstrap.NewParent(b, nil, io.Discard, nil)
+
+	var claimed *api.Claimed
+	var listening *api.Listening
+	var doorKey ssh.PublicKey
+	run := fakeRun(t, "sid-1", nil)
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonProcess(context.Background(), discardLogger(), testHostOptions(), a, "daemon-1",
+			func(ctx context.Context, h *host.Host) error {
+				// What the embedded sshd will present on the attach door.
+				if h.HostKey != nil {
+					doorKey = h.HostKey.PublicKey()
+				}
+				return run(ctx, h)
+			})
+	}()
+	out, err := parent.Run(context.Background(), bootstrap.Handlers{
+		Claimed:   func(c *api.Claimed) { claimed = c },
+		Listening: func(l *api.Listening) { listening = l },
+	})
+	require.NoError(t, err)
+
+	// Read here, before the daemon is waited for, because this is the record
+	// as it stood at the moment the parent was told the session had started
+	// -- which is the moment `upterm host --detach -o json` prints "status":
+	// "ready" and exits, and the moment the script it printed to runs
+	// `upterm session info`. Told started off the command alone, the daemon
+	// would be answering for a record that still said starting.
+	atStarted, err := sessiondir.ReadRecord(utils.UptermStateDir(), "daemon-1")
+	require.NoError(t, err)
+	require.NotNil(t, atStarted)
+	require.Equal(t, sessiondir.StatusReady, atStarted.Status,
+		"the parent is told started only once the record it will be read against says ready")
+	require.Equal(t, "sid-1", atStarted.SessionID,
+		"and carries the session ID, which is published by the same write")
+
+	require.NoError(t, <-done)
+	require.NotNil(t, out.Started)
+	require.Equal(t, "sid-1", out.Started.SessionId)
+	require.Equal(t, atStarted.Status, out.Started.Status,
+		"the parent is told the status the record carries, which is what it prints")
+	require.NotNil(t, claimed)
+	require.Equal(t, "daemon-1", claimed.Name)
+	require.NotEmpty(t, claimed.LaunchId)
+	require.Equal(t, int32(os.Getpid()), claimed.Pid)
+	require.Equal(t, utils.UptermLogFilePath(), claimed.LogPath)
+	require.NotNil(t, listening)
+	require.Equal(t, claimed.AttachSocket, listening.AttachSocket)
+	// Not merely non-empty: the parent pins whatever this names, and the
+	// door presents the session host key — never the --private-key signers,
+	// which authenticate the tunnel and nothing else. Reporting the signers
+	// leaves the parent unable to attach to its own session.
+	require.NotNil(t, doorKey, "the daemon must set the host key it reports")
+	require.Equal(t,
+		[]string{strings.TrimSuffix(string(ssh.MarshalAuthorizedKey(doorKey)), "\n")},
+		listening.HostKeys,
+		"the parent pins the door's session host key")
+
+	rec, err := sessiondir.ReadRecord(utils.UptermStateDir(), "daemon-1")
+	require.NoError(t, err)
+	require.Equal(t, utils.UptermLogFilePath(), rec.LogPath, "published for readers under another state root")
+}
+
+func TestRunDaemonProcessReportsANameInUse(t *testing.T) {
+	daemonTestRoots(t)
+	a, b := net.Pipe()
+	defer func() { _ = a.Close() }()
+	parent := bootstrap.NewParent(b, nil, io.Discard, nil)
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonProcess(context.Background(), discardLogger(), testHostOptions(), a, "taken", fakeRun(t, "", sessiondir.ErrNameInUse))
+	}()
+	out, err := parent.Run(context.Background(), bootstrap.Handlers{})
+	require.NoError(t, err)
+	require.ErrorIs(t, <-done, sessiondir.ErrNameInUse)
+	require.NotNil(t, out.Failed)
+	require.True(t, out.Failed.NameInUse)
+}
+
+// TestRunDaemonReportsAnArgumentItCannotParse pins the one failure that used
+// to be silent. A daemon whose own argv does not parse never reached
+// runDaemonProcess, so nothing was ever sent, and the parent saw its end of
+// the channel close and reported the daemon as gone rather than the reason.
+// Unreachable in practice -- the parent parsed the same argv before it
+// spawned anything -- but a failure shape that only holds while a caller
+// stays correct is not a shape.
+func TestRunDaemonReportsAnArgumentItCannotParse(t *testing.T) {
+	daemonTestRoots(t)
+
+	// Two characters where parseEscapeChar wants one, which is the cheapest
+	// way to make parseHostOptions fail without touching the arguments the
+	// session would run.
+	orig := flagHostEscapeChar
+	flagHostEscapeChar = "xy"
+	t.Cleanup(func() { flagHostEscapeChar = orig })
+	// parseHostOptions reads this one first, so a bad URL left behind by
+	// another test would fail the daemon on an error this case is not about.
+	// The assertion below names --escape-char and would catch it, but loudly
+	// failing for the wrong reason is still a worse test than not being able
+	// to.
+	origProxy := flagProxy
+	flagProxy = ""
+	t.Cleanup(func() { flagProxy = origProxy })
+
+	a, b := net.Pipe()
+	defer func() { _ = a.Close() }()
+	parent := bootstrap.NewParent(b, nil, io.Discard, nil)
+	done := make(chan error, 1)
+	go func() {
+		err := runDaemon(context.Background(), discardLogger(), nil, nil, []string{"sh"}, a, "bad-args")
+		// A real daemon's process exits here, and that is what closes its end
+		// of the channel. net.Pipe has to be told, and it matters: without
+		// it, a daemon that sent nothing leaves the parent waiting on a
+		// message that will never come, so the regression this test guards
+		// would hang the package instead of failing it.
+		_ = a.Close()
+		done <- err
+	}()
+	out, err := parent.Run(context.Background(), bootstrap.Handlers{})
+	require.NoError(t, err, "the parent read the reason, not the end of the connection")
+
+	daemonErr := <-done
+	require.ErrorContains(t, daemonErr, "--escape-char")
+	require.NotNil(t, out.Failed, "the parent has to be told why, not left to read EOF as the daemon going away")
+	require.Equal(t, daemonErr.Error(), out.Failed.Error,
+		"the message the parent prints is the daemon's own reason, unaltered")
+	require.False(t, out.Failed.NameInUse)
+	require.False(t, out.Failed.Abandoned)
+}
+
+func TestRunDaemonProcessMapsTheDecision(t *testing.T) {
+	for _, tc := range []struct {
+		dec   api.Accept_Decision
+		check func(*testing.T, error)
+	}{
+		{api.Accept_DECLINED, func(t *testing.T, err error) {
+			var want UserDiscardedError
+			require.ErrorAs(t, err, &want)
+		}},
+		{api.Accept_INTERRUPTED, func(t *testing.T, err error) {
+			var want UserInterruptedError
+			require.ErrorAs(t, err, &want)
+			// What shareRunE makes of it in the daemon: no word, status 130.
+			var stderr bytes.Buffer
+			require.Equal(t, exitInterrupted, Exit(nil, mapUserAction(nil, err), &stderr))
+			require.Empty(t, stderr.String())
+		}},
+	} {
+		t.Run(tc.dec.String(), func(t *testing.T) {
+			daemonTestRoots(t)
+			a, b := net.Pipe()
+			defer func() { _ = a.Close() }()
+			parent := bootstrap.NewParent(b, nil, io.Discard, nil)
+			done := make(chan error, 1)
+			go func() {
+				done <- runDaemonProcess(context.Background(), discardLogger(), testHostOptions(), a, "d", fakeRun(t, "sid", nil))
+			}()
+			out, err := parent.Run(context.Background(), bootstrap.Handlers{
+				SessionCreated: func(*api.GetSessionResponse) api.Accept_Decision { return tc.dec },
+			})
+			require.NoError(t, err)
+			runErr := <-done
+			tc.check(t, runErr)
+			require.ErrorIs(t, runErr, host.ErrSessionAbandoned)
+			require.NotNil(t, out.Failed)
+			require.True(t, out.Failed.Abandoned)
+		})
+	}
+}
+
+func TestRunDaemonProcessAbandonsWhenTheParentLeavesEarly(t *testing.T) {
+	daemonTestRoots(t)
+	a, b := net.Pipe()
+	defer func() { _ = a.Close() }()
+	var runCtx context.Context
+	entered := make(chan struct{})
+	run := func(ctx context.Context, h *host.Host) error {
+		runCtx = ctx
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonProcess(context.Background(), discardLogger(), testHostOptions(), a, "d", run)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run was never called; buildDaemonHost likely failed")
+	}
+	require.NoError(t, b.Close())
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled, "the run was cancelled when the parent left")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the daemon did not stop when its parent left")
+	}
+	require.ErrorIs(t, context.Cause(runCtx), host.ErrSessionAbandoned)
+}
+
+// TestRunDaemonProcessIgnoresTheParentLeavingAfterStart pins that Disarm
+// beats the parent's departure. It closes the parent's end the instant
+// parent.Run reports Started — with no wait for the daemon's own
+// SessionReadyCallback to have returned, since a real parent process has
+// no way to wait for that either — so a Disarm that ran after Started
+// (rather than before) would race this close and show up here, at least
+// intermittently.
+//
+// cause is read from inside run, at the instant it decides not to abandon,
+// rather than from outside after runDaemonProcess has returned: its own
+// deferred cancel(nil) cancels the context on the way out regardless of
+// outcome (context.CancelCauseFunc treats a nil cause as context.Canceled),
+// so a check made after <-done would see that cleanup cancellation and not
+// the abandonment question this test asks.
+func TestRunDaemonProcessIgnoresTheParentLeavingAfterStart(t *testing.T) {
+	daemonTestRoots(t)
+	a, b := net.Pipe()
+	defer func() { _ = a.Close() }()
+	parent := bootstrap.NewParent(b, nil, io.Discard, nil)
+	var cause error
+	run := func(ctx context.Context, h *host.Host) error {
+		inner := fakeRun(t, "sid", nil)
+		_ = inner(ctx, h)
+		select {
+		case <-ctx.Done():
+			cause = context.Cause(ctx)
+			return ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+			cause = context.Cause(ctx)
+			return nil
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonProcess(context.Background(), discardLogger(), testHostOptions(), a, "d", run)
+	}()
+	out, err := parent.Run(context.Background(), bootstrap.Handlers{})
+	require.NoError(t, err)
+	require.NotNil(t, out.Started)
+	require.NoError(t, parent.Close())
+	require.NoError(t, <-done, "a parent leaving after the command started is not abandonment")
+	require.NoError(t, cause, "the parent leaving after start must not be recorded as an abandonment cause")
+}
+
+// TestBuildDaemonHostRefusesAnEmptyName pins the guard at the top of
+// buildDaemonHost: a daemon started without a session name refuses before
+// touching anything else.
+func TestBuildDaemonHostRefusesAnEmptyName(t *testing.T) {
+	hostCmd()
+	daemonTestRoots(t)
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	child := bootstrap.NewChild(a, nil)
+	t.Cleanup(func() { _ = child.Close() })
+	_, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "", testHostOptions(), child, discardLogger())
+	require.ErrorContains(t, err, "without a session name")
+}
+
+// TestBuildDaemonHostNotifiesByName pins that the daemon is what tells the
+// operator what became of the session, and says which session it was: the
+// guests' arrivals and departures, and the loss of the relay and its return.
+func TestBuildDaemonHostNotifiesByName(t *testing.T) {
+	hostCmd()
+	daemonTestRoots(t)
+	var titles []string
+	swapNotify(t, func(title, _ string, _ any) error { titles = append(titles, title); return nil })
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	child := bootstrap.NewChild(a, nil)
+	t.Cleanup(func() { _ = child.Close() })
+	h, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "build", testHostOptions(), child, discardLogger())
+	require.NoError(t, err)
+
+	guest := &api.Client{Kind: api.Client_GUEST}
+	h.ClientJoinedCallback(guest)
+	h.ClientLeftCallback(guest)
+	h.TunnelCallback(host.TunnelEvent{Up: false, CanReconnect: true})
+	h.TunnelCallback(host.TunnelEvent{Up: true})
+	require.Equal(t, []string{
+		"A guest joined build", "A guest left build",
+		"build lost the relay", "build is back on the relay",
+	}, titles)
+}
+
+// A guest whose command can't start is told where the host's log is: the one
+// this daemon writes to, which its record names as well.
+func TestBuildDaemonHostTellsGuestsWhereItsLogIs(t *testing.T) {
+	hostCmd()
+	daemonTestRoots(t)
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	child := bootstrap.NewChild(a, nil)
+	t.Cleanup(func() { _ = child.Close() })
+	h, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "log", testHostOptions(), child, discardLogger())
+	require.NoError(t, err)
+	require.Equal(t, utils.UptermLogFilePath(), h.LogPath)
+}
+
+// TestBuildDaemonHostHidesClientIPs pins that --hide-client-ip reaches the
+// session, which keeps a guest's address out of its forced command's
+// environment as well as out of what upterm prints. The daemon runs the
+// root's pre-run on the argv its parent had, so a run that said
+// --hide-client-ip=false under CI keeps the address there too.
+func TestBuildDaemonHostHidesClientIPs(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ci     bool
+		flag   string
+		hidden bool
+	}{
+		{name: "by the flag", flag: "true", hidden: true},
+		{name: "by CI", ci: true, hidden: true},
+		{name: "by neither"},
+		{name: "not by CI when the flag is false", ci: true, flag: "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hostCmd()
+			daemonTestRoots(t)
+			withoutCI(t)
+			if tc.ci {
+				t.Setenv("CI", "true")
+			}
+			withHideClientIPFlag(t, tc.flag)
+			a, b := net.Pipe()
+			t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+			child := bootstrap.NewChild(a, nil)
+			t.Cleanup(func() { _ = child.Close() })
+			h, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "d", testHostOptions(), child, discardLogger())
+			require.NoError(t, err)
+			require.Equal(t, tc.hidden, h.HideClientIP)
+		})
+	}
+}
+
+// TestBuildDaemonHostPassesOnAccept pins that --accept reaches the session,
+// which reports an open one -- nobody asked, and no allowlist -- to every
+// reader of it.
+func TestDaemonConsentConfiguration(t *testing.T) {
+	for _, accept := range []bool{false, true} {
+		t.Run(fmt.Sprintf("accept=%t", accept), func(t *testing.T) {
+			hostCmd()
+			daemonTestRoots(t)
+			orig := flagAccept
+			flagAccept = accept
+			t.Cleanup(func() { flagAccept = orig })
+			a, b := net.Pipe()
+			t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+			child := bootstrap.NewChild(a, nil)
+			t.Cleanup(func() { _ = child.Close() })
+			h, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "d", testHostOptions(), child, discardLogger())
+			require.NoError(t, err)
+			require.Equal(t, accept, h.AutoAccept)
+			require.Equal(t, accept, h.SFTPAutoAccept, "--accept grants file transfers")
+			require.True(t, h.TerminalConsent)
+			require.Nil(t, h.PermissionChecker)
+			require.Equal(t, !accept, h.FileTransferApprovalRequired)
+		})
+	}
+}
+
+// TestRunDaemonProcessReportsAGenericFailure pins that a run error which is
+// neither ErrNameInUse nor ErrSessionAbandoned reaches the parent as neither.
+func TestRunDaemonProcessReportsAGenericFailure(t *testing.T) {
+	daemonTestRoots(t)
+	a, b := net.Pipe()
+	defer func() { _ = a.Close() }()
+	parent := bootstrap.NewParent(b, nil, io.Discard, nil)
+	done := make(chan error, 1)
+	go func() {
+		err := runDaemonProcess(context.Background(), discardLogger(), testHostOptions(), a, "boom", fakeRun(t, "sid", errors.New("boom")))
+		_ = a.Close()
+		done <- err
+	}()
+	out, err := parent.Run(context.Background(), bootstrap.Handlers{})
+	require.NoError(t, err)
+	require.EqualError(t, <-done, "boom")
+	require.NotNil(t, out.Failed)
+	require.Equal(t, "boom", out.Failed.Error)
+	require.False(t, out.Failed.NameInUse)
+	require.False(t, out.Failed.Abandoned)
+}
+
+// A name taken where the run was placed, and a failure in words chosen for
+// the operator, reach the parent to be printed as they are, made safe for a
+// terminal first; an ordinary failure is never printed that way.
+func TestRunDaemonProcessReportsVerbatimFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want *api.Failed
+	}{
+		{"a name taken", &host.NameTakenError{Text: "taken\x1b[2J here"}, &api.Failed{Error: "taken�[2J here", Verbatim: true, NameTaken: true}},
+		{"a name taken, wrapped", fmt.Errorf("placing: %w", &host.NameTakenError{Text: "taken here"}), &api.Failed{Error: "taken here", Verbatim: true, NameTaken: true}},
+		{"in the operator's words", verbatimError{text: "line one\nline\x07two"}, &api.Failed{Error: "line one\nline�two", Verbatim: true}},
+		{"anything else", errors.New("line one\nline two"), &api.Failed{Error: "line one\nline two"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			daemonTestRoots(t)
+			a, b := net.Pipe()
+			defer func() { _ = a.Close() }()
+			parent := bootstrap.NewParent(b, nil, io.Discard, nil)
+			done := make(chan error, 1)
+			go func() {
+				err := runDaemonProcess(context.Background(), discardLogger(), testHostOptions(), a, "placed", fakeRun(t, "sid", tc.err))
+				_ = a.Close()
+				done <- err
+			}()
+			out, err := parent.Run(context.Background(), bootstrap.Handlers{})
+			require.NoError(t, err)
+			require.Equal(t, tc.err, <-done)
+			require.NotNil(t, out.Failed)
+			require.True(t, proto.Equal(tc.want, out.Failed), "%v", out.Failed)
+		})
+	}
+}
+
+// placeFunc is a host.Broker that is a function.
+type placeFunc func(ctx context.Context, run host.Run) (host.Placement, error)
+
+func (f placeFunc) Place(ctx context.Context, run host.Run) (host.Placement, error) {
+	return f(ctx, run)
+}
+
+// placedFailure is what the operator's terminal shows of a run, placed by
+// broker, that fails before it starts: a real daemon, in this process on the
+// far end of a pipe, running a real host, with the parent printing as upterm
+// host does. Each of configure is applied to the host before it runs.
+func placedFailure(t *testing.T, broker host.Broker, configure ...func(*host.Host)) string {
+	t.Helper()
+	daemonTestRoots(t)
+	spawn := func(opts spawnOptions) (net.Conn, *os.Process, error) {
+		a, b := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer func() { _ = a.Close() }()
+			_ = runDaemonProcess(context.Background(), discardLogger(), testHostOptions(), a, opts.name, func(ctx context.Context, h *host.Host) error {
+				h.Broker = broker
+				for _, c := range configure {
+					c(h)
+				}
+				return h.Run(ctx)
+			})
+		}()
+		t.Cleanup(func() {
+			_ = b.Close()
+			<-done
+		})
+		return b, nil, nil
+	}
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach = true
+	err := s.run(context.Background())
+	require.Error(t, err)
+	Exit(nil, err, &stderr)
+	return stderr.String()
+}
+
+// requireEveryLineIsUpterms fails the test unless every line of out is one
+// upterm wrote.
+func requireEveryLineIsUpterms(t *testing.T, out string) {
+	t.Helper()
+	require.NotEmpty(t, out)
+	for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
+		require.True(t, strings.HasPrefix(line, "upterm: "), "a line upterm didn't write: %q in %q", line, out)
+	}
+}
+
+// An authority's name is one line wherever upterm prints it: the operator is
+// never shown a line of the authority's that passes for one of upterm's.
+func TestAnAuthoritysNameNeverStartsALine(t *testing.T) {
+	const authority = "Example\nupterm: attach with upterm attach x"
+	const shown = "Example�upterm: attach with upterm attach x"
+	relayKey, err := host.NewHostKey()
+	require.NoError(t, err)
+	// A relay whose authority stopped the session in its answer.
+	fake := fakerelay.Start(t, relayKey, func(req *server.CreateSessionRequest) (bool, []byte) {
+		key, _, _, _, err := ssh.ParseAuthorizedKey(req.HostPublicKeys[0])
+		if err != nil {
+			return false, nil
+		}
+		b, err := proto.Marshal(&server.CreateSessionResponse{SessionID: registration.ID(key, req.SessionSecret), DelegatedSession: &server.DelegatedSession{
+			Protocol: req.DelegatedSession.GetProtocol(), ExternalSessionId: req.DelegatedSession.GetExternalSessionId(),
+			Disposition: server.DelegatedDisposition_DELEGATED_STOPPED, DecisionRevision: 1}})
+		if err != nil {
+			return false, nil
+		}
+		return true, b
+	})
+	placing := func(pin ssh.PublicKey) host.Broker {
+		return placeFunc(func(_ context.Context, run host.Run) (host.Placement, error) {
+			return host.Placement{
+				RoutingID: run.RoutingID, Relay: fake.Addr, Trust: host.InitialTrust{Keys: [][]byte{pin.Marshal()}},
+				Protocol: "test_v1", ExternalID: "33333333-3333-4333-8333-333333333333", GuestAddress: "work",
+				Association: sessiondir.DelegationAssociation{Service: "https://authority.test", Account: "a", Login: "l"},
+				Display:     sessiondir.DelegationDisplay{Authority: authority},
+			}, nil
+		})
+	}
+
+	t.Run("stopped before the command started", func(t *testing.T) {
+		out := placedFailure(t, placing(relayKey.PublicKey()))
+		requireEveryLineIsUpterms(t, out)
+		require.Contains(t, out, shown+" stopped the session before its command started; no command was launched")
+	})
+	t.Run("a relay key it didn't list", func(t *testing.T) {
+		other, err := host.NewHostKey()
+		require.NoError(t, err)
+		out := placedFailure(t, placing(other.PublicKey()))
+		requireEveryLineIsUpterms(t, out)
+		require.Contains(t, out, " is not one "+shown+" listed for this relay")
+	})
+}
+
+// Once its session's name is claimed, the daemon tells the desktop what the
+// authority decided by the name the record gives the authority.
+func TestDaemonNamesTheAuthorityItsClaimedRecordHolds(t *testing.T) {
+	hostCmd()
+	daemonTestRoots(t)
+	titles := make(chan string, 1)
+	swapNotify(t, func(title, _ string, _ any) error { titles <- title; return nil })
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close() })
+	// A parent that is gone: what the claim tells it is lost, and nothing
+	// waits on it.
+	_ = b.Close()
+	child := bootstrap.NewChild(a, nil)
+	t.Cleanup(func() { _ = child.Close() })
+	h, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "d", testHostOptions(), child, discardLogger())
+	require.NoError(t, err)
+
+	dir, err := sessiondir.Claim(context.Background(), sessiondir.ClaimOptions{
+		RuntimeRoot: utils.UptermRuntimeDir(), StateRoot: utils.UptermStateDir(), Name: "d", Command: []string{"bash"},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dir.Release(context.Background()) })
+	require.NoError(t, dir.Update(func(r *sessiondir.Record) {
+		r.Delegation = &sessiondir.Delegation{DelegationDisplay: sessiondir.DelegationDisplay{Authority: "Example Authority"}}
+	}))
+	h.SessionClaimedCallback(dir)
+	h.DecisionCallback(host.DecisionStopped)
+	select {
+	case title := <-titles:
+		require.Equal(t, "Example Authority stopped the session", title)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the desktop was never told")
+	}
+}
+
+// A broker's error, whatever it says, reaches the operator's terminal with
+// nothing in it that can control the terminal, and on one line: one that
+// isn't verbatim is printed inside a line of upterm's own.
+func TestAPlacementErrorIsMadeSafeForTheTerminal(t *testing.T) {
+	placing := func(text string) host.Broker {
+		return placeFunc(func(context.Context, host.Run) (host.Placement, error) {
+			return host.Placement{}, errors.New(text)
+		})
+	}
+	t.Run("controls", func(t *testing.T) {
+		out := placedFailure(t, placing("refused \x1b]0;owned\x07here\x1b[2J"))
+		require.Equal(t, "upterm: session s could not start: refused �]0;owned�here�[2J (see /var/log/upterm.log)\n", out)
+	})
+	t.Run("lines", func(t *testing.T) {
+		out := placedFailure(t, placing("refused\nupterm: attach with upterm attach x\r\nhere"))
+		requireEveryLineIsUpterms(t, out)
+		require.Equal(t, "upterm: session s could not start: refused�upterm: attach with upterm attach x��here (see /var/log/upterm.log)\n", out)
+	})
+}
+
+// A delegated run handed authorized keys is refused before it is placed, and
+// the operator is told so as any session that could not start is.
+func TestADelegatedRunWithAuthorizedKeysIsRefusedBeforeItIsPlaced(t *testing.T) {
+	guest, err := host.NewHostKey()
+	require.NoError(t, err)
+	var places atomic.Int32
+	broker := placeFunc(func(context.Context, host.Run) (host.Placement, error) {
+		places.Add(1)
+		return host.Placement{}, errors.New("placed")
+	})
+	out := placedFailure(t, broker, func(h *host.Host) {
+		h.AuthorizedKeys = []*host.AuthorizedKey{{PublicKeys: []ssh.PublicKey{guest.PublicKey()}}}
+	})
+	require.Equal(t, "upterm: session s could not start: a delegated run takes no authorized keys: its authority decides who joins (see /var/log/upterm.log)\n", out)
+	require.Zero(t, places.Load(), "the run was placed")
+}
+
+// TestRunDaemonProcessTreatsALostParentAtSessionCreatedAsAbandonment pins the
+// wrap buildDaemonHost's SessionCreatedCallback puts on a transport failure
+// while reporting the session: host.ErrSessionAbandoned, not the raw error,
+// so Host.Run records startup_abandoned rather than startup_failed.
+func TestRunDaemonProcessTreatsALostParentAtSessionCreatedAsAbandonment(t *testing.T) {
+	daemonTestRoots(t)
+	a, b := net.Pipe()
+	defer func() { _ = a.Close() }()
+	var runErr error
+	run := func(ctx context.Context, h *host.Host) error {
+		// Not fakeRun: its SessionCreatedCallback error is returned as-is, and
+		// what this pins is the wrap buildDaemonHost puts on it.
+		runErr = h.SessionCreatedCallback(ctx, &api.GetSessionResponse{SessionId: "sid"})
+		return runErr
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonProcess(context.Background(), discardLogger(), testHostOptions(), a, "gone", run)
+	}()
+	// The parent leaves without answering.
+	require.NoError(t, b.Close())
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, host.ErrSessionAbandoned)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the daemon did not notice its parent leaving")
+	}
+	require.ErrorIs(t, runErr, host.ErrSessionAbandoned)
+}
+
+// TestBuildDaemonHostReportsAnUnusableKnownHostsFile pins that a known_hosts
+// path that cannot be created fails the build with the host-key callback's
+// own error, naming the path that could not be used.
+func TestBuildDaemonHostReportsAnUnusableKnownHostsFile(t *testing.T) {
+	hostCmd()
+	daemonTestRoots(t)
+	file := filepath.Join(t.TempDir(), "a-file")
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+	orig := flagKnownHostsFilename
+	flagKnownHostsFilename = filepath.Join(file, "known_hosts") // under a regular file
+	t.Cleanup(func() { flagKnownHostsFilename = orig })
+	origSkip := flagSkipHostKeyCheck
+	flagSkipHostKeyCheck = true
+	t.Cleanup(func() { flagSkipHostKeyCheck = origSkip })
+
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	child := bootstrap.NewChild(a, nil)
+	t.Cleanup(func() { _ = child.Close() })
+	_, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "kh", testHostOptions(), child, discardLogger())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), file, "the error names the path that could not be used")
+}
+
+func TestJoinTimeoutFlagReachesHostOptions(t *testing.T) {
+	cmd := hostCmd()
+	t.Cleanup(func() { flagJoinTimeout = 0 })
+	require.NoError(t, cmd.PersistentFlags().Parse([]string{"--join-timeout", "9m"}))
+	opts, err := parseHostOptions([]string{"sh"})
+	require.NoError(t, err)
+	require.Equal(t, 9*time.Minute, opts.joinTimeout)
+}
+
+func TestJoinTimeoutReachesTheDaemonHost(t *testing.T) {
+	hostCmd()
+	daemonTestRoots(t)
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	child := bootstrap.NewChild(a, nil)
+	t.Cleanup(func() { _ = child.Close() })
+	opts := testHostOptions()
+	opts.joinTimeout = 7 * time.Minute
+	h, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "n", opts, child, discardLogger())
+	require.NoError(t, err)
+	require.Equal(t, 7*time.Minute, h.JoinTimeout)
+}
+
+// TestBuildDaemonHostSetsIdentitiesOnlyFromPrivateKey pins that a session
+// whose identities were named with --private-key tells its Host so: those
+// identities are the whole set, and a redial must not offer the session key
+// ahead of them. The same key list that merely defaulted leaves it off.
+func TestBuildDaemonHostSetsIdentitiesOnlyFromPrivateKey(t *testing.T) {
+	for _, named := range []bool{false, true} {
+		t.Run(fmt.Sprintf("named=%t", named), func(t *testing.T) {
+			hostCmd()
+			daemonTestRoots(t)
+			// No agent, so the key below is what both cases resolve: with
+			// one, the unnamed case would take the agent's keys instead.
+			t.Setenv("SSH_AUTH_SOCK", "")
+			_, priv, err := ed25519.GenerateKey(rand.Reader)
+			require.NoError(t, err)
+			block, err := ssh.MarshalPrivateKey(priv, "")
+			require.NoError(t, err)
+			key := filepath.Join(t.TempDir(), "id_ed25519")
+			require.NoError(t, os.WriteFile(key, pem.EncodeToMemory(block), 0o600))
+			orig := flagPrivateKeys
+			flagPrivateKeys = []string{key}
+			t.Cleanup(func() { flagPrivateKeys = orig })
+			if named {
+				// As cobra records a flag given from any origin;
+				// daemonTestRoots restores the map.
+				suppliedFlags["private-key"] = true
+			}
+
+			a, b := net.Pipe()
+			t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+			child := bootstrap.NewChild(a, nil)
+			t.Cleanup(func() { _ = child.Close() })
+			h, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "ids", testHostOptions(), child, discardLogger())
+			require.NoError(t, err)
+			require.Equal(t, named, h.IdentitiesOnly)
+		})
+	}
+}
+
+func TestJoinTimeoutFlagDefaultsToOff(t *testing.T) {
+	f := hostCmd().PersistentFlags().Lookup("join-timeout")
+	require.NotNil(t, f)
+	require.Equal(t, "0s", f.DefValue)
+}
+
+func TestJoinTimeoutFlagRejectsNegative(t *testing.T) {
+	cmd := hostCmd()
+	t.Cleanup(func() { flagJoinTimeout = 0 })
+	require.NoError(t, cmd.PersistentFlags().Parse([]string{"--join-timeout", "-5m"}))
+	err := cmd.PreRunE(cmd, nil)
+	require.ErrorContains(t, err, "--join-timeout cannot be negative")
+}
+
+// TestBuildDaemonHostTellsTheParentWhichPrivateKeyItSkipped pins that a
+// private key the daemon cannot use is named on the operator's terminal, not
+// only in the daemon log: the session goes on with another key, and the
+// operator should know which identity it is not using. It was pinned for
+// the in-process host until that path was deleted; the daemon is where the
+// keys are read now.
+func TestBuildDaemonHostTellsTheParentWhichPrivateKeyItSkipped(t *testing.T) {
+	hostCmd()
+	daemonTestRoots(t)
+	// No agent: with one, SignersWith would take its keys and never read the
+	// file this case is about.
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	bad := filepath.Join(t.TempDir(), "id_bad")
+	require.NoError(t, os.WriteFile(bad, []byte("not a private key\n"), 0o600))
+	orig := flagPrivateKeys
+	flagPrivateKeys = []string{bad}
+	t.Cleanup(func() { flagPrivateKeys = orig })
+
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	var printed strings.Builder
+	parent := bootstrap.NewParent(b, nil, &printed, nil)
+	parentDone := make(chan error, 1)
+	go func() {
+		_, err := parent.Run(context.Background(), bootstrap.Handlers{})
+		parentDone <- err
+	}()
+
+	child := bootstrap.NewChild(a, nil)
+	_, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "skip", testHostOptions(), child, discardLogger())
+	// Closing the child ends the exchange, so the parent's Run returns and
+	// everything it printed is in the builder.
+	require.NoError(t, child.Close())
+	require.ErrorIs(t, <-parentDone, bootstrap.ErrDaemonGone, "the exchange ended because the child closed it")
+
+	require.Contains(t, printed.String(), "upterm: warning: skipping private key "+bad+": ",
+		"the operator is told which key is not being used, on one line that says it is upterm's warning")
+	_ = err // whether the build then succeeds depends on the fallback key and is not this test's concern
+}
+
+// daemonPrints builds the daemon's Host with its parent on the far end of a
+// pipe, hands it to use, and returns everything the parent printed by the
+// time use returned.
+func daemonPrints(t *testing.T, name string, use func(*host.Host)) string {
+	t.Helper()
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	var printed strings.Builder
+	parent := bootstrap.NewParent(b, nil, &printed, nil)
+	parentDone := make(chan error, 1)
+	go func() {
+		_, err := parent.Run(context.Background(), bootstrap.Handlers{})
+		parentDone <- err
+	}()
+
+	child := bootstrap.NewChild(a, nil)
+	h, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), name, testHostOptions(), child, discardLogger())
+	require.NoError(t, err)
+	use(h)
+	// Closing the child ends the exchange, so the parent's Run returns and
+	// everything it printed is in the builder.
+	require.NoError(t, child.Close())
+	require.ErrorIs(t, <-parentDone, bootstrap.ErrDaemonGone)
+	return printed.String()
+}
+
+func TestVersionAdviceFollowsTheDirection(t *testing.T) {
+	newer := &version.CompatibilityResult{HostVersion: "v0.38.0", ServerVersion: "v1.0.0", Direction: version.RelayNewer}
+	require.Equal(t, "upterm: warning: the relay runs uptermd v1.0.0 and this is upterm v0.38.0; upgrade with upterm upgrade", versionWarning(newer, "upgrade with upterm upgrade"))
+	older := &version.CompatibilityResult{HostVersion: "v1.0.0", ServerVersion: "v0.38.0", Direction: version.RelayOlder}
+	require.Equal(t, "upterm: warning: the relay runs uptermd v0.38.0, older than this upterm (v1.0.0); its operator can upgrade it", versionWarning(older, "ignored"))
+	unknown := &version.CompatibilityResult{HostVersion: "v1.0.0", ServerVersion: "unknown", Direction: version.RelayUnknown}
+	require.Equal(t, "upterm: warning: the relay didn't report a version upterm understands; this is upterm v1.0.0", versionWarning(unknown, "ignored"))
+}
+
+// The daemon says a version mismatch on the operator's terminal as one line,
+// with the upgrade advice only when it is this upterm that is behind: the
+// ownership check behind the advice isn't run for a relay that is.
+func TestTheDaemonSaysAVersionMismatchInOneLine(t *testing.T) {
+	hostCmd()
+	daemonTestRoots(t)
+
+	t.Run("the relay is newer", func(t *testing.T) {
+		withRunningBinary(t, "/opt/homebrew/Cellar/upterm/0.38.0/bin/upterm")
+		printed := daemonPrints(t, "newer", func(h *host.Host) {
+			h.VersionWarningCallback(&version.CompatibilityResult{HostVersion: "v0.38.0", ServerVersion: "v1.0.0", Direction: version.RelayNewer})
+		})
+		require.Equal(t, "upterm: warning: the relay runs uptermd v1.0.0 and this is upterm v0.38.0; upgrade with brew upgrade upterm\n", printed)
+	})
+
+	t.Run("the relay is older", func(t *testing.T) {
+		withRunningBinaryFunc(t, func() (string, error) {
+			t.Error("the advice was looked up for a relay that is behind")
+			return "", errors.New("not asked")
+		})
+		printed := daemonPrints(t, "older", func(h *host.Host) {
+			h.VersionWarningCallback(&version.CompatibilityResult{HostVersion: "v1.0.0", ServerVersion: "v0.38.0", Direction: version.RelayOlder})
+		})
+		require.Equal(t, "upterm: warning: the relay runs uptermd v0.38.0, older than this upterm (v1.0.0); its operator can upgrade it\n", printed)
+	})
+}
+
+func TestRelayWarningLines(t *testing.T) {
+	require.Equal(t, "upterm: warning: this relay doesn't support reconnecting; if the connection drops, guests can't reach this session until you restart it",
+		relayWarningLine(host.RelayWarning{Kind: host.NoReconnect}))
+	require.Equal(t, "upterm: warning: the relay's certificate isn't valid for relay.example.com, so a reconnect would be refused; use the relay's own hostname in --server",
+		relayWarningLine(host.RelayWarning{Kind: host.CertNotValidForServer, Host: "relay.example.com"}))
+}
+
+// What the relay's first answer turned up -- that it can't take a session
+// back, and that its version isn't one upterm understands -- reaches the
+// operator's terminal ahead of the banner, so it is read before the session
+// starts rather than found above it later.
+func TestRelayWarningsReachTheHostBeforeTheBanner(t *testing.T) {
+	printed := runDaemonAgainstUnsupportedRelay(t)
+	banner := strings.Index(printed, bannerMarker)
+	require.NotEqual(t, -1, banner, printed)
+	for _, line := range []string{
+		"upterm: warning: this relay doesn't support reconnecting; if the connection drops, guests can't reach this session until you restart it\n",
+		// The fake relay speaks Go's own SSH version string.
+		"upterm: warning: the relay didn't report a version upterm understands; this is upterm v" + version.Current().String() + "\n",
+	} {
+		require.Equal(t, 1, strings.Count(printed, line), printed)
+		require.Less(t, strings.Index(printed, line), banner, "said after the banner:\n%s", printed)
+	}
+}
+
+// bannerMarker is what runDaemonAgainstUnsupportedRelay's parent prints where
+// upterm host prints the banner: when it is told the session was created.
+const bannerMarker = "<banner>\n"
+
+// runDaemonAgainstUnsupportedRelay runs the daemon's Host against a relay
+// that can't take a session back, up to the session's creation, and returns
+// everything its parent printed, with bannerMarker where upterm host would
+// print the banner. The parent declines the session there, so nothing past
+// the banner runs.
+func runDaemonAgainstUnsupportedRelay(t *testing.T) string {
+	t.Helper()
+	hostCmd()
+	daemonTestRoots(t)
+
+	key, err := host.NewHostKey()
+	require.NoError(t, err)
+	relay := fakerelay.Start(t, key, fakerelay.RandomID)
+	origServer, origSkip := flagServer, flagSkipHostKeyCheck
+	flagServer, flagSkipHostKeyCheck = "ssh://"+relay.Addr, true
+	t.Cleanup(func() { flagServer, flagSkipHostKeyCheck = origServer, origSkip })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	var printed strings.Builder
+	parent := bootstrap.NewParent(b, nil, &printed, nil)
+	parentDone := make(chan error, 1)
+	go func() {
+		_, err := parent.Run(ctx, bootstrap.Handlers{
+			SessionCreated: func(*api.GetSessionResponse) api.Accept_Decision {
+				printed.WriteString(bannerMarker)
+				return api.Accept_DECLINED
+			},
+		})
+		parentDone <- err
+	}()
+
+	child := bootstrap.NewChild(a, nil)
+	h, err := buildDaemonHost(ctx, hostSettingsFromFlags(), "relaywarn", testHostOptions(), child, discardLogger())
+	require.NoError(t, err)
+	require.ErrorAs(t, h.Run(ctx), new(UserDiscardedError))
+	require.NoError(t, child.Close())
+	require.ErrorIs(t, <-parentDone, bootstrap.ErrDaemonGone)
+	return printed.String()
+}
+
+func TestDaemonGuestCommandConfiguration(t *testing.T) {
+	cmd := hostCmd()
+	daemonTestRoots(t)
+	require.NoError(t, cmd.ParseFlags([]string{"--login-command=tool 'a b'", "--allow-exec"}))
+	opts, err := parseHostOptions([]string{"sh"})
+	require.NoError(t, err)
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	child := bootstrap.NewChild(a, nil)
+	t.Cleanup(func() { _ = child.Close() })
+	h, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "guest-options", opts, child, discardLogger())
+	require.NoError(t, err)
+	require.Equal(t, []string{"tool", "a b"}, h.LoginCommand)
+	require.True(t, h.AcceptExec)
+	require.False(t, h.ExecDisabled)
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	require.Equal(t, cwd, h.CommandDir)
+	hostCmd()
+}
+
+func TestForwardingDaemonConfiguration(t *testing.T) {
+	cmd := hostCmd()
+	defer hostCmd()
+	daemonTestRoots(t)
+	require.NoError(t, cmd.ParseFlags([]string{"--allow-forwarding=loopback"}))
+	opts, err := parseHostOptions([]string{"sh"})
+	require.NoError(t, err)
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	child := bootstrap.NewChild(a, nil)
+	t.Cleanup(func() { _ = child.Close() })
+	h, err := buildDaemonHost(context.Background(), hostSettingsFromFlags(), "forward-options", opts, child, discardLogger())
+	require.NoError(t, err)
+	require.True(t, h.AllowLoopbackTCPForwarding)
+	require.False(t, h.ForwardingDisabled)
+	require.False(t, h.AllowLocalTCPForwarding)
+}

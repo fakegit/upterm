@@ -1,0 +1,344 @@
+//go:build !windows
+
+package internal
+
+import (
+	"errors"
+	"os"
+	"os/exec"
+	"sync"
+	"syscall"
+
+	ptylib "github.com/creack/pty"
+	"github.com/owenthereal/upterm/internal/termsize"
+	"github.com/owenthereal/upterm/internal/tty"
+	"golang.org/x/sys/unix"
+)
+
+// startPty starts c on a pty of the given size, falling back to
+// termsize.Default for a size that is not one. A pinned pty keeps that size:
+// its Setsize changes nothing.
+//
+// r hears of the pty's size: once at start, before startPty returns, and for
+// each Setsize that changes it; see sizeReporter. Nil reports nothing, as a
+// forced command's pty does (startSessionPty).
+func startPty(c *exec.Cmd, size termsize.Size, pinned bool, r sizeReporter) (PTY, error) {
+	if !size.Valid() {
+		size = termsize.Default
+	}
+
+	f, slave, err := openSizedPTY(size)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = slave.Close() }()
+
+	// Keep caller-provided streams, as creack/pty's StartWithSize does.
+	if c.Stdin == nil {
+		c.Stdin = slave
+	}
+	if c.Stdout == nil {
+		c.Stdout = slave
+	}
+	if c.Stderr == nil {
+		c.Stderr = slave
+	}
+	if c.SysProcAttr == nil {
+		c.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	c.SysProcAttr.Setsid = true
+	c.SysProcAttr.Setctty = true
+	if err := c.Start(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+
+	reportStart(r, size, pinned)
+
+	return wrapPty(f, c, pinned, r), nil
+}
+
+// startSessionPty is startPty for a command a guest runs on a pty of its own,
+// whose environment also names that pty in SSH_TTY, as sshd's does for a
+// session with a terminal.
+//
+// The slave name is only known once the pty is open, and the environment is
+// fixed once the command starts.
+func startSessionPty(c *exec.Cmd, size termsize.Size) (PTY, error) {
+	if !size.Valid() {
+		size = termsize.Default
+	}
+
+	f, slave, err := openSizedPTY(size)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = slave.Close() }()
+
+	if c.Env == nil {
+		c.Env = os.Environ()
+	}
+	c.Env = append(c.Env, "SSH_TTY="+slave.Name())
+	c.Stdin, c.Stdout, c.Stderr = slave, slave, slave
+	if c.SysProcAttr == nil {
+		c.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	c.SysProcAttr.Setsid = true
+	c.SysProcAttr.Setctty = true
+	if err := c.Start(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+
+	return wrapPty(f, c, false, nil), nil
+}
+
+// openSizedPTY acquires both handles and prepares the master before any child
+// starts. Sizing first lets a command observe its initial geometry immediately;
+// preparation afterward keeps Fd-based setup away from the published master.
+func openSizedPTY(size termsize.Size) (master, slave *os.File, err error) {
+	master, slave, err = ptylib.Open()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := ptylib.Setsize(master, &ptylib.Winsize{Rows: uint16(size.Rows), Cols: uint16(size.Cols)}); err != nil {
+		_ = master.Close()
+		_ = slave.Close()
+		return nil, nil, err
+	}
+	master, err = preparePTYMaster(master)
+	if err != nil {
+		_ = slave.Close()
+		return nil, nil, err
+	}
+	return master, slave, nil
+}
+
+// Linux kernel return EIO when attempting to read from a master pseudo
+// terminal which no longer has an open slave. So ignore error here.
+// See https://github.com/creack/pty/issues/21
+func ptyError(err error) error {
+	if pathErr, ok := err.(*os.PathError); !ok || pathErr.Err != syscall.EIO {
+		return err
+	}
+
+	return nil
+}
+
+func wrapPty(f *os.File, cmd *exec.Cmd, pinned bool, r sizeReporter) *pty {
+	// Snapshotted once, here, rather than read from cmd through the RWMutex
+	// below every time Signal or Kill needs them: see Signal's and Kill's
+	// own comments for why.
+	var pid int
+	var process *os.Process
+	if cmd.Process != nil {
+		pid = cmd.Process.Pid
+		process = cmd.Process
+	}
+	p := &pty{ptyPlatformState: ptyPlatformState{File: f}, cmd: cmd, pinned: pinned, report: r, pid: pid, process: process}
+	initPTYInput(p)
+	return p
+}
+
+// pty wraps the master and its command. Non-Linux platforms retain a mutex
+// across Read and Close; Linux uses the File poller so Close releases parked I/O.
+// See ftests failure:
+// * https://travis-ci.org/owenthereal/upterm/jobs/632489866
+// * https://travis-ci.org/owenthereal/upterm/jobs/632458125
+type pty struct {
+	ptyPlatformState
+	cmd    *exec.Cmd // Process started with this PTY
+	pinned bool
+
+	// setWinsize is TIOCSWINSZ unless a test has made it fail.
+	setWinsize func(fd int, ws *unix.Winsize) error
+	// report hears of each resize Setsize makes, in two steps; see startPty.
+	// Nil reports nothing.
+	report sizeReporter
+	// pid and process are cmd.Process.Pid and cmd.Process, fixed at
+	// construction (see wrapPty) and never touched again. Signal and Kill
+	// read them without the RWMutex below; nothing else does.
+	pid     int
+	process *os.Process
+	sync.RWMutex
+}
+
+func (pty *pty) Setsize(h, w int) error {
+	pty.RLock()
+	defer pty.RUnlock()
+
+	// --pty-size promises the geometry will not move. Every resize in the
+	// process funnels through here — the host's SIGWINCH handler and a guest's
+	// window-change request both reach it via event.go — so this is the only
+	// place the promise has to be kept. Reporting success is deliberate: a
+	// client asking to resize a pinned session has done nothing wrong.
+	if pty.pinned {
+		return nil
+	}
+
+	setWinsize := pty.setWinsize
+	if setWinsize == nil {
+		setWinsize = func(fd int, ws *unix.Winsize) error {
+			return unix.IoctlSetWinsize(fd, unix.TIOCSWINSZ, ws)
+		}
+	}
+	ws := unix.Winsize{Row: uint16(h), Col: uint16(w)}
+	// What the ioctl applies, which is what the command is told and lays its
+	// output out at: a dimension past what a winsize holds wraps, so 65537
+	// columns is one, and the fan-out must hear the one.
+	applied := termsize.Size{Cols: int(ws.Col), Rows: int(ws.Row)}
+	err := pty.control(func(fd uintptr) error {
+		report := pty.report
+		if report != nil {
+			// A resize to the size the pty has changes nothing, so there is
+			// nothing to report: the fan-out takes every ResizeBegin for a
+			// real change, and a same-size one would reset the region it is
+			// weighing. A size that cannot be read is reported all the same:
+			// the ioctl may well apply it, and if it does not its outcome
+			// deletes the report. The check and the ioctl are not one step, so
+			// Setsize calls must be serialized, as their callers do:
+			// terminalWindows under its mu, and sharedPTY's set under its own.
+			if cur, err := unix.IoctlGetWinsize(int(fd), unix.TIOCGWINSZ); err == nil &&
+				cur.Row == ws.Row && cur.Col == ws.Col {
+				report = nil
+			}
+		}
+
+		// Begun before the ioctl, not after it. The ioctl is what sends the
+		// command SIGWINCH, and a command that repaints at once can have its
+		// repaint in the fan-out before the ioctl returns: reported after,
+		// that repaint would count as drawn at the old size, and a joiner at
+		// the new one would be replayed without it. Reported before, the
+		// error goes the other way, and is one the command repairs: output
+		// already on its way at the old size counts as the new, and the
+		// repaint that follows draws over it.
+		var seq uint64
+		if report != nil {
+			seq = report.ResizeBegin(applied)
+		}
+		err := setWinsize(int(fd), &ws)
+		if report != nil {
+			// A failed ioctl is ended, not undone with a report of the old
+			// size: it sent no SIGWINCH and changed no layout, so the bytes
+			// that followed are the old size's, and the fan-out drops the
+			// event.
+			report.ResizeEnd(seq, err == nil)
+		}
+		return err
+	})
+	if errors.Is(err, os.ErrClosed) {
+		// A resize that lost the race with the end of the session is nothing
+		// to anyone, and the Windows pty says nothing about one on a closed
+		// pty either (pty_windows.go's Setsize).
+		return nil
+	}
+	return err
+}
+
+// Redraw nudges the foreground process group with SIGWINCH, the signal a
+// full-screen program repaints on. Nothing about the geometry changes, so a
+// pinned session is nudged like any other.
+func (pty *pty) Redraw() error {
+	pty.RLock()
+	defer pty.RUnlock()
+
+	var pgrp int
+	err := pty.control(func(fd uintptr) (err error) {
+		pgrp, err = tty.ForegroundProcessGroup(int(fd))
+		return err
+	})
+	if errors.Is(err, os.ErrClosed) {
+		// A nudge that lost the race with the end of the session is nothing
+		// to anyone, and the Windows pty says nothing about one on a closed
+		// pty either (pty_windows.go's Redraw).
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if pgrp <= 0 {
+		// kill(0, …) would signal our own process group.
+		return errors.New("pty has no foreground process group")
+	}
+	return unix.Kill(-pgrp, unix.SIGWINCH)
+}
+
+// control runs f with the master's descriptor while holding a reference on
+// the file, so a Close racing it cannot destroy the file under the ioctl and
+// the number can never be one the process has reused. Fd() takes no
+// reference: it reads the number bare, and the write path — unlocked,
+// still in progress — may be the operation that finally releases the file.
+// control reports a closed file as os.ErrClosed and leaves what to do about
+// it to the caller. Unlike Fd, it preserves the prepared master's poller mode.
+func (pty *pty) control(f func(fd uintptr) error) error {
+	rc, err := pty.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var ferr error
+	if err := rc.Control(func(fd uintptr) { ferr = f(fd) }); err != nil {
+		// Control's only failure here is the file being closed or closing
+		// (os/rawconn.go's checkValid, then poll.FD.RawControl's incref).
+		// The callback's own error (ferr) still comes back below, distinct
+		// from this one.
+		return os.ErrClosed
+	}
+	return ferr
+}
+
+func (pty *pty) Read(p []byte) (n int, err error) {
+	return readPTY(pty, p)
+}
+
+func (pty *pty) Close() error {
+	return closePTY(pty)
+}
+
+// Wait waits for the process to exit
+func (pty *pty) Wait() error {
+	pty.RLock()
+	cmd := pty.cmd
+	pty.RUnlock()
+
+	if cmd == nil {
+		return nil // No process to wait for
+	}
+	return cmd.Wait()
+}
+
+// Kill terminates the process.
+//
+// Deliberately not behind the RWMutex above, for the same reason as Signal:
+// process is fixed at construction and never changes, so reading it needs
+// no lock -- and taking one would let a pending close's write lock starve
+// the kill step exactly the way it used to starve Signal. terminate's own
+// close now runs on its own goroutine and can still be pending, its write
+// lock queued, when the escalation reaches Kill; a kill step that blocked
+// on that would mean SIGKILL is never sent, the give-up warning never
+// logs, and terminate never returns.
+func (pty *pty) Kill() error {
+	if pty.process == nil {
+		return nil // No process to kill
+	}
+	return pty.process.Kill()
+}
+
+// Signal sends sig to the command's process group. The command is a session
+// leader — creack/pty starts it with Setsid — so its group is its pid, and
+// this reaches every process that has not left the group on purpose.
+//
+// Deliberately not behind the RWMutex above: pid is fixed at construction
+// (wrapPty) and never changes, so nothing here needs the lock to read it
+// safely -- and taking it anyway would let a write lock queued by Close
+// starve every signal behind it. That starvation is exactly what used to
+// make terminate's own hangup impossible to send: Close (the write lock)
+// queued ahead of Signal (a read lock) whenever it ran concurrently, and
+// Go's sync.RWMutex blocks new readers behind a pending writer. terminate
+// now closes the pty master itself, mid-escalation, so a signal must never
+// depend on that close having finished first.
+func (pty *pty) Signal(sig syscall.Signal) error {
+	if pty.pid == 0 {
+		return nil
+	}
+	return unix.Kill(-pty.pid, sig)
+}

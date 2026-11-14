@@ -1,169 +1,761 @@
 # Upterm
 
-[Upterm](https://github.com/owenthereal/upterm) is an open-source solution for sharing terminal sessions instantly over the public internet via secure tunnels.
-Upterm is good for
-
-* Remote pair programming
-* Access remote computers behind NATs and firewalls
-* Remote debugging
-* \<insert your creative use cases\>
+[Upterm](https://github.com/owenthereal/upterm) is an open-source tool enabling developers to share terminal sessions securely over the web. It’s perfect for remote pair programming, accessing computers behind NATs/firewalls, remote debugging, and more.
 
 This is a [blog post](https://owenou.com/upterm) to describe Upterm in depth.
 
-## Usage
+## :movie_camera: Quick Demo
 
-The host starts a terminal session:
+[![demo](https://raw.githubusercontent.com/owenthereal/upterm/gh-pages/demo.gif)](https://asciinema.org/a/efeKPxxzKi3pkyu9LWs1yqdbB)
 
-```bash
-$ upterm host -- bash
-```
-
-The host displays the ssh connection string:
-
-```bash
-$ upterm session current
-=== IQKSFOICLSNNXQZTDKOJ
-Command:                bash
-Force Command:          n/a
-Host:                   ssh://uptermd.upterm.dev:22
-SSH Session:            ssh IqKsfoiclsNnxqztDKoj:MTAuMC40OS4xNjY6MjI=@uptermd.upterm.dev
-```
-
-The client opens a terminal and connects to the host's session:
-
-```bash
-$ ssh IqKsfoiclsNnxqztDKoj:MTAuMC40OS4xNjY6MjI=@uptermd.upterm.dev
-```
+## :rocket: Getting Started
 
 ## Installation
 
 ### Mac
 
+```console
+brew install --cask owenthereal/upterm/upterm
 ```
-brew install owenthereal/upterm/upterm
+
+#### Migrating from Formula to Cask
+
+If you previously installed upterm using the Homebrew formula (without `--cask`), you'll need to migrate to the Cask version:
+
+```console
+# Uninstall the old formula version
+brew uninstall upterm
+
+# Install the new Cask version
+brew install --cask owenthereal/upterm/upterm
+```
+
+**Note:** Running `brew upgrade` with the old formula installed will fail with an error. Follow the migration steps above to resolve this.
+
+### Windows
+
+```powershell
+scoop bucket add upterm https://github.com/owenthereal/scoop-upterm
+scoop install upterm
 ```
 
 ### Standalone
 
 `upterm` can be easily installed as an executable. Download the latest [compiled binaries](https://github.com/owenthereal/upterm/releases) and put it in your executable path.
 
+### Go
+
+```console
+go install github.com/owenthereal/upterm/cmd/upterm@latest
+```
+
 ### From source
 
-```
-git clone git@github.com:owenthereal/upterm.git
+```console
+git clone https://github.com/owenthereal/upterm.git
 cd upterm
 go install ./cmd/upterm/...
 ```
 
-## Upgrade
+## :wrench: Basic Usage
 
-`upterm` comes with a command to upgrade
+1. Host starts a terminal session:
+
+   ```console
+   upterm host
+   ```
+
+1. Host retrieves and shares the connection string:
+
+   ```console
+   upterm session current
+   ```
+
+1. Client joins using the shared string, and rejoins on its own if the connection drops:
+
+   ```console
+   upterm join ssh://SESSION_USER@uptermd.upterm.dev
+   ```
+
+   Or with plain `ssh` (no install needed):
+
+   ```console
+   ssh SESSION_USER@uptermd.upterm.dev
+   ```
+
+   `SESSION_USER` stands for the session's SSH user, the part before `@` on
+   the host's `➤ SSH:` line. On uptermd.upterm.dev it is the session ID; a
+   self-hosted relay that routes without Consul adds the node the session is
+   on, after a colon. To reach a session by a name of your own instead, see
+   [Reach your own machine](#reach-your-own-machine).
+
+## :blue_book: Quick Reference
+
+Dive into more commands and advanced usage in the [documentation](docs/upterm.md).
+To reach your own machine from a laptop or a phone with plain `ssh`, VS Code or `scp`, see [Reach your own machine](#reach-your-own-machine).
+To reach agents running in [Herdr](https://github.com/herdrdev/herdr) at home from a phone or another laptop, see [Reach your Herdr agents from anywhere](guides/herdr.md).
+Below are some notable highlights:
+
+### Joining with `upterm join`
+
+`upterm join` takes the connect string on the host's `➤ Join:` line. If the
+connection drops, it resets most terminal modes the session had set (the
+alternate screen and mouse reporting, for example), says why it's waiting, and
+rejoins on its own: Enter retries at once, and Ctrl-C stops. `~.` leaves.
+
+A forced command (`upterm host --force-command`) starts again on each rejoin,
+so don't use `upterm join` with one whose effects mustn't repeat.
+
+It offers keys as `ssh` does: the agent's, then the default key files, and it
+generates one only when you have none. Unlike `ssh`, it doesn't read
+`~/.ssh/config`: per-host `IdentityFile`, `User` and `ProxyJump` don't apply,
+the target can't be a host alias, and FIDO keys work only through the agent.
+Use `-i`, or plain `ssh`, for those.
+
+### Command Execution
+
+Host a session with any desired command:
+
+```console
+upterm host -- docker run --rm -ti ubuntu bash
+```
+
+### Access Control
+
+Host a session with specified client public key(s) authorized to connect:
+
+```console
+upterm host --authorized-keys PATH_TO_PUBLIC_KEY
+```
+
+Or authorize users by `provider:username`, fetching their public keys from a
+code-hosting service:
+
+```console
+upterm host --authorized-user github:username
+upterm host --authorized-user gitlab:username
+upterm host --authorized-user srht:username
+upterm host --authorized-user codeberg:username
+```
+
+Self-hosted instances are supported by naming the host. `gitea` and `forgejo`
+always require one, since there is no default instance. Keys are always fetched
+over HTTPS:
+
+```console
+upterm host --authorized-user github:username@ghe.example.com
+upterm host --authorized-user gitea:username@git.example.com
+upterm host --authorized-user forgejo:username@git.example.com
+upterm host --authorized-user https://git.example.com/username
+```
+
+For a GitHub Enterprise Server instance that requires a login, authenticate
+first with `gh auth login --hostname ghe.example.com`; only credentials stored
+for that host are used.
+
+### SSH agents and hardware keys
+
+`upterm host` authenticates to the server with your SSH identity when the
+tunnel is established, the same as `ssh` would, and again whenever it
+reconnects. Everything else — guest joins, `upterm attach`, key renegotiation —
+uses a key generated for the session, so an agent that confirms each signature
+(gpg-agent with a smartcard, 1Password, a FIDO key) asks at start. On a server
+that accepts any host, as uptermd.upterm.dev does, a reconnect uses the
+session's own key and doesn't ask the agent, unless `--private-key` names the
+identities: those are then the only ones offered, on every reconnect too. On a
+server with `--authorized-keys`, such an agent asks on every reconnect. For a
+long-lived session that will reconnect, use a key file or an agent without
+per-use confirmation.
+
+To keep such an agent out of it entirely, name a plain key. A supplied
+`--private-key` is the whole set, like OpenSSH's `IdentitiesOnly`:
+
+```console
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/upterm
+upterm host --private-key ~/.ssh/upterm
+```
+
+To use one particular agent identity, name its public key:
+
+```console
+upterm host --private-key ~/.ssh/id_ed25519_sk.pub
+```
+
+Guests still authenticate with a key of their own. A session with no
+`--authorized-keys` or `--authorized-user` accepts any key, but not none.
+Started with `--accept` as well, such a session is open: anyone with the
+session ID can join, and nobody is asked. `upterm host` warns about it as the
+session starts, and `upterm session info` says so (`"open": true` in its
+JSON).
+
+### Force command
+
+Host a session initiating `tmux new -t pair-programming`, while ensuring clients join with `tmux attach -t pair-programming`.
+This mirrors functionality provided by tmate:
+
+```console
+upterm host --force-command 'tmux attach -t pair-programming' -- tmux new -t pair-programming
+```
+
+A forced command starts again each time `upterm join` rejoins; nothing the previous one did is undone.
+
+Each guest's forced command runs on a pty of its own, with `SSH_TTY`, `SSH_CONNECTION` and `SSH_CLIENT` set as sshd sets them, so a program that copies over OSC 52 when it runs over SSH copies to the guest's clipboard. `--hide-client-ip` leaves out the two that carry the guest's address.
+
+### Running Without a Terminal
+
+Host a session from a script or CI step with nothing attached to its terminal. `--accept` skips the confirmation prompt, `--name` gives the session a local name you choose, and `--pty-size` pins the terminal geometry so the command renders the same for every client:
+
+```console
+upterm host --accept --name build-shell --pty-size 132x43 -- bash &
+```
+
+In a fresh environment `known_hosts` does not yet hold the relay's key, and the host-key confirmation cannot be answered without a terminal. Pin it directly:
+
+```console
+mkdir -p ~/.ssh && cat >> ~/.ssh/known_hosts <<'EOF'
+@cert-authority uptermd.upterm.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4
+@cert-authority [uptermd.upterm.dev]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4
+EOF
+```
+
+The same two lines are committed at [`etc/known_hosts/uptermd.upterm.dev`](etc/known_hosts/uptermd.upterm.dev), for anyone who would rather fetch the file than paste it — compare the fingerprint of *every* line in whatever you fetch before trusting it. `uptermd.upterm.dev`'s host key has the SHA256 fingerprint `SHA256:9ajV8JqMe6jJE/s3TYjb/9xw7T0pfJ2+gADiBIJWDPE`; that's the value to check against, however you obtained the key.
+
+Note that `ssh-keyscan uptermd.upterm.dev` is **not** a substitute. It records whatever answered the scan, so its line is only as good as the fingerprint check you make on it. The relay presents an SSH host certificate signed with its own key, and upterm checks the plain key line `ssh-keyscan` emits against that key, as OpenSSH does; upterm 0.37.0 and earlier authorize a certificate only through a line marked `@cert-authority`, and fall back to the first-connection prompt, which a runner with no terminal can't answer.
+
+`--skip-host-key-check` accepts whatever answers on the first connection. It is convenient for a self-hosted relay you are bringing up, and it is not a substitute for pinning: on a fresh runner it will trust anything that can intercept that connection.
+
+If this key is ever rotated, a pin pasted into a job has to be updated by hand: the fingerprint here changes, and so does the copy bundled with [action-upterm](https://github.com/owenthereal/action-upterm), which needs a release of its own. A stale pin surfaces as a host-key mismatch, and upterm won't connect until it is updated. upterm 0.37.0 and earlier treat it as an unknown host instead: a job with no terminal fails, because the first-connection prompt cannot be answered, and an interactive run is prompted and could accept the new key, so update the pin rather than accepting at the prompt. Watch this section after upgrading.
+
+Look the session up by name while it runs and after it ends. The record outlives the process and carries how the command finished:
+
+```console
+upterm session info build-shell -o json
+```
+
+The `status` field is `starting`, `ready`, `reconnecting`, `disconnected` or `ending` while the session still holds its name, and `ended` once nobody does; `reason` is `exited` (with `exitCode`), `signaled` (with `signal` and originating `signalNumber`), `stopped` (explicit admin stop), `canceled` (parent cancellation), `join_timeout`, `startup_failed`, `startup_abandoned` (declined at the confirmation prompt) or `unknown`. While it is `reconnecting`, `tunnelReason` says why (`network`, `relay_error`, `agent_unavailable`, `agent_refused`, `auth_refused`, `relay_key_changed`, `relay_unsupported` or `proof_refused`), with `tunnelLostAt`, `tunnelError` and `nextAttemptAt`; a `disconnected` session's `tunnelReason` is `reconnect_unsupported`. `reconnect` is `supported` or `unsupported` once the first connection has shown which.
+
+`upterm session wait NAME` returns the command's exit code, 0 for explicit stop or join timeout, 128 plus the originating signal number for host or command signals, and 125 for cancellation or unavailable outcomes. Lookup, read and replacement failures, and cancellation of the waiter's context, return 125 with a diagnostic; interrupting the observer leaves the session alive. Legacy stopped records remain successful; legacy signal records without a valid numeric signal return 125. The on-disk record calls the numeric field `signal_number`.
+
+To keep a session open while a build runs and give people a window to join only if it fails, set the join timeout when the build is done instead of at launch. The script keeps the build's exit status, and works under `set -e`:
+
+```sh
+upterm host --detach --accept --name build -- bash
+build_exit_code=0
+make || build_exit_code=$?
+if [ "$build_exit_code" -ne 0 ]; then
+  # Ten minutes for someone to join; once they have, it runs until they exit.
+  if upterm session set build --join-timeout 10m; then
+    upterm session wait build || true
+  fi
+fi
+upterm session stop build || true   # ends it either way; never masks the build's result
+exit "$build_exit_code"
+```
+
+The variable is `build_exit_code` rather than `status`, which zsh reserves. Interrupting `upterm session wait` on its own leaves the session running; in this script it falls through to `session stop`, which ends it. Each `session set` restarts the window from now, so running it again with the same duration extends the deadline; `--join-timeout 0` turns it off. A guest who joins at any point, even briefly or only over SFTP, claims the session: the join timeout is off for the rest of its life, and a later `session set` says so. `session info` shows the timeout and its deadline (`joinTimeout`, `joinDeadline` in the JSON), and where they came from (`joinStateSource`: the daemon, or the record when the session did not answer). `session info`, `session stop` and `session set` exit 4 when no session has the name.
+
+The hosted command sees its own name in `UPTERM_SESSION_NAME`. `upterm session list` shows every live session, including one started under a different `XDG_RUNTIME_DIR` — a cron job or a system service — reached through the admin socket path its record carries. Records outlive the sessions that wrote them for seven days, and the listing prunes the ones past that.
+
+Put a terminal on a session started without one, from any shell on the same machine:
+
+```console
+upterm attach build-shell
+```
+
+Type `~.` at the start of a line to detach; the session keeps running, and `upterm attach` again picks up where the screen left off. On Unix, `~^Z` suspends the terminal instead — `fg` resumes it. `--escape-char none` sends every keystroke to the session. A session's own terminal counts as a client too: `session info` lists it as `host`, guests as `guest`, and a guest connection's forwards (see [Local TCP Forwarding](#local-tcp-forwarding)) as `jump`. In its JSON, `guestCount` counts currently connected guests (including jumps, excluding host terminals); scripts asking whether a terminal or SFTP guest has ever joined should use `firstGuestJoinedAt`.
+
+### Reconnecting
+
+If the host's connection to the server drops — a Wi-Fi switch, a laptop
+waking up, a server deploy — `upterm host` reconnects on its own and keeps the
+same session ID, so the same connect string works again once it's back. While it
+retries, `upterm session info` shows `reconnecting`, why, and when it tries
+next. Nothing on the host stops: the command, its terminal and a local
+`upterm attach` carry on. The ID lasts as long as the `upterm host` process,
+not across a restart.
+
+(On a self-hosted relay with several nodes and no Consul, a host that comes back on another node gets a new connect string; `upterm session info` shows it.)
+
+Guests connected at the drop are disconnected. A guest who joined with
+`upterm join` rejoins on its own once the host is back, and says it's waiting
+and when it tries next until then. If the connect string changed, as in the
+note above, it keeps waiting on the old one and, after 5 minutes, adds that the
+session may have ended or moved: stop it with Ctrl-C and join the new one. A
+plain `ssh` guest rejoins with the same command; one who tries during the gap
+is told:
+
+```text
+upterm: no host is connected for session ID right now. If it's reconnecting, try again once it's back; on some relays the host then has a new command to share. Otherwise it may have ended, or the ID may be wrong.
+```
+
+(A plain `ssh` guest who enters at another node of a multi-node relay reads a shorter form, in ssh's `channel 0: open failed` line: `…right now; it may have ended, or the ID may be wrong.`)
+
+For machines without upterm, this script rejoins an interactive session
+automatically and leaves the terminal usable after a drop. Save it as
+`upterm-rejoin` and run it in place of `ssh`, with the same arguments:
 
 ```bash
-$ upterm upgrade # upgrade to the latest version
-
-$ upterm upgrade VERSION # upgrade to a version
+#!/usr/bin/env bash
+# upterm-rejoin: rejoin an interactive upterm session when the connection drops.
+# Retries only when ssh itself fails (exit 255). Any other exit status is the
+# remote side ending — your shell's own `exit 1` included — and stops. It stops
+# too after 10 tries in a row that fail within 5 s, before the session starts.
+reset_modes() { printf '\030\0337\033[?1049l\033[?1047l\033[?47l\033[r\0338\033[?1l\033[?7h\033[?25h\033[?1000l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?2004l\033[<u\033[>4m\033(B'; }
+trap reset_modes EXIT   # also runs on Ctrl-C
+fails=0
+while :; do
+  start=$SECONDS
+  ssh -t "$@"; rc=$?
+  reset_modes
+  [ "$rc" -eq 255 ] || exit "$rc"
+  if [ $((SECONDS - start)) -lt 5 ]; then fails=$((fails + 1)); else fails=0; fi
+  if [ "$fails" -ge 10 ]; then
+    echo "upterm-rejoin: 10 tries in a row failed within 5 s; stopping. upterm join says why, and waits for a host that's reconnecting." >&2
+    exit 255
+  fi
+  echo "upterm-rejoin: connection lost; rejoining in 3 s (Ctrl-C to stop)" >&2
+  sleep 3 || exit 130
+done
 ```
 
-### Mac
+- To stop, press Ctrl-C during the pause. While connected, Ctrl-C goes to the
+  session.
+- ssh's `~.` also exits 255, and so reconnects; follow it with Ctrl-C.
+- A remote command that exits 255 is retried too, which is why the script is
+  for interactive sessions only.
+- A refused key, a session that has ended and a host that's still away all
+  exit 255 before the session starts, so after about half a minute of those
+  the script stops. [`upterm join`](#joining-with-upterm-join) tells them
+  apart, and keeps waiting for a host that's reconnecting.
 
+Reconnecting needs a server that supports it: uptermd 0.34.0 or later, which
+uptermd.upterm.dev runs. With an older one, `upterm session info` says
+`Reconnect: unsupported by this relay`, and a lost connection leaves the
+session `disconnected`, as before.
+
+### Reach your own machine
+
+Leave a door open on a machine, at home say, and reach it from a laptop or a
+phone with plain `ssh`, `scp` and VS Code, through the relay, without opening
+a port. Only your own keys get in:
+
+1. On the machine, pin the relay's key first, so the door checks the relay
+   rather than trusting whatever answers: the lines are under
+   [Running Without a Terminal](#running-without-a-terminal).
+2. Open the door:
+
+   ```console
+   upterm host --detach --name home --full-access \
+     --authorized-user github:YOUR_GITHUB_USER \
+     --login-command herdr
+   ```
+
+   - `--authorized-user github:YOUR_GITHUB_USER` lets in only the keys on
+     your GitHub account, as they are when the door starts.
+   - `--full-access` lets those keys do what an SSH login to your account
+     can, without asking you: run commands, transfer files, and forward
+     ports to this machine's loopback addresses.
+   - `--login-command herdr` is what plain `ssh home` opens: a
+     [Herdr](guides/herdr.md) client of its own for each guest. Without it,
+     plain `ssh home` shares the door's own terminal.
+   - `--detach` asks before it starts the door, on this terminal, then
+     leaves it running in the background.
+3. The door prints its ssh config as it starts. Print it again whenever you
+   need it:
+
+   ```console
+   upterm session ssh-config home
+   ```
+
+   Put both parts on each laptop: the `Host home` block in its
+   `~/.ssh/config`, and the relay's line in its `~/.ssh/known_hosts`, once.
+   The block's `User` changes whenever the door restarts, and on a relay that
+   routes by node, also when the door comes back on another node, so print
+   it again then.
+4. From the laptop: `ssh home`, `scp notes.txt home:`, `sftp home`, or
+   VS Code's **Remote-SSH: Connect to Host…** → `home`.
+
+The key `ssh home` offers has to be on your GitHub account, as it was when
+the door started: after you add, change or revoke one there, restart the
+door. [Reach your Herdr agents from anywhere](guides/herdr.md) covers the
+rest: a phone, keeping the machine awake, and a jump to its own sshd.
+
+#### VS Code
+
+VS Code's Remote-SSH starts its server on the session's machine with a
+command, and talks to it through a forward to a loopback port there, so it
+needs a session that allows both: `--full-access`, or `--allow-exec
+--allow-forwarding=loopback`. Put the block `upterm session ssh-config NAME`
+prints in `~/.ssh/config`, add the relay's line to `~/.ssh/known_hosts`, and
+choose **Remote-SSH: Connect to Host…** → `NAME`.
+
+To reach a server on that machine from the laptop, a dev server on port 3000
+say, add a `LocalForward` with literal loopback addresses to the block, and
+open `http://127.0.0.1:3000`:
+
+```text
+  LocalForward 127.0.0.1:3000 127.0.0.1:3000
 ```
-brew upgrade upterm
+
+In testing, VS Code's own `remote.SSH.defaultForwardedPorts` setting didn't
+forward through upterm: its log said "Created tunnel does not match
+requirements of requested tunnel. Host or port mismatch."
+
+### What guests can do
+
+A guest who joins with `upterm join`, or with plain `ssh` and no command,
+shares your terminal: they see it, and type into it unless the session is
+`--read-only`. A guest can ask for more, and each of these asks you first, in
+your terminal:
+
+| A guest runs | What it does | Allow it without asking | Never allow it |
+| --- | --- | --- | --- |
+| `ssh SESSION CMD`, VS Code, `herdr --remote` | runs `CMD` as you, apart from your terminal | `--allow-exec` | `--no-exec` |
+| `scp`, `sftp` | reads and writes your files | `--allow-sftp` | `--no-sftp` |
+| `ssh -L 8080:127.0.0.1:8080` | reaches a port on this machine's loopback addresses | `--allow-forwarding=loopback` | `--no-forwarding` |
+
+- `--full-access` allows all three for the keys `--authorized-user` or
+  `--authorized-keys` names, and refuses to start without one of them:
+  without an allowlist, anyone with the session ID would get a shell as you.
+- `--accept` starts the session without asking you first, and allows file
+  transfers too.
+- `--read-only` lets guests only watch and download: no typing, commands,
+  uploads or forwarding.
+- `--allow-forwarding=any` lets guests reach anything this machine can, not
+  only its loopback addresses: see [Local TCP Forwarding](#local-tcp-forwarding).
+
+A command a guest runs can read more input, and so more code, after the one
+you saw: allowing one is like giving a shell. It runs through `$SHELL -c`
+(or `/bin/sh`) on Unix, and pwsh, Windows PowerShell or cmd.exe on Windows.
+
+`--login-command PROGRAM` gives each guest's plain `ssh` a `PROGRAM` of its
+own, Herdr say, instead of your terminal; a command a guest names still
+follows the table. `--force-command COMMAND` runs `COMMAND` for every guest
+instead of both, and tells it what a guest asked for in
+`SSH_ORIGINAL_COMMAND`. The two can't be used together. `--no-exec` and
+`--read-only` refuse a command a guest names even where the forced command
+would have taken its place, and under `--read-only` the login or forced
+command still opens, but nothing a guest types reaches it.
+
+Whatever a guest runs, its own command or your login or forced command, starts
+in the directory the session started in, with the session's environment minus
+the variables that describe your own SSH connection or terminal pane
+(`SSH_CONNECTION`, `TMUX` and `HERDR_ENV`, for example). A guest's own
+environment requests are ignored.
+
+`--login-command`, `--allow-exec`, `--allow-sftp`, `--allow-forwarding`,
+`--full-access`, `--no-exec` and `--no-forwarding` are set on the command line
+only, not in the environment or the config file: restart the session to
+change them.
+
+#### Approving requests
+
+When a guest asks for something, upterm says so in your terminal. Type `~a` at
+the start of a line to review the oldest request. The review says who is
+asking and what they want. A guest that a `provider:user` entry names, such
+as `--authorized-user github:alice`, is shown as `alice (github:alice)`. Any
+other guest is shown by their key, with the entry that let them in when there
+is one: a URL entry or an `--authorized-keys` file. Answer with the code it
+shows:
+
+- `y CODE` then Enter allows what the review names, on this connection only:
+  that command, that destination, or every file operation on that path (for
+  two paths, renaming or linking the first to the second);
+- `a CODE` then Enter allows this guest the same kind of request until the
+  session ends, across reconnects;
+- `n CODE` then Enter denies it;
+- Esc decides later. A request expires 60 seconds after it arrives.
+
+Allowing a guest's commands never allows it file transfers or forwarding.
+
+Only the session's primary terminal can answer: the one attached to it
+first. A session in the background (`--detach`) has none until you
+`upterm attach NAME`, and until then a request is denied at once. On a door,
+the shell `upterm attach` puts you in is the door's own: `exit` there closes
+it for every guest, so leave with `~.` instead. `--escape-char none` turns
+review off; another `--escape-char` takes the place of `~`, typed twice to
+send it (`~~a` sends `~a`).
+
+`session info`, `session current` and `upterm host --detach -o json` report
+what the session allows: `guestShell` (`shared`, `login`, `forced`),
+`execution` (`off`, `approval`, `granted`, `forced`), `tcpForwarding` (`off`,
+`loopback-approval`, `loopback`, `all`) and `approvalMethod` (`terminal`,
+`custom`, `unavailable`). They say how the session was started, never what
+has been allowed since. An older upterm doesn't report them, and neither
+does a session that has ended. The older `localForwarding` boolean is true
+only when forwards to anything are allowed.
+
+### File Transfer (SFTP/SCP)
+
+Clients can transfer files using standard `scp` or `sftp` commands. Run the commands shown under `➤ SFTP:` and `➤ SCP:` in `upterm session current`. A self-hosted relay may put a `:` in the session user, so pass it with `-o User=` to keep `scp` and `sftp` from treating the session ID as a host name:
+
+```console
+# Download a file from host
+scp -o User=SESSION_USER uptermd.upterm.dev:/path/to/file.txt ./local/
+
+# Upload a file to host
+scp -o User=SESSION_USER ./local/file.txt uptermd.upterm.dev:/path/to/destination/
 ```
 
-## Quick Reference
+With the block `upterm session ssh-config NAME` prints in `~/.ssh/config`, `scp NAME:/path/to/file.txt ./local/` works the same.
 
-```bash
-# Host a terminal session that runs $SHELL with
-# client's input/output attaching to the host's
-$ upterm host
+**Security model:**
 
-# Display the ssh connection string and share it with
-# the client(s)
-$ upterm session current
-=== SESSION_ID
-Command:                /bin/bash
-Force Command:          n/a
-Host:                   ssh://uptermd.upterm.dev:22
-SSH Session:            ssh TOKEN@uptermd.upterm.dev
+- File transfers have the same access as the terminal session (clients can already access any file via the shell)
+- Each file operation asks you first, as [Approving requests](#approving-requests) describes, unless `--allow-sftp`, `--accept` or `--full-access` allows transfers. One that isn't approved, because you denied it, it expired, or nothing could answer it, fails with scp's or sftp's own `Permission denied`
+- Use `--read-only` to restrict SFTP to downloads only (no uploads, deletes, or modifications)
+- Use `--no-sftp` to disable file transfers entirely
 
-# A client connects to the host session with ssh
-$ ssh TOKEN@uptermd.upterm.dev
+### Local TCP Forwarding
 
-# Host a terminal session that only allows specified client public key(s) to connect
-$ upterm host --authorized-key PATH_TO_PUBLIC_KEY
+Guests can use standard SSH local forwarding (`ssh -L`, or `LocalForward` in
+`~/.ssh/config`) through a session to this machine's loopback addresses:
+literal `127.0.0.0/8` and `::1`. Each forward asks you first, unless
+`--allow-forwarding=loopback` or `--full-access` allows them. Hostnames,
+`localhost` included, mapped IPv6 and addresses with a zone are refused, as is
+anywhere else this machine can reach, unless `--allow-forwarding=any` allows
+forwards to anything, without asking. `--no-forwarding` and `--read-only`
+refuse all forwarding, and `--accept` allows none.
 
-# Host a session with a custom command
-$ upterm host -- docker run --rm -ti ubuntu bash
+For example:
 
-# Host a session that runs 'tmux new -t pair-programming' and
-# force clients to join with 'tmux attach -t pair-programming'.
-# This is similar to what tmate offers.
-$ upterm host --force-command 'tmux attach -t pair-programming' -- tmux new -t pair-programming
-
-# Connect to uptermd.upterm.dev via WebSocket
-$ upterm host --server wss://uptermd.upterm.dev -- bash
-
-# A client connects to the host session via WebSocket
-$ ssh -o ProxyCommand='upterm proxy wss://TOKEN@uptermd.upterm.dev' TOKEN@uptermd.upterm.dev:443
+```console
+upterm host --allow-forwarding=loopback
+ssh -L 5555:127.0.0.1:8080 SESSION_USER@uptermd.upterm.dev
 ```
 
-More advanced usage is [here](https://github.com/owenthereal/upterm/blob/master/docs/upterm.md).
+A refused forward shows up only once something connects to the local port,
+as OpenSSH's own line in the guest's terminal, such as:
 
-## Tips
+```text
+channel 3: open failed: administratively prohibited: upterm: forwarding to localhost:8080 refused: upterm forwards only to literal loopback addresses; use 127.0.0.1:8080 or [::1]:8080
+```
 
-**Why doesn't `upterm session current` show current session in Tmux?**
+After the first successful forward, the guest appears in session info and join/leave notifications until its SSH connection closes, even between forwarding channels. It is listed as `jump`, followed by where its forwards go, such as `→ 127.0.0.1:8080`: each distinct destination once, up to 16, then how many more forwards it opened, to anywhere else (`(+N more forwards)`). `--hide-client-ip`, and CI, hide the destinations along with the address. Multiple forwards on that connection share one entry; terminal and SFTP sessions retain their own entries. Forwarding alone does not set `firstGuestJoinedAt` or satisfy `--join-timeout`: an accepted terminal or SFTP session must join before that deadline. An idle `ssh -N` connection or a failed forward does not appear.
 
-`upterm session current` needs the `UPTERM_ADMIN_SOCKET` environment variable to function.
-And this env var is set in the specified command.
-Unfotunately, Tmux doesn't carry over environment variables that are not in its default list to any Tmux session unless you tell it to ([Ref](http://man.openbsd.org/i386/tmux.1#GLOBAL_AND_SESSION_ENVIRONMENT)).
-So to get `upterm session current` to work, add the following line to your `~/.tmux.conf`
+### WebSocket Connection
+
+In scenarios where your host restricts ssh transport, establish a connection to `uptermd.upterm.dev` (or your self-hosted server) via WebSocket:
+
+```console
+upterm host --server wss://uptermd.upterm.dev -- bash
+```
+
+Clients can connect to the host session via WebSocket as well:
+
+```console
+upterm join wss://SESSION_USER@uptermd.upterm.dev
+```
+
+Or with plain `ssh`, through `upterm proxy`, which the guest needs installed too: `upterm session ssh-config NAME` prints a `Host` block whose `ProxyCommand` runs it.
+
+### HTTP Proxy
+
+If the host can only reach the internet through an HTTP proxy, pass it with `--proxy`. It works with `ssh://`, `ws://` and `wss://` servers, so the default server works too as long as the proxy allows `CONNECT` to port 22:
+
+```console
+upterm host --proxy http://proxy.example.com:3128 -- bash
+```
+
+Without `--proxy`, `ws://` and `wss://` connections already use `HTTPS_PROXY`/`HTTP_PROXY`, but `ssh://` connections go direct. Many corporate proxies only allow `CONNECT` to port 443; in that case, use `--server wss://uptermd.upterm.dev` as well.
+
+Like other flags, `--proxy` can be set with `UPTERM_PROXY` or as `proxy` in the config file, which keeps proxy credentials off the command line. Clients behind a proxy pass the same flag to `upterm join` or `upterm proxy`.
+
+### Debug GitHub Actions
+
+`upterm` can be integrated with GitHub Actions to enable real-time SSH debugging, allowing you to interact directly with the runner system during workflow execution. This is achieved through [action-upterm](https://github.com/owenthereal/action-upterm), which sets up an `upterm` session within your CI pipeline.
+
+To get started, include `action-upterm` in your GitHub Actions workflow as follows:
+
+```yaml
+name: CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Setup upterm session
+      uses: owenthereal/action-upterm@v2
+```
+
+This setup allows you to SSH into the workflow runner whenever you need to troubleshoot or inspect the execution environment. Find the SSH connection string in the `Checks` tab of your Pull Request or in the workflow logs.
+
+VS Code can open the runner too, when the session allows what it needs: see [VS Code](#vs-code).
+
+action-upterm v2 runs the session on upterm's own background daemon (`upterm host --detach`) instead of tmux, and requires upterm v0.32.0 or newer, which it installs by default. upterm itself enforces `wait-timeout-minutes`: attached mode passes it as `--join-timeout`, and detached mode hands it over with `upterm session set` once the job's other steps are done. The first guest to join claims the session for good, even one who left again before the window opened.
+
+For comprehensive details on configuring and using this integration, visit the [action-upterm GitHub repo](https://github.com/owenthereal/action-upterm).
+
+### Debug Other CI Systems
+
+Everything the GitHub Action does is available from the CLI, so the same pattern works on GitLab, Buildkite, a self-hosted runner, or any script: start a detached session, print the join command, and block until someone has used it — or until nobody has joined in time.
+
+```sh
+command -v jq >/dev/null || { echo "this recipe needs jq" >&2; exit 1; }
+
+# Pin the relay's key so a clean runner with no terminal verifies it instead
+# of trusting whatever answers; see "Running Without a Terminal" for the
+# fingerprint to check it against.
+known_hosts=$(mktemp)
+cat > "$known_hosts" <<'EOF'
+@cert-authority uptermd.upterm.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4
+@cert-authority [uptermd.upterm.dev]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4
+EOF
+
+# Start detached, capture name + join command in one shot.
+upterm host --detach --accept --output json \
+  --known-hosts "$known_hosts" \
+  --authorized-user "github:${DEBUG_USER:?set DEBUG_USER to the GitHub user who may join}" \
+  --join-timeout 10m -- bash > session.json || exit
+name=$(jq -er .name session.json) || exit
+
+# End the session however this script ends: finished, cancelled or timed out.
+trap 'upterm session stop "$name" 2>/dev/null || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "join: $(jq -r .sshCommand session.json)"
+upterm session wait "$name" & wait $! || true   # waiting in the shell lets a signal interrupt it
+```
+
+- The job pins the relay's key with `--known-hosts`, so a fresh runner with no terminal verifies the relay rather than trusting whatever answers. See "Running Without a Terminal" for the published key and its fingerprint.
+- `--authorized-user` is not optional on a shared runner: the join command ends up in a log. Set `DEBUG_USER` to the GitHub account that should get in; the recipe stops if it is unset. For another provider, replace the whole `github:` value (`gitlab:NAME`, `codeberg:NAME`, `srht:NAME`, `gitea:NAME@HOST` and `--authorized-keys FILE` work too).
+- Leaving out `--name` lets upterm pick a name no other session on the machine holds, so concurrent jobs on one worker cannot stop each other's sessions; the recipe reads it back from the JSON.
+- The recipe checks for `jq` before it starts anything, and `|| exit` stops the step when the session did not start (for example, the relay is unreachable), instead of letting it pass without one.
+- `--join-timeout` ends the session if no guest joins within that long, and exits 0, so an unanswered debug session does not fail the build. Once a guest has joined it never re-arms.
+- `upterm session wait` blocks until the session ends and exits with its outcome — 0 for a join timeout or an explicit `session stop`. A guest who disconnects without exiting the shell leaves the session running until the job ends.
+- The session runs in its own background daemon, which a runner that stops only the job's processes would leave behind, so the `trap` stops it when the script finishes, is cancelled or times out, whether the runner signals the whole job or only this shell; a cancelled script still exits non-zero (130 for SIGINT, 143 for SIGTERM). A runner that kills the job outright, with no SIGINT or SIGTERM first, gives the trap no chance: stop the session from the job's cleanup hook there. Expect this on Windows: GitHub Actions' Windows runners end a cancelled Git Bash step without running any of its traps.
+- To open the session before the build and count only after a failure, leave `--join-timeout` off the `upterm host` line and use the failed-build script under "Running Without a Terminal".
+
+## :bulb: Tips
+
+### Resolving Tmux Session Display Issue
+
+**Issue**: The command `upterm session current` does not display the current session when used within Tmux.
+
+**Cause**: This occurs because `upterm session current` requires the `UPTERM_ADMIN_SOCKET` environment variable, which is set in the specified command. Tmux, however, does not carry over environment variables not on its default list to any Tmux session unless instructed to do so ([Reference](http://man.openbsd.org/i386/tmux.1#GLOBAL_AND_SESSION_ENVIRONMENT)).
+
+**Solution**: To rectify this, add the following line to your `~/.tmux.conf`:
 
 ```conf
-set-option -ga update-environment " UPTERM_ADMIN_SOCKET"
+set-option -ga update-environment " UPTERM_ADMIN_SOCKET UPTERM_SESSION_NAME"
 ```
 
-**How to make it obvious that I am in an upterm session?**
+### Identifying Upterm Session
 
-It can be confusing whether your shell command is running in an upterm session or not, especially if the shell command is `bash` or `zsh`.
-Add the following line to your `~/.bashrc` or `~/.zshrc` and decorate your prompt to show a sign if the shell command is in a terminal session:
+**Issue**: It might be unclear whether your shell command is running in an upterm session, especially with common shell commands like `bash` or `zsh`.
+
+**Solution**: Use `upterm session current -o go-template` to customize your shell prompt with session info. Add to your `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-export PS1="$([[ ! -z "${UPTERM_ADMIN_SOCKET}"  ]] && echo -e '\xF0\x9F\x86\x99 ')$PS1" # Add an emoji to the prompt if `UPTERM_ADMIN_SOCKET` exists
+# Show 🆙 emoji and connected client count when in upterm session
+# (zsh also needs `setopt PROMPT_SUBST` for the prompt to run the command)
+export PS1='$([ -n "$UPTERM_ADMIN_SOCKET" ] && upterm session current -o go-template="🆙 {{.ClientCount}} " 2>/dev/null)'"$PS1"
 ```
 
-## Demo
+The `UPTERM_ADMIN_SOCKET` check keeps `upterm` from running on every prompt outside a session. With [Starship](https://starship.rs), add to `~/.config/starship.toml` and include `${custom.upterm}` in your `format` (or leave `format` unset so Starship places it):
 
-[![asciicast](https://asciinema.org/a/LTwpMqvvV98eo3ueZHoifLHf7.svg)](https://asciinema.org/a/LTwpMqvvV98eo3ueZHoifLHf7)
+```toml
+[custom.upterm]
+command = "upterm session current -o go-template='{{.ClientCount}}'"
+when = 'test -n "$UPTERM_ADMIN_SOCKET"'
+format = "([🆙 $output]($style) )"
+style = "bold yellow"
+shell = ["sh"]
+```
 
-## How it works
+**Template variables available** (Go templates use PascalCase field names):
 
-You run the `upterm` program by specifying the command for your terminal session.
+- `{{.SessionID}}` - Session ID
+- `{{.ClientCount}}` - Number of connected clients
+- `{{.Host}}` - Server host
+- `{{.Command}}` - Command being shared
+- `{{.ForceCommand}}` - Force command (if set)
+
+> **Note**: JSON output (`-o json`) uses camelCase keys (e.g., `sessionId`, `clientCount`).
+>
+> **Tip**: The same template mechanism can be used for terminal titles or other integrations.
+
+**Alternative** (simpler, without client count):
+
+```bash
+export PS1="$([[ ! -z "${UPTERM_ADMIN_SOCKET}"  ]] && echo -e '\xF0\x9F\x86\x99 ')$PS1"
+```
+
+## :gear: How it works
+
 Upterm starts an SSH server (a.k.a. `sshd`) in the host machine and sets up a reverse SSH tunnel to a [Upterm server](https://github.com/owenthereal/upterm/tree/master/cmd/uptermd) (a.k.a. `uptermd`).
-Clients connect to your terminal session over the public internet via `uptermd` using `ssh` using TCP or WebSocket.
-A community Upterm server is running at `uptermd.upterm.dev` and `upterm` points to this server by default.
+Clients connect to a terminal session over the public internet via `uptermd` using `ssh` or `ssh` over WebSocket.
 
 ![upterm flowchart](https://raw.githubusercontent.com/owenthereal/upterm/gh-pages/upterm-flowchart.svg?sanitize=true)
 
-## Deploy Uptermd
+## :hammer_and_wrench: Deployment
 
 ### Kubernetes
 
 You can deploy uptermd to a Kubernetes cluster. Install it with [helm](https://helm.sh):
 
+```console
+helm repo add upterm https://upterm.dev
+helm repo update
+helm install uptermd upterm/uptermd
 ```
-$ helm repo add upterm https://upterm.dev
-$ helm repo update
-$ helm search repo upterm
-NAME            CHART VERSION   APP VERSION     DESCRIPTION
-upterm/uptermd  0.1.0           0.4.1           Secure Terminal Sharing
-$ helm install uptermd upterm/uptermd
-```
+
+### Fly.io
+
+The cheapest way to deploy a worry-free [Upterm server](https://github.com/owenthereal/upterm/tree/master/cmd/uptermd) (a.k.a. `uptermd`) is to use [Fly.io](https://fly.io).
+Fly offers a generous free tier and excellent global performance. The official uptermd community server is hosted on Fly.
+
+1. Install the Fly CLI and authenticate:
+
+   ```console
+   curl -L https://fly.io/install.sh | sh
+   flyctl auth login
+   ```
+
+1. Copy [`fly.example.toml`](./fly.example.toml) to `fly.toml` and set your app
+   name. It pulls the published `ghcr.io/owenthereal/upterm/uptermd` image, so
+   no local build is needed.
+1. Deploy your uptermd server:
+
+  ```console
+  flyctl deploy
+  ```
+
+Your uptermd server will be available at `your-app-name.fly.dev`. You can connect using either SSH or WebSocket protocols.
+
+> **Upgrading from an earlier release:** `uptermd-fly` no longer exists. Replace your `[build] dockerfile`/`build-target` and `[experimental] entrypoint` settings with the `[build] image` and `[env]` blocks shown in [`fly.example.toml`](./fly.example.toml).
+
+### Variable expansion in configuration
+
+`uptermd` expands environment variable references in its text configuration
+values — flags, `UPTERMD_*` environment variables, and config files alike. This
+exists because the container image has no shell, so values that need a runtime
+value (a machine ID, a pod IP) cannot be interpolated before the process starts.
+
+Expansion applies to text values only. Boolean options — `--debug` and
+`--ssh-proxy-protocol` — are parsed before expansion runs, so a reference such
+as `UPTERMD_DEBUG=${DEBUG_ENABLED}` fails at startup with a parse error rather
+than being substituted. Give booleans a literal `true` or `false`.
+
+| Syntax | Meaning |
+| --- | --- |
+| `${NAME}` | Required. `uptermd` exits at startup if `NAME` is unset or empty. |
+| `${NAME:-default}` | Uses `default` when `NAME` is unset or empty. |
+| `$${` | A literal `${` (outside defaults only). |
+
+A `$` not followed by `{` is always literal, and substituted values are never
+rescanned — a password containing `${TOKEN}` is passed through untouched. The `$${` escape applies only outside defaults; a default value cannot contain `${` or `}`.
+
+Comma-separated lists are split before expansion, so a substituted value is always a single element — with `HOSTS=a.example.com,b.example.com`, setting `UPTERMD_HOSTNAME=${HOSTS}` produces one element, not two.
+
+If an existing configuration value contains a literal `${`, escape it as `$${`.
 
 ### Heroku
 
-The cheapest way to deploy a worry-free [Upterm server](https://github.com/owenthereal/upterm/tree/master/cmd/uptermd) (a.k.a. `uptermd`) is to use [Heroku](https://heroku.com).
-Heroku offers [free Dyno hours](https://www.heroku.com/pricing) which should be sufficient for most casual uses.
+You can deploy an [Upterm server](https://github.com/owenthereal/upterm/tree/master/cmd/uptermd) (a.k.a. `uptermd`) to [Heroku](https://heroku.com).
+Note that Heroku discontinued their free tier in November 2022, so this option now requires paid plans.
 
 You can deploy with one click of the following button:
 
@@ -173,35 +765,45 @@ You can also automate the deployment with [Heroku Terraform](https://devcenter.h
 The Heroku Terraform scripts are in the [terraform/heroku folder](./terraform/heroku).
 A [util script](./bin/heroku-install) is provided for your convenience to automate everything:
 
-```
-$ git clone https://github.com/owenthereal/upterm
-$ cd upterm
-
-# Provinsion uptermd in Heroku Common Runtime.
-# Follow instructions
-$ bin/heroku-install
-
-# Provinsion uptermd in Heroku Private Spaces.
-# Follow instructions
-$ TF_VAR_heroku_region=REGION TF_VAR_heroku_space=SPACE_NAME TF_VAR_heroku_team=TEAM_NAME bin/heroku-install
+```console
+git clone https://github.com/owenthereal/upterm
+cd upterm
 ```
 
-You **must** use WebScoket as the protocol for a Heroku-deployed Uptermd server because the platform only support HTTP/HTTPS routing.
+Provision uptermd in Heroku Common Runtime. Follow instructions.
+
+```console
+bin/heroku-install
+```
+
+Provision uptermd in Heroku Private Spaces. Follow instructions.
+
+```console
+TF_VAR_heroku_region=REGION TF_VAR_heroku_space=SPACE_NAME TF_VAR_heroku_team=TEAM_NAME bin/heroku-install
+```
+
+You **must** use WebSocket as the protocol for a Heroku-deployed Uptermd server because the platform only support HTTP/HTTPS routing.
 This is how you host a session and join a session:
 
-```
-# Use the Heroku-deployed Uptermd server via WebSocket
-$ upterm host --server wss://YOUR_HEROKU_APP_URL -- YOUR_COMMAND
+Use the Heroku-deployed Uptermd server via WebSocket
 
-# A client connects to the host session via WebSocket
-$ ssh -o ProxyCommand='upterm proxy wss://TOKEN@YOUR_HEROKU_APP_URL' TOKEN@YOUR_HEROKU_APP_URL:443
+```console
+upterm host --server wss://YOUR_HEROKU_APP_URL -- YOUR_COMMAND
 ```
+
+A client connects to the host session via WebSocket
+
+```console
+upterm join wss://SESSION_USER@YOUR_HEROKU_APP_URL
+```
+
+Or with plain `ssh`, through the block `upterm session ssh-config NAME` prints on the host.
 
 ### Digital Ocean
 
-There is an util script that makes provinsioning [Digital Ocean Kubernetes](https://www.digitalocean.com/products/kubernetes) and an Upterm server easier:
+There is an util script that makes provisioning [Digital Ocean Kubernetes](https://www.digitalocean.com/products/kubernetes) and an Upterm server easier:
 
-```
+```bash
 TF_VAR_do_token=$DO_PAT \
 TF_VAR_uptermd_host=uptermd.upterm.dev \
 TF_VAR_uptermd_acme_email=YOUR_EMAIL \
@@ -210,23 +812,244 @@ TF_VAR_uptermd_host_keys_dir=PATH_TO_HOST_KEYS \
 bin/do-install
 ```
 
-## How is Upterm compared to prior arts?
+### Systemd
 
-Upterm is an alternative to [Tmate](https://tmate.io).
+A hardened systemd service is provided in `systemd/uptermd.service`. You can use it to easily run a
+secured `uptermd` on your machine:
 
-Tmate is a fork of an older version of Tmux. It adds terminal sharing capability on top of Tmux 2.x.
-Tmate doesn't intend to catch up with the latest Tmux, so any Tmate & Tmux users must maintain two versions of the configuration.
-For example, you must [bind the same keys twice with a condition](https://github.com/tmate-io/tmate/issues/108).
+```console
+cp systemd/uptermd.service /etc/systemd/system/uptermd.service
+systemctl daemon-reload
+systemctl start uptermd
+```
 
-Upterm is designed from the group up not to be a fork of anything.
-It builds around the concept of linking the input & output of any shell command between a host and its clients.
-As you see above, you can share any command besides `tmux`.
-This opens up a door for securely sharing a terminal session using containers.
+### Traefik
 
-Upterm is written in Go.
-It is more friendly hackable than Tmate that is written in C because Tmux is C.
-The Upterm CLI and server (`uptermd`) are compiled into a single binary.
-You can quickly [spawn up your pairing server](#deploy-uptermd) in any cloud environment with zero dependencies.
+Below is an example `docker-compose` configuration for deploying `uptermd` behind [Traefik](https://doc.traefik.io/traefik/), including support for both SSH and WebSocket connections:
+
+```yaml
+services:
+  upterm:
+    build: 
+        context: https://github.com/owenthereal/upterm.git
+        dockerfile: Dockerfile.uptermd
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      # SSH over TCP (port 2222)
+      - "traefik.tcp.services.uptermd.loadbalancer.server.port=2222"
+      - "traefik.tcp.services.uptermd.loadbalancer.proxyProtocol.version=2" # required for real IP forwarding over TCP
+      - "traefik.tcp.routers.uptermd.service=uptermd"
+      - "traefik.tcp.routers.uptermd.rule=HostSNI(`*`)"
+      - "traefik.tcp.routers.uptermd.entrypoints=uptermd"
+      # WebSocket over HTTPS (port 8443)
+      - "traefik.http.services.uptermd-wss.loadbalancer.server.port=8443"
+      - "traefik.http.routers.uptermd-wss.service=uptermd-wss"
+      - "traefik.http.routers.uptermd-wss.rule=Host(`upterm.example.com`)" # edit as needed
+      - "traefik.http.routers.uptermd-wss.entrypoints=websecure"
+      - "traefik.http.routers.uptermd-wss.tls.certresolver=<your cert resolver here>"
+
+    command:
+      - --ssh-addr=0.0.0.0:2222
+      - --ws-addr=0.0.0.0:8443
+      - --ssh-proxy-protocol
+
+    networks:
+      - web
+
+networks:
+  web:
+    external: true
+```
+
+**Important notes:**
+
+- **Proxy Protocol:**
+  The `--ssh-proxy-protocol` flag (or `UPTERMD_SSH_PROXY_PROTOCOL=true`) uses the [PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) header when present to preserve the client IP address behind TCP proxies such as Traefik, HAProxy or AWS ELB. The header is optional: direct SSH connections still work.
+  To refuse connections without a PROXY protocol v2 header, use `--ssh-proxy-protocol-required` (or `UPTERMD_SSH_PROXY_PROTOCOL_REQUIRED=true`). This implies `--ssh-proxy-protocol` and requires `--internal-addr`, where node hops and WebSocket bridges connect without a PROXY header. Only v2 PROXY headers describing TCPv4 or TCPv6 are accepted.
+  A valid header from any peer is believed. Use network isolation or a firewall so only trusted proxies can reach the public SSH listener.
+  The `--ssh-network` option (or `UPTERMD_SSH_NETWORK`) selects `tcp` (the default), `tcp4` or `tcp6`. For an IPv4-only public listener, use `--ssh-network=tcp4 --ssh-addr=0.0.0.0:2222`; the default `tcp` preserves dual-stack wildcard binding.
+
+- **Entrypoints:**
+  Make sure to configure the appropriate [Traefik entrypoints](https://doc.traefik.io/traefik/routing/entrypoints/). This example uses two: one for SSH (`uptermd` on port `2222`) and one for WebSocket/HTTPS (`websecure` on port `443`).
+
+- **WebSocket:**
+  The WebSocket service allows clients to connect to `uptermd` over HTTPS, which is useful in restrictive network environments.
+
+- **Certificates:**
+  Replace `<your cert resolver here>` with your actual Traefik certificate resolver for TLS.
+
+For more details on Traefik TCP and HTTP routing, see the [Traefik documentation](https://doc.traefik.io/traefik/routing/overview/).
+
+### Hardening a multi-node relay
+
+Use `--ssh-proxy-protocol-required` to require a PROXY protocol v2 header on
+the public SSH listener. Only trusted proxies may be able to reach that
+listener: a valid header from any peer is believed. The strict listener
+requires `--internal-addr` for node hops and bridged WebSocket guests, which
+do not send PROXY headers.
+
+On Fly, `--ssh-network tcp4 --ssh-addr 0.0.0.0:2222` is one way to isolate
+the public listener. Fly's proxy reaches machines over private IPv4, while
+other apps in the organization reach them over IPv6 (6PN); binding IPv4 keeps
+those apps off this listener. Elsewhere, use your network's own isolation or
+firewall rules to admit only trusted proxies.
+
+Bind `--internal-addr` where only relay nodes can reach it. On Fly, use
+`[fly-local-6pn]:2223` and isolate that port from other apps in the
+organization. The 6PN address alone does not restrict access to relay nodes.
+Set `--node-addr` to this node's reachable internal address when it differs
+from the bound address; it is the address neighbours dial. With an internal
+listener configured, the public SSH listener refuses relay certificates.
+
+#### Hop keys
+
+A dedicated `--hop-key` signs connections between relay nodes. Hosts always
+receive certificates signed with the server's own keys. `--hop-key` takes
+private key files; `HOP_KEY` takes private key PEM content. `--hop-trusted-key`
+takes comma-separated public keys in `authorized_keys` format. A node trusts
+its own hop signing keys implicitly. By default it also accepts hops signed
+with its own server keys; `--hop-refuse-host-key` disables that fallback and
+requires a hop key or trusted hop key.
+
+On a shared SSH listener (without `--internal-addr`), configuring any hop key,
+trusted hop key, or `--hop-refuse-host-key` makes untrusted relay certificates
+fail authentication. With none of those hop options set, the shared listener
+preserves the legacy fallback: an untrusted relay certificate is admitted as
+its certified key if that key may join the session. Certificates without the
+relay extension continue to authenticate as ordinary guest keys.
+
+To migrate from server-key signing to a dedicated hop key H1, complete each
+step on every node before starting the next:
+
+1. Add H1's public key to `--hop-trusted-key` everywhere, still signing with
+   the server key.
+2. Set `--hop-key` to H1's private key everywhere, keeping H1 trusted and
+   continuing to accept server-key hops during the rollout.
+3. Enable `--hop-refuse-host-key` everywhere.
+
+To rotate H1 to H2, keep the outgoing key explicitly trusted until no node
+signs with it:
+
+1. Set `--hop-trusted-key` to H1,H2 everywhere, still signing with H1.
+2. Switch `--hop-key` to H2, keeping `--hop-trusted-key` at H1,H2 on every
+   node throughout the rollout. Nodes already on H2 need H1 listed to accept
+   hops from nodes still on H1.
+3. Once every node signs with H2, remove H1. Keep H2 listed, or clear the
+   trust list because each node trusts its own H2 signing key implicitly.
+
+#### Server-key rotation
+
+`--node-trusted-key` lists additional public keys accepted from a neighbour
+when hopping to it, in comma-separated `authorized_keys` format. A node also
+trusts its own current server keys. Keep the outgoing server key explicitly
+listed until no node presents it.
+
+Server-key rotation also needs a hop authority that remains trusted during
+the rollout. Prefer a dedicated hop key with the migration above complete;
+server-key rotation then leaves hop trust unchanged. If hops still use the
+server key, list both server public keys K1,K2 in `--hop-trusted-key` on every
+node for the entire rollout, alongside `--node-trusted-key`. Switching a
+node's server key to K2 removes its implicit trust in K1, so K1 must stay
+explicitly trusted for hops from nodes still on K1. Without either approach,
+mixed nodes can refuse each other's hops.
+
+These are the complete key settings at each step; K1 and K2 in trust lists
+mean public keys, while the presented key is private key material:
+
+| Step | Presents (`PRIVATE_KEY` / `--private-key`) | `--node-trusted-key` | `--hop-trusted-key`, if hops are still signed with the server key | `--hop-trusted-key`, with a dedicated hop key |
+| --- | --- | --- | --- | --- |
+| 0. Before | K1 | none | none | unchanged |
+| 1. Trust, on every node | K1 | K1,K2 | K1,K2 | unchanged |
+| 2. Present (rolling; mixed while it runs) | K2 on rolled nodes, K1 on the rest | K1,K2 | K1,K2 | unchanged |
+| 3. Retire, after every node presents K2 | K2 | none, or K2 | none, or K2 | unchanged |
+
+Listing a node's current key is harmless. Keep both keys listed on every node
+throughout the rollout, then retire K1 from both trust lists together when
+hops use the server key. Existing hosts pin their relay's server key; these
+settings control trust between relay nodes.
+
+For example, these environment variables configure a Fly node after the
+dedicated hop-key migration, alongside your session routing configuration.
+Every node uses the same hop key; the files below contain private keys.
+Keep the internal port reachable only by relay nodes and configure the
+public proxy to send PROXY v2 headers:
+
+```bash
+export UPTERMD_SSH_ADDR='0.0.0.0:2222'
+export UPTERMD_SSH_NETWORK='tcp4'
+export UPTERMD_SSH_PROXY_PROTOCOL_REQUIRED='true'
+export UPTERMD_INTERNAL_ADDR='[fly-local-6pn]:2223'
+export UPTERMD_NODE_ADDR='${FLY_MACHINE_ID}.vm.${FLY_APP_NAME}.internal:2223'
+export UPTERMD_PRIVATE_KEY='/etc/uptermd/server.key'
+export UPTERMD_HOP_KEY='/etc/uptermd/hop.key'
+export UPTERMD_HOP_REFUSE_HOST_KEY='true'
+```
+
+### Restricting Host Registration
+
+By default, any SSH client that can reach `uptermd` can register a session as a host.
+For private or invite-only deployments, the `--authorized-keys` flag (or `UPTERMD_AUTHORIZED_KEYS` environment variable) restricts host registration to a specific set of public keys.
+This mirrors OpenSSH's [`AuthorizedKeysFile`](https://man.openbsd.org/sshd_config#AuthorizedKeysFile) directive.
+
+```console
+uptermd --authorized-keys /etc/uptermd/authorized_keys
+```
+
+The flag accepts standard `authorized_keys`-formatted files (one key per line, comments allowed) and may be repeated to compose keys from multiple sources:
+
+```console
+uptermd --authorized-keys /etc/uptermd/team.keys --authorized-keys /etc/uptermd/ops.keys
+```
+
+Files are read once at startup; restart `uptermd` to pick up edits. Joiners (clients connecting to a session) are unaffected — they continue to be authorized by the host's own `authorized_keys`.
+
+For the Helm chart, populate the `authorized_keys` value:
+
+```yaml
+authorized_keys:
+  - "ssh-ed25519 AAAA... alice@laptop"
+  - "ssh-ed25519 BBBB... bob@desktop"
+```
+
+### Connection Establishment Budget
+
+The `--handshake-timeout` flag (or `UPTERMD_HANDSHAKE_TIMEOUT` environment variable) bounds how long a
+connection may take to be established, defaulting to `60s`. The budget is split evenly: the first half
+covers authenticating the incoming connection, the second half covers dialing the upstream and
+handshaking with it. A connection that exhausts either half is dropped.
+
+```console
+uptermd --handshake-timeout 90s
+```
+
+Raise it for clients on high-latency links or when the session store is slow to answer; lower it to shed
+half-open connections sooner. The value must be at least `1s`, since each half has to cover a complete SSH
+handshake, and less than `2m`, since each half must also fit inside the validity window of the short-lived
+user certificate `uptermd` mints while authenticating. `0` selects the default rather than disabling the
+timeout.
+
+## :chart_with_upwards_trend: Monitoring
+
+`uptermd` exposes Prometheus metrics at the `/metrics` endpoint when configured with `--metric-addr` (or `UPTERMD_METRIC_ADDR` environment variable).
+
+Available metrics:
+
+- `routing_connections_count` (Counter) - Total number of SSH connections accepted
+- `routing_active_connections_count` (Gauge) - Current number of active SSH connections
+- `routing_connection_duration_seconds` (Histogram) - Connection duration in seconds
+- `routing_errors_count` (Counter) - Total number of connection errors
+- `routing_connection_timeout_count` (Counter) - Number of connections that timed out during establishment
+
+## :balance_scale: Comparison with Prior Arts
+
+Upterm stands as a modern alternative to [Tmate](https://github.com/tmate-io/tmate).
+
+Tmate originates as a fork from an older iteration of Tmux, extending terminal sharing capabilities atop Tmux 2.x. However, Tmate has no plans to align with the latest Tmux updates, compelling Tmate & Tmux users to manage two separate configurations. For instance, the necessity to [bind identical keys twice, conditionally](https://github.com/tmate-io/tmate/issues/108).
+
+On the flip side, Upterm is architected from the ground up to be an independent solution, not a fork. It embodies the idea of connecting the input & output of any shell command between a host and its clients, transcending beyond merely `tmux`. This paves the way for securely sharing terminal sessions utilizing containers.
+
+Written in Go, Upterm is more hack-friendly compared to Tmate, which is crafted in C, akin to Tmux. The seamless compilation of Upterm CLI and server (`uptermd`) into a single binary facilitates swift [deployment of your pairing server](#hammer_and_wrench-deployment) across any cloud environment, devoid of dependencies.
 
 ## License
 

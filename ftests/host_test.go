@@ -1,52 +1,108 @@
 package ftests
 
 import (
+	"bytes"
 	"context"
-	"os"
-	"path/filepath"
-	"strings"
+	"runtime/pprof"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/owenthereal/upterm/host/api"
 	"github.com/owenthereal/upterm/utils"
-	log "github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 )
 
-func testHostClientCallback(t *testing.T, hostURL, nodeAddr string) {
-	jch := make(chan *api.Client)
-	lch := make(chan *api.Client)
+// callbackTimeout bounds how long a test waits for a host callback that is
+// causally downstream of an action the test has already taken. Measured on the
+// happy path, the client-left callback fires ~600µs after Client.Close()
+// returns, so this ceiling is four orders of magnitude of headroom: it costs
+// nothing when the callback fires and keeps the assertion about *whether* the
+// event happened rather than about how loaded the machine is.
+//
+// It replaces a 2s budget that failed roughly one full-suite run in five on
+// testHostClientCallback. A flaky baseline is worse than a slow one here,
+// because the functional suite is the safety net for the front-door rewrite,
+// and a failure that cannot be trusted is not a safety net.
+const callbackTimeout = 10 * time.Second
 
-	adminSockDir, err := newAdminSocketDir()
-	if err != nil {
-		t.Fatal(err)
+// awaitClientCallback waits for a client event, dumping goroutine stacks if it
+// never arrives. A bare "callback is not called" says nothing about whether the
+// event was dropped, the host's event loop wedged, or the relay never tore the
+// connection down; the stacks say which.
+func awaitClientCallback(t *testing.T, ch <-chan *api.Client, what string) *api.Client {
+	t.Helper()
+
+	select {
+	case c := <-ch:
+		return c
+	case <-time.After(callbackTimeout):
+		var stacks bytes.Buffer
+		_ = pprof.Lookup("goroutine").WriteTo(&stacks, 2)
+		t.Logf("goroutine dump at %s callback timeout:\n%s", what, stacks.String())
+		t.Fatalf("client %s callback was not called within %s", what, callbackTimeout)
+		return nil
 	}
-	defer os.RemoveAll(adminSockDir)
+}
 
-	adminSocketFile := filepath.Join(adminSockDir, "upterm.sock")
+func testHostClientCallback(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	testClientCallbacks(t, hostShareURL, hostNodeAddr, clientJoinURL, false)
+}
+
+// testHostClientCallbackReadOnly covers the read-only session path, which
+// has no input copy and so relies on the window-change channel closing to
+// learn that the client has left.
+func testHostClientCallbackReadOnly(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	testClientCallbacks(t, hostShareURL, hostNodeAddr, clientJoinURL, true)
+}
+
+func testClientCallbacks(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string, readOnly bool) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	// Buffered so a duplicate event cannot wedge the host. The emitter
+	// delivers to listeners from a goroutine that holds an emitter-wide lock
+	// while it blocks on the listener channel, so one callback stuck on an
+	// unbuffered send stalls every later event on that host, including the
+	// client-left event this test is waiting for. The spare capacity also
+	// lets the test observe duplicates instead of deadlocking on them.
+	jch := make(chan *api.Client, 4)
+	lch := make(chan *api.Client, 4)
+
+	// Setup admin socket
+	adminSocketFile := setupAdminSocket(t)
 
 	h := &Host{
-		Command:                  []string{"bash", "-c", "PS1='' BASH_SILENCE_DEPRECATION_WARNING=1 bash --norc"},
+		Command:                  getTestShell(),
 		PrivateKeys:              []string{HostPrivateKey},
 		AdminSocketFile:          adminSocketFile,
 		PermittedClientPublicKey: ClientPublicKeyContent,
+		ReadOnly:                 readOnly,
+		// The fixture's own terminal comes in by the host door and is
+		// announced like any other client. This test is about the guest's
+		// events, so the host's are filtered here rather than counted: the
+		// assertions below are "exactly one guest joined, exactly one left".
 		ClientJoinedCallback: func(c *api.Client) {
+			if c.Kind == api.Client_HOST {
+				return
+			}
 			jch <- c
 		},
 		ClientLeftCallback: func(c *api.Client) {
+			if c.Kind == api.Client_HOST {
+				return
+			}
 			lch <- c
 		},
 	}
 
-	if err := h.Share(hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
 	defer h.Close()
 
 	// verify admin server
-	session := getAndVerifySession(t, adminSocketFile, hostURL, nodeAddr)
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -54,104 +110,84 @@ func testHostClientCallback(t *testing.T, hostURL, nodeAddr string) {
 	c := &Client{
 		PrivateKeys: []string{ClientPrivateKey},
 	}
-	if err := c.JoinWithContext(ctx, session, hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err = c.JoinWithContext(ctx, session, clientJoinURL)
+	require.NoError(err)
 
-	var clientID string
-	select {
-	case cc := <-jch:
-		pk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(ClientPublicKeyContent))
-		if err != nil {
-			t.Fatal(err)
+	// Drain the guest's output. Client.JoinWithContext pumps the session into
+	// an unbuffered channel, so a test that never reads it stops the guest
+	// reading its SSH channel, the channel window fills, and the host blocks
+	// writing to it. This test does not care what the shell prints, but
+	// leaving it unread makes the host's output fan-out the slowest part of
+	// the system for no reason.
+	_, remoteOutputCh := c.InputOutput()
+	go func() {
+		for range remoteOutputCh { //nolint:revive // drained, not inspected
 		}
+	}()
 
-		if cc.Id == "" {
-			t.Fatal("client id can't be empty")
-		}
+	pk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(ClientPublicKeyContent))
+	require.NoError(err)
 
-		clientID = cc.Id
-
-		if diff := cmp.Diff(utils.FingerprintSHA256(pk), cc.PublicKeyFingerprint); diff != "" {
-			t.Fatal(diff)
-		}
-
-		if diff := cmp.Diff("SSH-2.0-Go", cc.Version); diff != "" {
-			t.Fatal(diff)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("client joined callback is not called")
-	}
+	joined := awaitClientCallback(t, jch, "joined")
+	assert.NotEmpty(joined.Id, "client id can't be empty")
+	assert.Equal(utils.FingerprintSHA256(pk), joined.PublicKeyFingerprint, "public key fingerprint should match")
+	assert.Equal("SSH-2.0-Go", joined.Version, "client version should match")
 
 	// client leaves
 	cancel()
 	c.Close()
 
-	select {
-	case cc := <-lch:
-		if cc.Id == "" {
-			t.Fatal("client id can't be empty")
-		}
+	left := awaitClientCallback(t, lch, "left")
+	assert.NotEmpty(left.Id, "client id can't be empty")
+	assert.Equal(joined.Id, left.Id, "client ID should match on leave")
+	assert.Equal(utils.FingerprintSHA256(pk), left.PublicKeyFingerprint, "public key fingerprint should match on leave")
+	assert.Equal("SSH-2.0-Go", left.Version, "client version should match on leave")
 
-		pk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(ClientPublicKeyContent))
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if diff := cmp.Diff(clientID, cc.Id); diff != "" {
-			t.Fatal(diff)
-		}
-
-		if diff := cmp.Diff(utils.FingerprintSHA256(pk), cc.PublicKeyFingerprint); diff != "" {
-			t.Fatal(diff)
-		}
-
-		if diff := cmp.Diff("SSH-2.0-Go", cc.Version); diff != "" {
-			t.Fatal(diff)
-		}
-	case <-time.After(2 * time.Second):
-		if os.Getenv("MUTE_FLAKY_TESTS") != "" {
-			log.Error("FLAKY_TEST: client left callback is not called")
-		} else {
-			t.Fatal("client left callback is not called")
-		}
-	}
+	// Exactly one event of each kind per guest. The relay terminates SSH on
+	// both sides, so a change to how it originates connections upstream can
+	// easily make the host see a guest join or leave twice; today it does not.
+	// These can only fire on a real duplicate, never on a slow machine.
+	assert.Empty(jch, "expected exactly one client joined event")
+	assert.Empty(lch, "expected exactly one client left event")
 }
 
-func testHostSessionCreatedCallback(t *testing.T, hostURL, nodeAddr string) {
-	h := &Host{
-		Command:      []string{"bash", "--norc"},
-		ForceCommand: []string{"vim"},
-		PrivateKeys:  []string{HostPrivateKey},
-		SessionCreatedCallback: func(session *api.GetSessionResponse) error {
-			if want, got := []string{"bash", "--norc"}, session.Command; !cmp.Equal(want, got) {
-				t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-			}
-			if want, got := []string{"vim"}, session.ForceCommand; !cmp.Equal(want, got) {
-				t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-			}
+func testHostSessionCreatedCallback(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
+	assert := assert.New(t)
 
-			checkSessionPayload(t, session, hostURL, nodeAddr)
+	// Setup admin socket
+	adminSocketFile := setupAdminSocket(t)
+
+	h := &Host{
+		Command:         getTestShell(),
+		ForceCommand:    []string{"vim"},
+		PrivateKeys:     []string{HostPrivateKey},
+		AdminSocketFile: adminSocketFile,
+		SessionCreatedCallback: func(_ context.Context, session *api.GetSessionResponse) error {
+			assert.Equal(getTestShell(), session.Command, "command should match")
+			assert.Equal([]string{"vim"}, session.ForceCommand, "force command should match")
+
+			checkSessionPayload(t, session, hostShareURL, hostNodeAddr)
 			return nil
 		},
 	}
 
-	if err := h.Share(hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
 	defer h.Close()
 }
 
-func testHostFailToShareWithoutPrivateKey(t *testing.T, hostURL, nodeAddr string) {
-	h := &Host{
-		Command: []string{"bash"},
-	}
-	err := h.Share(hostURL)
-	if err == nil {
-		t.Fatal("expect error")
-	}
+func testHostFailToShareWithoutPrivateKey(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
 
-	if !strings.Contains(err.Error(), "Permission denied (publickey)") {
-		t.Fatalf("expect permission denied error: %s", err)
+	// Setup admin socket
+	adminSocketFile := setupAdminSocket(t)
+
+	h := &Host{
+		Command:         getTestShell(),
+		AdminSocketFile: adminSocketFile,
 	}
+	err := h.Share(hostShareURL)
+	require.Error(err, "should fail without private key")
+	require.ErrorContains(err, "Permission denied (publickey)", "should fail with permission denied error")
 }

@@ -2,64 +2,287 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
-	"os/signal"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/oklog/run"
 	"github.com/olebedev/emitter"
+	"github.com/owenthereal/upterm/internal/termsize"
 	uio "github.com/owenthereal/upterm/io"
-	crytoterm "golang.org/x/crypto/ssh/terminal"
 )
+
+const (
+	// outputIdleTimeout is how long output may stay quiet after the process
+	// exits before the pty is considered drained.
+	outputIdleTimeout = 100 * time.Millisecond
+	// outputDrainTimeout bounds the total time spent draining after exit.
+	outputDrainTimeout = time.Second
+)
+
+const (
+	// guestFlushTimeout bounds how long the fan-out waits for asynchronous
+	// guests to receive what it has already accepted, once the producer has
+	// stopped. A guest still behind when it expires loses the remainder; it is
+	// deliberately not dropped for that, because the session is ending and a
+	// slow last second is not an overflow.
+	guestFlushTimeout = time.Second
+	// guestFlushLogTimeout bounds how long exit waits for the warning about
+	// that flush to be written. Generous for any handler that is working, so
+	// the line lands before the host tears down and stays in order with what
+	// follows it; short enough that a handler blocked on a stopped terminal
+	// cannot hold the exit open. Both halves matter — fire-and-forget loses the
+	// line, waiting outright hangs the host.
+	guestFlushLogTimeout = 100 * time.Millisecond
+)
+
+// DefaultStopGrace is how long each step of the teardown waits before the
+// next, save the first: SIGHUP (bounded by hangupGrace instead), then close
+// the pty master, then SIGTERM, then SIGKILL. Five seconds is long enough
+// for a shell to hang up its jobs and a program to flush, and short enough
+// that `session stop` against something that ignores everything is a worst
+// case of about sixteen seconds -- hangupGrace plus three of these -- not a
+// minute.
+const DefaultStopGrace = 5 * time.Second
+
+// hangupGrace bounds only the first step of terminate's teardown -- how
+// long SIGHUP alone is given before the pty master closes -- and is
+// shorter than stopGrace on purpose. An idle interactive shell (nothing
+// typed into it yet, nothing running) ignores a bare SIGHUP for ten
+// seconds or more, measured against a real bash; a shell that is going to
+// act on it, forwarding it to its jobs, does so in tens of milliseconds.
+// A full stopGrace here would buy the idle case nothing and would cost
+// every freshly started, untouched session -- the common case for a
+// `--detach`ed one -- several extra seconds on every stop.
+const hangupGrace = time.Second
+
+// activityWriter records when it last wrote, so a drain can stop once output
+// has gone idle.
+type activityWriter struct {
+	io.Writer
+	last atomic.Int64 // unix nanoseconds of the last write
+}
+
+func (w *activityWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	w.last.Store(time.Now().UnixNano())
+	return n, err
+}
+
+// waitIdle returns when done is closed, when no write has happened for idle,
+// or after max. The idle window is measured from now, not from the last
+// write, so output that has not yet been read still gets its chance.
+func (w *activityWriter) waitIdle(done <-chan struct{}, idle, max time.Duration) {
+	start := time.Now()
+	deadline := time.NewTimer(max)
+	defer deadline.Stop()
+	tick := time.NewTicker(idle / 4)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-deadline.C:
+			return
+		case <-tick.C:
+			last := time.Unix(0, w.last.Load())
+			if last.Before(start) {
+				last = start
+			}
+			if time.Since(last) >= idle {
+				return
+			}
+		}
+	}
+}
 
 func newCommand(
 	name string,
 	args []string,
 	env []string,
-	stdin *os.File,
-	stdout *os.File,
+	ptySize termsize.Size,
+	pinPtySize bool,
+	term string,
 	eventEmitter *emitter.Emitter,
 	writers *uio.MultiWriter,
+	logger *slog.Logger,
 ) *command {
 	return &command{
 		name:         name,
 		args:         args,
 		env:          env,
-		stdin:        stdin,
-		stdout:       stdout,
+		ptySize:      ptySize,
+		pinPtySize:   pinPtySize,
+		term:         term,
 		eventEmitter: eventEmitter,
 		writers:      writers,
+		logger:       logger,
 	}
 }
 
 type command struct {
-	name string
-	args []string
-	env  []string
+	timing serverTiming
+	name   string
+	args   []string
+	env    []string
+
+	ptySize    termsize.Size
+	pinPtySize bool
+	term       string
 
 	cmd  *exec.Cmd
-	ptmx *pty
-
-	stdin  *os.File
-	stdout *os.File
+	ptmx PTY
 
 	writers *uio.MultiWriter
+	// pacer, when set, is what the output copy writes to: it holds a write
+	// while the session has no primary and its earliest guest is behind, and
+	// passes it on to writers otherwise. Nil copies straight into writers.
+	// Set by the caller after construction, not a newCommand parameter.
+	pacer *guestPacer
+
+	// output is what the output copy writes through, recording when it last
+	// wrote. A field rather than Run's own, so that it is there before Run
+	// is: the host door reads it too, for when the command last said
+	// anything (see sessionHandler.output).
+	output activityWriter
 
 	eventEmitter *emitter.Emitter
+	logger       *slog.Logger
 
 	ctx context.Context
+
+	// result is the command's own outcome, recorded by the actor that waits on
+	// it. run.Group.Run returns whichever actor finished first, and the output
+	// copy returns nil on pty EOF at the same instant the command exits, so
+	// reading a status off Run is a coin toss. HandleSession learned this the
+	// hard way; see HandleSession.
+	resultMu sync.Mutex
+	result   CommandResult
+
+	// flushLogTimeoutForTesting, when non-zero, replaces guestFlushLogTimeout.
+	// A test asserting the warning has landed when Run returns needs a bound
+	// that a loaded CI scheduler cannot miss.
+	flushLogTimeoutForTesting time.Duration
+
+	// stopGrace bounds each step of terminate's teardown; zero means
+	// DefaultStopGrace. Set by the caller after construction, not a
+	// newCommand parameter.
+	stopGrace time.Duration
+
+	// order is what the command's end is recorded against: the session's
+	// shutdown. Set by the caller after construction; nil records nothing.
+	order *endOrder
 }
 
-func (c *command) Start(ctx context.Context) (*pty, error) {
+// grace is how long terminate waits at each step: the field if set, else
+// DefaultStopGrace.
+func (c *command) grace() time.Duration {
+	if c.stopGrace > 0 {
+		return c.stopGrace
+	}
+	return DefaultStopGrace
+}
+
+// copyTarget is where the output copy writes: the pacer if there is one, the
+// fan-out itself if not.
+func (c *command) copyTarget() io.Writer {
+	if c.pacer != nil {
+		return c.pacer
+	}
+	return c.writers
+}
+
+func (c *command) recordResult(err error, afterShutdown bool) {
+	code, exited := exitCode(err)
+
+	res := CommandResult{Exited: exited, Code: code, EndedAfterShutdown: afterShutdown}
+	if !exited {
+		res.Signal, res.SignalNumber = signalOutcome(err)
+	}
+
+	c.resultMu.Lock()
+	c.result = res
+	c.resultMu.Unlock()
+}
+
+// Result returns the command's outcome. Safe after Run returns.
+func (c *command) Result() CommandResult {
+	c.resultMu.Lock()
+	defer c.resultMu.Unlock()
+	return c.result
+}
+
+// environ is the environment the command runs with: the host's own, then the
+// session's variables, then TERM, when the host names one.
+//
+// The session's own variables go last, and that is the whole rule for all
+// three of them. exec.Cmd keeps the last duplicate key, so appending is
+// what makes UPTERM_SESSION_NAME, UPTERM_ADMIN_SOCKET and TERM describe
+// *this* session rather than whatever the host inherited — and inheriting
+// them is the ordinary case, not an exotic one: a host started inside
+// another upterm session, or a multiplexer told to forward the variables,
+// hands us somebody else's session, and TERM comes from whichever terminal
+// launched the host. Prepended instead, --term would silently do nothing
+// and `upterm session info` inside the session would name the outer one.
+func (c *command) environ() []string {
+	env := append(os.Environ(), c.env...)
+	if c.term != "" {
+		env = append(env, fmt.Sprintf("TERM=%s", c.term))
+	}
+	return env
+}
+
+// termName is the TERM the command runs under: the last its environment
+// sets, which is the one exec.Cmd keeps, and conpty.Spawn on Windows, which
+// matches the name case-insensitively there; or "" for none.
+func (c *command) termName() string {
+	term := ""
+	for _, kv := range c.environ() {
+		name, value, _ := strings.Cut(kv, "=")
+		if name == "TERM" || runtime.GOOS == "windows" && strings.EqualFold(name, "TERM") {
+			term = value
+		}
+	}
+	return term
+}
+
+// Start opens the command's pty and starts it. initial is the geometry the
+// initial client arrived with, used when nothing was asked for explicitly.
+func (c *command) Start(ctx context.Context, initial termsize.Size) (PTY, error) {
 	c.ctx = ctx
-	c.cmd = exec.CommandContext(ctx, c.name, c.args...)
-	c.cmd.Env = append(c.env, os.Environ()...)
+	// exec.Command, not CommandContext: Go's own cancellation kills the
+	// process outright the instant the context ends, ahead of the hangup
+	// the wait actor below sends first. A forced command is torn down the
+	// same way, at a shorter grace (see forceCommandStopGrace).
+	c.cmd = exec.Command(c.name, c.args...)
+	c.cmd.Env = c.environ()
+
+	want := c.ptySize
+	if !want.Valid() {
+		// The initial client's terminal, when there is one: the local
+		// terminal used to be the host's stdin and now it is a client, and
+		// the geometry it reports is the same one.
+		want = initial
+	}
 
 	var err error
-	c.ptmx, err = startPty(c.cmd)
+	// startPty falls back to termsize.Default for a size that is not one, so
+	// a session nobody offered a geometry still opens at something usable.
+	//
+	// The fan-out hears the pty's size so that it knows which size every byte
+	// of the replay ring was written at: once inside startPty, before the
+	// copy in Run starts, so the first byte has one, and then at each change.
+	// A forced command's pty (startSessionPty) reports to no one.
+	c.ptmx, err = startPty(c.cmd, want, c.pinPtySize, c.writers)
 	if err != nil {
 		return nil, fmt.Errorf("unable to start pty: %w", err)
 	}
@@ -68,76 +291,353 @@ func (c *command) Start(ctx context.Context) (*pty, error) {
 }
 
 func (c *command) Run() error {
-	// Set stdin in raw mode.
-	isTty := crytoterm.IsTerminal(int(c.stdin.Fd()))
-
-	if isTty {
-		oldState, err := crytoterm.MakeRaw(int(c.stdin.Fd()))
-		if err != nil {
-			return fmt.Errorf("unable to set terminal to raw mode: %w", err)
-		}
-		defer func() { _ = crytoterm.Restore(int(c.stdin.Fd()), oldState) }()
-	}
-
+	timing := c.timing.orDefault()
+	closer := newPTYCloser(c.ptmx)
+	defer func() { closer.wait(time.Now().Add(time.Second)) }()
 	var g run.Group
-	if isTty {
-		// pty
-		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, syscall.SIGWINCH)
-		ch <- syscall.SIGWINCH // Initial resize.
+	{
+		// output: the pty into the fan-out. Every consumer — the local
+		// terminal included — is a client of the fan-out now, so there is
+		// nothing here to attach: what keeps the pty from running ahead of
+		// its readers is the primary client's synchronous writer or, with no
+		// primary, the pacer holding each write until the earliest guest has
+		// caught up.
 		ctx, cancel := context.WithCancel(c.ctx)
-		tee := terminalEventEmitter{c.eventEmitter}
+		c.output.Writer = c.copyTarget()
+		output := &c.output
+		done := make(chan struct{})
 		g.Add(func() error {
-			for {
-				select {
-				case <-ctx.Done():
-					close(ch)
-					return ctx.Err()
-				case <-ch:
-					h, w, err := getPtysize(c.stdin)
-					if err != nil {
-						return err
+			// Runs last, by LIFO. The copy has returned, so the producer has
+			// provably stopped and nothing further can enter the fan-out: this
+			// is the only point where a flush is a barrier rather than a guess.
+			// Putting it in the interrupt instead would race the producer, and
+			// waiting there for the copy would not even be bounded — cancelling
+			// the reader cannot release a copy blocked in a synchronous write
+			// to a client, and run.Group calls interrupts one after another, so
+			// that wait would hold up the pty close behind it.
+			defer func() {
+				flushCtx, cancelFlush := context.WithTimeout(context.WithoutCancel(c.ctx), guestFlushTimeout)
+				defer cancelFlush()
+				if err := c.writers.Shutdown(flushCtx); err != nil {
+					// Not a host failure, and nothing to do about it here: a
+					// guest still stuck when the deadline expires loses its tail
+					// by design, and a guest already gone flushes to nil. Worth
+					// a line because otherwise the only evidence is a guest
+					// whose last screenful never arrived, which looks from the
+					// outside exactly like output the command never produced.
+					//
+					// Written off this goroutine but waited for, under a bound.
+					//
+					// This defer is the output actor's return path, and
+					// run.Group cannot finish until it returns, so writing here
+					// directly would let a handler blocked on a stopped
+					// terminal hang the host's exit and leave guestFlushTimeout
+					// bounding nothing. Not waiting at all trades that for a
+					// quieter fault: Go abandons runnable goroutines at process
+					// exit, so the one diagnostic this path produces could be
+					// lost, or land after the shutdown lines it should precede,
+					// with a perfectly healthy logger.
+					//
+					// Waiting under a bound is the only form with neither
+					// failure. One goroutine per call of Run, which is once per
+					// host process.
+					logTimeout := guestFlushLogTimeout
+					if c.flushLogTimeoutForTesting > 0 {
+						logTimeout = c.flushLogTimeoutForTesting
 					}
-					tee.TerminalWindowChanged("local", c.ptmx, w, h)
+					logged := make(chan struct{})
+					go func() {
+						defer close(logged)
+						c.logger.Warn("gave up delivering final output to a guest",
+							"timeout", guestFlushTimeout, "error", err)
+					}()
+					select {
+					case <-logged:
+					case <-time.After(logTimeout):
+					}
 				}
-			}
-		}, func(err error) {
-			tee.TerminalDetached("local", c.ptmx)
-			cancel()
-		})
-	}
-
-	{
-		// input
-		ctx, cancel := context.WithCancel(c.ctx)
-		g.Add(func() error {
-			_, err := io.Copy(c.ptmx, uio.NewContextReader(ctx, c.stdin))
-			return err
-		}, func(err error) {
-			cancel()
-		})
-	}
-	{
-		// output
-		if err := c.writers.Append(c.stdout); err != nil {
-			return err
-		}
-		ctx, cancel := context.WithCancel(c.ctx)
-		g.Add(func() error {
-			_, err := io.Copy(c.writers, uio.NewContextReader(ctx, c.ptmx))
+			}()
+			defer close(done)
+			_, err := io.Copy(output, uio.NewContextReader(ctx, c.ptmx))
 			return ptyError(err)
 		}, func(err error) {
-			c.writers.Remove(os.Stdout)
+			// The process may have exited with output still buffered in the
+			// pty. Cancelling the copy here would drop it, so let the copy
+			// run until the read ends or output goes idle. On Unix the read
+			// ends by itself once the slave side closes; ConPTY never signals
+			// EOF until closed, and a background child can keep a Unix pty
+			// open, so the wait is bounded.
+			//
+			// Pacing ends first. A write the pacer is holding is not
+			// activity — activityWriter records a write when it returns — so
+			// waitIdle would read a gated pty as quiet and the cancel below
+			// would cut its tail off; and a slow guest would hold the exit
+			// open for as long as it took. From here the tail goes out
+			// unpaced, as best-effort as the flush after it.
+			if c.pacer != nil {
+				c.pacer.release()
+			}
+			output.waitIdle(done, timing.outputIdle, timing.outputDrain)
 			cancel()
 		})
 	}
 	{
+		ctx, cancel := context.WithCancel(c.ctx)
+		waitDone := make(chan struct{})
 		g.Add(func() error {
-			return c.cmd.Wait()
+			defer close(waitDone)
+
+			// The command's end is recorded against the session's shutdown
+			// the moment Wait returns, before exited closes: which branch
+			// the select below takes, where both can be ready, says nothing
+			// about which came first.
+			exited := make(chan struct{})
+			var (
+				waitErr       error
+				afterShutdown bool
+			)
+			go func() {
+				waitErr = c.ptmx.Wait()
+				afterShutdown = c.order.commandEnded()
+				close(exited)
+			}()
+
+			select {
+			case <-exited:
+				c.recordResult(waitErr, afterShutdown)
+				return waitErr
+			case <-ctx.Done():
+				// The session is ending and the command is not: hang it up
+				// the way a terminal going away would, and escalate only if
+				// it stays.
+				terminateWith(c.ptmx, closer, exited, timing.hangup, c.grace(), c.logger, c.name)
+				// terminate's own final wait is bounded -- it may return
+				// with the process still not confirmed exited, however
+				// unlikely -- so waitErr may still be being written by the
+				// goroutine above. Reading it here unconditionally would be
+				// a data race; recording is safe only once exited has
+				// actually closed, which happens-before this observes it.
+				select {
+				case <-exited:
+					c.recordResult(waitErr, afterShutdown)
+				default:
+				}
+				return ctx.Err()
+			}
 		}, func(err error) {
-			c.ptmx.Close()
+			// cancel first: this actor's own execute is parked in the select
+			// above on this same ctx, and run.Group's contract is that
+			// execute returns once interrupt is invoked. When the output
+			// actor returns first with c.ctx still live -- a command that
+			// closes its pty slave but keeps running, so the master read
+			// ends on its own while nothing has asked the session to stop --
+			// nothing else would ever cancel this ctx, and waiting on
+			// waitDone before that happened would block forever. Cancelling
+			// first unblocks the select via ctx.Done, which sends terminate
+			// on its way; in the cancellation flow this cancel is a no-op,
+			// since ctx is already done.
+			cancel()
+
+			// The output interrupt has already drained. Share the close that
+			// termination may have started; the final join happens after all
+			// actors return so Close cannot hold up escalation.
+			<-waitDone
+			closer.start()
 		})
 	}
 
 	return g.Run()
+}
+
+// outputFlusher is a PTY that can discard its tty's output queue without
+// the pty's RWMutex -- whose read lock an abandoned read may hold, and whose
+// write lock a pending close may be queued for: the macOS pty
+// (pty_darwin.go). terminate flushes through it where it can; a PTY without
+// it -- every other platform, and the tests' fakes -- is simply not flushed.
+type outputFlusher interface {
+	FlushOutput() error
+}
+
+// terminate ends a command that has been told to stop, in this order: SIGHUP to
+// its process group, which a job-control shell forwards to every job; if it
+// stays past hangupGrace, close the pty master -- anything still holding the
+// terminal open fails its reads and writes, which collects processes that
+// ignored the hangup, and is also what frees a session leader a platform will
+// otherwise block inside exit() while its controlling terminal still holds
+// output nobody has drained, since the reader that was going to drain it
+// stopped issuing new reads the moment this session began ending; SIGTERM after
+// another grace; SIGKILL to the group, then the leader, after a third -- the
+// boundary is everything in the command's process group, plus everything that
+// hangs up when the pty goes, and a leader-only kill would leave its own
+// children behind exactly like the hangup and the term steps would if nothing
+// forwarded them. Where signals are unsupported it kills at once. Every wait in
+// here is bounded, including the one after the final kill -- terminate must
+// return, with or without proof the process has actually gone, because it runs
+// on the actor's own execute and run.Group is waiting for that to return before
+// anything else can. A command still not confirmed exited when terminate gives
+// up is logged: Result() staying zero for it is fine, but it should not also be
+// silent.
+//
+// The shared closer starts Close on its own goroutine and final cleanup joins
+// it under a bound. On non-Linux Unix, Read holds the pty's read lock for
+// the length of a blocking read and Close takes the write lock, so a
+// synchronous close here would wait on a read that only the process's exit
+// ends -- the very hang this step exists to break. Bypassing that lock does
+// not fix it either: the master is opened in blocking mode with no poller
+// registration, so the Go runtime itself defers the underlying close(2)
+// behind whatever read is already in flight, independent of any lock this
+// package takes. Linux instead prepares pollable I/O released by Close.
+// Starting Close is still worth doing: once the reader is
+// released -- the process's own exit, or the case this step exists for, a
+// leader already stuck in exit() because its slave is already closed -- the
+// close lands, and anything still holding the master open past that point
+// fails its next read or write.
+//
+// That release needs nothing to be holding the master in the kernel, and a
+// write can: a client's input parked on a full input queue, sent to a
+// raw-mode command that has stopped reading. On macOS that write is released
+// only when the slave is revoked, which happens only once the leader's exit
+// completes -- and XNU does not let that exit complete while the tty's
+// output queue holds anything. The write waits for the exit, the exit for
+// the output to drain, the drain for the close, and the close for the write:
+// the close alone can never land, and every step after it is futile, since
+// the leader is already exiting. So the output queue -- bytes nothing will
+// read, since the reader has stopped -- is discarded just before the close,
+// through outputFlusher, which reaches the master without the pty's lock.
+// The leader then finishes exiting, the parked write fails, and the close
+// lands. Once, and only there: when the close reaches the file, control
+// reports os.ErrClosed, and until it does a read still parked on the master
+// takes whatever is queued, so a flush at any later step would have nothing
+// useful to do. Output queued after the close has been issued -- a hangup
+// handler writing more than hangupGrace after SIGHUP while an input write is
+// parked -- is not rescued, and the teardown walks the rest of the
+// escalation as it would without the flush. A failed flush is logged and
+// changes nothing that follows it.
+// terminateWith uses the bounds copied when the command or session started.
+// A forced command's handler may outlive the session.
+func terminateWith(ptmx PTY, closer *ptyCloser, exited <-chan struct{}, hangup, grace time.Duration, logger *slog.Logger, name string) {
+	closer.until = time.Now().Add(hangup + 3*grace)
+	// gone reports whether exited has already closed, without blocking:
+	// sending a signal after that would reach whatever pid the kernel has
+	// since reused, not the command, and closing or killing an already-gone
+	// process is only ever wasted work, not wrong -- so only the signals
+	// check this.
+	gone := func() bool {
+		select {
+		case <-exited:
+			return true
+		default:
+			return false
+		}
+	}
+	// wait blocks for up to d, reporting whether exited closed within it.
+	// Every step below is followed by exactly one of these.
+	wait := func(d time.Duration) bool {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-exited:
+			return true
+		case <-timer.C:
+			return false
+		}
+	}
+	// kill sends SIGKILL to the group -- the same non-blocking exited check
+	// the other signal steps make first, since a group signal has the same
+	// reused-pid risk they do -- and then kills the leader directly, the
+	// way it always has: Signal alone cannot be trusted to reach a leader
+	// that already left the group on purpose, and Kill (through
+	// os.Process) is what returns ErrProcessDone once the leader is
+	// already reaped, which a raw group signal has no way to know. Then it
+	// waits at most one more grace for either to have taken -- the one
+	// wait in this whole function that is not preceded by a signal this
+	// function chose to send for its own sake, since it is also where
+	// terminate lands when Signal itself reports the platform cannot take
+	// a step it was asked for (Windows: the group SIGKILL above is then
+	// simply a no-op, and this step is the Kill it already was). A command
+	// still running when even this gives up is logged, so an abandoned
+	// teardown leaves a trace.
+	kill := func() {
+		if !gone() {
+			_ = ptmx.Signal(syscall.SIGKILL)
+		}
+		_ = ptmx.Kill()
+		if !wait(grace) {
+			logger.Warn("command did not exit after being killed; giving up on this teardown",
+				"name", name, "bound", grace)
+		}
+	}
+	// signal sends sig and reports whether the escalation should skip every
+	// remaining graceful step and kill now. Only one error means that: the
+	// platform saying it cannot signal at all (errors.ErrUnsupported, which
+	// is what the Windows PTY returns), because there is then no point
+	// spending a grace on a step it will never take. Any other error is a
+	// failure of this one send -- an ESRCH from a group that has just
+	// vanished, a transient refusal -- and the escalation carries on as if
+	// the signal had been sent: the wait that follows every step is what
+	// decides whether it took, and a process that is already gone reaches
+	// the next gone() check anyway. Jumping to SIGKILL on those was skipping
+	// the hangup a job-control shell needs to collect its jobs, and the
+	// close that frees a leader stuck in exit(), over an error that says
+	// nothing about either.
+	//
+	// The cost of carrying on is wall clock on an error path: a failed
+	// hangup used to reach the kill in one grace and now walks the whole
+	// escalation, hangupGrace plus three graces, the same worst case as a
+	// command that ignores everything (see DefaultStopGrace). That stays
+	// under `session stop`'s own wait, and the usual reason a send fails is
+	// a group that has already gone -- whose exited is closed, so every wait
+	// after it returns at once.
+	signal := func(sig syscall.Signal) (unsupported bool) {
+		err := ptmx.Signal(sig)
+		switch {
+		case err == nil:
+			return false
+		case errors.Is(err, errors.ErrUnsupported):
+			return true
+		default:
+			logger.Debug("a teardown signal was not delivered; continuing the escalation",
+				"name", name, "signal", sig.String(), "error", err)
+			return false
+		}
+	}
+
+	if gone() {
+		return
+	}
+	if unsupported := signal(syscall.SIGHUP); unsupported {
+		kill()
+		return
+	}
+	if wait(hangup) {
+		return
+	}
+
+	// Discard the output queue a leader stuck in exit is waiting on, before
+	// the close and never after it (see the doc comment above). Not waited on
+	// beyond the ioctl returning, and a failure is only logged: the close
+	// goes ahead exactly as it would have.
+	if f, ok := ptmx.(outputFlusher); ok {
+		if err := f.FlushOutput(); err != nil {
+			logger.Debug("the tty's output queue was not flushed; closing the master anyway",
+				"name", name, "error", err)
+		}
+	}
+	closer.start()
+	if wait(grace) {
+		return
+	}
+
+	if gone() {
+		return
+	}
+	if unsupported := signal(syscall.SIGTERM); unsupported {
+		kill()
+		return
+	}
+	if wait(grace) {
+		return
+	}
+
+	kill()
 }

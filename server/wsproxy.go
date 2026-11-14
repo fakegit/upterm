@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,41 +14,77 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/oklog/run"
 	"github.com/owenthereal/upterm/host/api"
+	"github.com/owenthereal/upterm/routing"
+	"github.com/owenthereal/upterm/upterm"
 	"github.com/owenthereal/upterm/ws"
-	log "github.com/sirupsen/logrus"
+	"log/slog"
 )
 
 type webSocketProxy struct {
-	ConnDialer connDialer
-	Logger     log.FieldLogger
+	ConnDialer     connDialer
+	SessionManager *SessionManager
+	Logger         *slog.Logger
+	// deny is the sources refused at the upgrade.
+	deny sourceDeny
 
 	srv *http.Server
 	mux sync.Mutex
+	// stopped records a Shutdown that arrived before Serve; see sshd.stopped.
+	stopped bool
 }
 
 func webHandler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/getting-started") {
-			h.ServeHTTP(w, r)
+		switch {
+		case r.URL.Path == "/health":
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
 			return
-		}
-
-		w.Header().Add("Content-Type", "text/plain")
-		// TODO: better getting-started guide
-		data := `1. Install the upterm CLI by following https://github.com/owenthereal/upterm#installation.
+		case strings.HasPrefix(r.URL.Path, "/getting-started"):
+			w.Header().Add("Content-Type", "text/plain")
+			// TODO: better getting-started guide
+			data := `1. Install the upterm CLI by following https://github.com/owenthereal/upterm#installation.
 2. On your machine, host a session with "upterm host --server wss://%s -- YOUR_COMMAND". More details in https://github.com/owenthereal/upterm#quick-start.
-3. Your pair(s) join the session with "ssh -o ProxyCommand='upterm proxy wss://TOKEN@%s' TOKEN@%s:443".
+3. Your pair(s) join the session with "upterm join wss://TOKEN@%s", which rejoins on its own if the connection drops.
+4. Or with ssh: "ssh -o ProxyCommand='upterm proxy wss://TOKEN@%s' TOKEN@%s".
 `
-		fmt.Fprintf(w, data, r.Host, r.Host, r.Host)
+			_, _ = fmt.Fprintf(w, data, r.Host, r.Host, r.Host, sshAddress(r.Host))
+			return
+		default:
+			h.ServeHTTP(w, r)
+		}
 	})
+}
+
+// sshAddress is the host:port the page tells ssh to dial. A Host header already
+// carries the port when the relay isn't on the default one, so appending 443 to
+// it would name a port twice; only a header without one gets 443.
+func sshAddress(hostHeader string) string {
+	host, port, err := net.SplitHostPort(hostHeader)
+	if err != nil {
+		// No port, so the header is a bare name or a bracketed IPv6 literal.
+		host, port = strings.Trim(hostHeader, "[]"), ""
+	}
+	if port == "" {
+		port = "443"
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func (s *webSocketProxy) Serve(ln net.Listener) error {
 	s.mux.Lock()
+	if s.stopped {
+		s.mux.Unlock()
+		_ = ln.Close()
+		return http.ErrServerClosed
+	}
 	s.srv = &http.Server{
 		Handler: webHandler(&wsHandler{
-			ConnDialer: s.ConnDialer,
-			Logger:     s.Logger,
+			ConnDialer:     s.ConnDialer,
+			SessionManager: s.SessionManager,
+			Logger:         s.Logger,
+			deny:           s.deny,
 		}),
 	}
 	s.mux.Unlock()
@@ -59,10 +96,14 @@ func (s *webSocketProxy) Shutdown() error {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
+	s.stopped = true
+
 	if s.srv != nil {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(serverShutDownDeadline))
 		defer cancel()
 
+		// http.Server owns wsln outright -- Server.Shutdown no longer closes it --
+		// so Shutdown closes it exactly once and a close error here is a real one.
 		return s.srv.Shutdown(ctx)
 	}
 
@@ -76,15 +117,22 @@ var upgrader = websocket.Upgrader{
 }
 
 type wsHandler struct {
-	ConnDialer connDialer
-	Logger     log.FieldLogger
+	ConnDialer     connDialer
+	SessionManager *SessionManager
+	Logger         *slog.Logger
+	deny           sourceDeny
 }
 
 // ServeHTTP checks the following header:
 // * Authorization
 // * Upterm-Client-Version
 func (h *wsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	clientVersion := r.Header.Get("Upterm-Client-Version")
+	// A denied source is told only that it is forbidden.
+	if h.deny.denied(r.RemoteAddr) {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	clientVersion := r.Header.Get(upterm.HeaderUptermClientVersion)
 	if clientVersion == "" {
 		h.httpError(w, fmt.Errorf("missing upterm client version"))
 		return
@@ -96,21 +144,81 @@ func (h *wsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sshUser := user
+	if h.SessionManager.GetRoutingMode() == routing.ModeEmbedded {
+		sshUser = user + ":" + pass
+	}
+
 	wsc, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		h.httpError(w, fmt.Errorf("ws upgrade failed"))
 		return
 	}
 	wsconn := ws.WrapWSConn(wsc)
-	defer wsconn.Close()
+	defer func() {
+		_ = wsconn.Close()
+	}()
 
-	id, err := api.DecodeIdentifier(user+":"+pass, string(clientVersion))
-	if err != nil {
-		h.wsError(wsc, err, "error decoding id")
-		return
+	// Determine connection type and decode identifier using SessionManager
+	var id *api.Identifier
+	if string(clientVersion) == upterm.HostSSHClientVersion {
+		// HOST connection: sshUser is the session ID
+		id = &api.Identifier{
+			Id:   sshUser,
+			Type: api.Identifier_HOST,
+		}
+	} else {
+		// CLIENT connection: decode the SSH user using SessionManager
+		sessionID, nodeAddr, err := h.SessionManager.ResolveSSHUser(sshUser)
+		if err != nil {
+			err = fmt.Errorf("error resolving SSH user %s: %w", sshUser, err)
+			// Fronting the SSH proxy, hand over a guest this can't place. A
+			// banner saying why reaches the guest's ssh client, which a
+			// WebSocket close frame doesn't. In embedded mode a resolve failure
+			// is a decode failure, which the SSH proxy refuses without one. It
+			// decodes the user itself, so sshUser only stands in for the
+			// session ID, in logs.
+			if id = h.sshProxyHandOff(sshUser); id == nil {
+				h.wsError(wsc, err, "error resolving SSH user")
+				return
+			}
+			// A session that isn't stored, or a user that names none, is the
+			// guest's to put right, and the SSH proxy tells it how, so it is a
+			// warning. A store that couldn't answer is an error.
+			level := slog.LevelWarn
+			var lookup *lookupError
+			var missing *ErrSessionNotFound
+			if errors.As(err, &lookup) && !errors.As(err, &missing) {
+				level = slog.LevelError
+			}
+			h.Logger.Log(r.Context(), level, "error resolving SSH user", "error", err)
+		} else {
+			id = &api.Identifier{
+				Id:       sessionID,
+				NodeAddr: nodeAddr,
+				Type:     api.Identifier_CLIENT,
+			}
+		}
 	}
 
 	conn, err := h.ConnDialer.Dial(id)
+	// In Consul mode a guest's node comes from a cache the store's watch keeps,
+	// which can trail its host's reconnect to another node. Fronting the SSH
+	// proxy, hand over a guest whose node won't take the dial: the SSH proxy's
+	// front door makes the attempt itself, and if that fails, refreshes a
+	// route that can move, one whose host proved its key. A legacy session's
+	// route can't, and its hand-off buys only a second dial and a generic SSH
+	// rejection, which still keeps the dial error out of the close frame. An
+	// embedded-mode guest's node is its user's own choice, and there is
+	// nothing to refresh it from. The refused dial is a warning: the hand-off
+	// usually recovers it, and a guest it doesn't is logged as an error below.
+	if err != nil && id.Type == api.Identifier_CLIENT && id.NodeAddr != "" &&
+		h.SessionManager.GetRoutingMode() == routing.ModeConsul {
+		if handOff := h.sshProxyHandOff(id.Id); handOff != nil {
+			h.Logger.Warn("error dialing the session's node", "error", err, "node", id.NodeAddr)
+			conn, err = h.ConnDialer.Dial(handOff)
+		}
+	}
 	if err != nil {
 		h.wsError(wsc, err, "error dialing")
 		return
@@ -118,8 +226,8 @@ func (h *wsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var o sync.Once
 	cl := func() {
-		wsconn.Close()
-		conn.Close()
+		_ = wsconn.Close()
+		_ = conn.Close()
 	}
 
 	var g run.Group
@@ -141,17 +249,39 @@ func (h *wsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := g.Run(); err != nil {
+		// A host or guest leaving ends its WebSocket, and upterm's clients end
+		// it by closing the connection without a close frame, which reads as an
+		// abnormal closure. Either way the pipe has ended, not failed, and
+		// there is no one left to send a close frame to.
+		var closed *websocket.CloseError
+		if errors.As(err, &closed) {
+			h.Logger.Debug("websocket closed", "error", err)
+			return
+		}
 		h.wsError(wsc, err, "error piping")
 	}
 }
 
+// sshProxyHandOff is the identifier that sends a guest of sessionID to this
+// node's SSH proxy, which authorizes the guest's user itself, or nil when the
+// handler doesn't front one.
+func (h *wsHandler) sshProxyHandOff(sessionID string) *api.Identifier {
+	if _, ok := h.ConnDialer.(sshProxyDialer); !ok {
+		return nil
+	}
+	return &api.Identifier{Id: sessionID, Type: api.Identifier_CLIENT}
+}
+
+// httpError turns away a request the handler won't upgrade. That is the
+// sender's to put right, and every upterm client sends what the handler
+// checks, so it is a warning: what gets here is mostly browsers and scanners.
 func (h *wsHandler) httpError(w http.ResponseWriter, err error) {
-	h.Logger.WithError(err).Error("http error")
+	h.Logger.Warn("http error", "error", err)
 	w.WriteHeader(400)
 	_, _ = w.Write([]byte(err.Error()))
 }
 
 func (h *wsHandler) wsError(ws *websocket.Conn, err error, msg string) {
-	h.Logger.WithError(err).Error(msg)
+	h.Logger.Error(msg, "error", err)
 	_ = ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, err.Error()))
 }

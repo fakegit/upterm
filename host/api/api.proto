@@ -2,36 +2,153 @@ syntax = "proto3";
 
 package api;
 
+option go_package = "github.com/owenthereal/upterm/host/api";
+
 service AdminService {
-    rpc GetSession (GetSessionRequest) returns (GetSessionResponse) {}
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse) {}
+  rpc StopSession(StopSessionRequest) returns (StopSessionResponse) {}
+  rpc SetJoinTimeout(SetJoinTimeoutRequest) returns (SetJoinTimeoutResponse) {}
 }
 
-message GetSessionRequest {
+message GetSessionRequest {}
+
+// StopSessionRequest asks the session to end: the command is hung up, then
+// terminated, then killed, and the record reads stopped.
+message StopSessionRequest {
+  // launch_id must be the launch_id of the record the caller read. A name
+  // and a socket path are reused by whoever claims the name next, so they
+  // do not say which run is being stopped; the launch does. The daemon
+  // refuses any other value, an empty one included, so that a session that
+  // ended and was replaced between the read and this call is not stopped in
+  // place of the one that was inspected.
+  string launch_id = 1;
+}
+
+message StopSessionResponse {}
+
+// SetJoinTimeoutRequest sets how long the session waits for its first guest,
+// counted from now, or from readiness if it is not ready yet. It replaces any
+// timeout already set; zero disables it.
+message SetJoinTimeoutRequest {
+  // launch_id binds the request to the launch the caller read, for the reason
+  // StopSessionRequest's does.
+  string launch_id = 1;
+  int64 timeout_nanos = 2;
+}
+
+message SetJoinTimeoutResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    COUNTING = 1; // state.deadline_unix_nano says when it fires
+    PENDING = 2;  // not ready yet; state.timeout_nanos counts from readiness
+    DISABLED = 3;
+    CLAIMED = 4;  // a guest had joined, at state.first_guest_joined_unix_nano; nothing was set
+    ENDING = 5;   // the timeout already fired, or the session is tearing down
+  }
+  Outcome outcome = 1;
+  JoinState state = 2;
+}
+
+// JoinState is a session's join timeout. A zero field is absent.
+message JoinState {
+  int64 timeout_nanos = 1;                // set and not claimed
+  int64 deadline_unix_nano = 2;           // counting, or the deadline that fired
+  int64 first_guest_joined_unix_nano = 3; // the first guest's join
 }
 
 message GetSessionResponse {
-    string session_id = 1;
-    repeated string command = 2;
-    repeated string force_command = 3;
-    string host = 4;
-    string node_addr = 5;
-    repeated Client connected_clients = 6;
+  string session_id = 1;
+  repeated string command = 2;
+  repeated string force_command = 3;
+  string host = 4;
+  string node_addr = 5;
+  repeated Client connected_clients = 6;
+  repeated AuthorizedKey authorized_keys = 7;
+  string ssh_user = 8; // SSH username for client connections
+  bool sftp_disabled = 9; // true if SFTP is disabled (--no-sftp)
+  JoinState join_state = 10; // the join timeout as the daemon holds it
+  // launch_id is the launch this daemon speaks for, so a reader can tell the
+  // run it read a record for from one that has since claimed the name. Empty
+  // from a daemon that claimed no name, and from daemons before this field.
+  string launch_id = 11;
+  // open is true when anyone with the session ID can join and nobody was
+  // asked: there is no allowlist, and the session was started with --accept,
+  // so nobody confirmed it either. It describes the session and changes
+  // nothing about who may join. False from daemons before this field.
+  bool open = 12;
+
+  // The fields below are each optional: a daemon from before one leaves it
+  // unset, and a reader must treat unset as unknown, never as false or empty.
+  optional string name = 13;                          // the session's name
+  optional string status = 14;                        // starting, ready, reconnecting, disconnected, ending
+  optional string reconnect = 15;                     // supported, unsupported
+  optional string tunnel_reason = 16;                 // why the tunnel is down, one of sessiondir's TunnelReason values; empty when it is up
+  optional int64 tunnel_lost_at_unix_nano = 17;       // UTC; unset when the tunnel is up
+  optional int64 next_attempt_at_unix_nano = 18;      // UTC; unset when no attempt is scheduled
+  optional bool start_confirmed = 19;                 // the host answered the start prompt, rather than passing --accept
+  optional bool read_only = 20;
+  optional string file_transfer = 21;                 // off, downloads, all
+  optional bool file_transfer_approval_required = 22; // each guest file transfer waits for approval in the primary host terminal
+  optional bool local_forwarding = 23; // unrestricted effective grant only
+  repeated string login_command = 24;
+  optional string guest_shell = 25;    // shared, login, forced
+  optional string execution = 26;      // off, approval, granted, forced
+  optional string tcp_forwarding = 27; // off, loopback-approval, loopback, all
+  optional string approval_method = 28; // terminal, custom, unavailable
+  // The relay key the host trusted on its first connection, for a guest to
+  // pin the relay as the host did. relay_known_hosts is that key's
+  // known_hosts line, for the host and port the host dialled, and
+  // relay_key_trust is how the host came to trust it: known (a line in its
+  // known_hosts already did), prompted (accepted at its prompt) or
+  // auto-accepted (accepted without asking, --skip-host-key-check). Both are
+  // unset when the host can't say: its host key check isn't one upterm
+  // built.
+  optional string relay_known_hosts = 29;
+  optional string relay_key_trust = 30;
+  // delegated_address is the guest address of a delegated session, one an
+  // external authority decides: the SSH user guests reach it as. Unset for
+  // every other session.
+  optional string delegated_address = 31;
+}
+
+message AuthorizedKey {
+  repeated string public_key_fingerprints = 1;
+  string comment = 2;
 }
 
 message Client {
-    string id = 1;
-    string version = 2;
-    string addr = 3;
-    string public_key_fingerprint = 4;
+  string id = 1;
+  string version = 2;
+  string addr = 3;
+  string public_key_fingerprint = 4;
+  // Which door the client came in by. GUEST is zero so a reader built before
+  // this field existed sees every client as a guest, which is what they were.
+  Kind kind = 5;
+  // Where a FORWARD client's forwards go: the distinct host:port destinations
+  // it has opened, as it asked for them, in the order first opened, at most
+  // 16 of them. unlisted_forwards counts the forwards it opened to anywhere
+  // past those.
+  repeated string forward_destinations = 6;
+  uint32 unlisted_forwards = 7;
+
+  enum Kind {
+    GUEST = 0;
+    HOST = 1;
+    // A guest connection's forwards, listed apart from any terminal or SFTP
+    // session on the same connection: a jump through the session (`ssh -J`)
+    // or an `ssh -L`, to somewhere the host can reach. A reader built before
+    // this value existed sees it as a guest, which it also is.
+    FORWARD = 2;
+  }
 }
 
 message Identifier {
-    string id = 1;
-    Type type = 2;
-    string node_addr = 3;
+  string id = 1;
+  Type type = 2;
+  string node_addr = 3;
 
-    enum Type {
-      HOST = 0;
-      CLIENT = 1;
-    }
+  enum Type {
+    HOST = 0;
+    CLIENT = 1;
+  }
 }

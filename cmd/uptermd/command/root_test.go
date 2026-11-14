@@ -1,0 +1,360 @@
+package command
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/owenthereal/upterm/server"
+	"github.com/stretchr/testify/require"
+)
+
+// uptermdEnv lists every variable that can influence a decode, so tests can
+// start from a known-empty environment. root.go:100-105 binds UPTERMD_*
+// through viper's AutomaticEnv and additionally binds bare SENTRY_DSN.
+var uptermdEnv = []string{
+	"UPTERMD_SSH_ADDR", "UPTERMD_WS_ADDR", "UPTERMD_NODE_ADDR", "UPTERMD_INTERNAL_ADDR",
+	"UPTERMD_HOP_KEY", "UPTERMD_HOP_TRUSTED_KEY", "UPTERMD_HOP_REFUSE_HOST_KEY",
+	"UPTERMD_AUTHORIZED_KEYS", "UPTERMD_PRIVATE_KEY", "UPTERMD_HOSTNAME",
+	"UPTERMD_SSH_NETWORK", "UPTERMD_SSH_PROXY_PROTOCOL_REQUIRED", "UPTERMD_SSH_PROXY_PROTOCOL", "UPTERMD_NETWORK", "UPTERMD_NETWORK_OPT",
+	"UPTERMD_METRIC_ADDR", "UPTERMD_DEBUG", "UPTERMD_ROUTING",
+	"UPTERMD_CONSUL_URL", "UPTERMD_CONSUL_SESSION_TTL", "UPTERMD_SENTRY_DSN",
+	"SENTRY_DSN", "UPTERMD_HANDSHAKE_TIMEOUT", "UPTERMD_NODE_ID", "UPTERMD_DENY_SOURCE",
+	"UPTERMD_LEGACY_HOPS",
+}
+
+// ambientEnv lists variables that reach the decoded struct through flag
+// DEFAULTS rather than viper's UPTERMD_ prefix, and so are invisible to
+// uptermdEnv. PORT feeds the ssh-addr default via utils.DefaultLocalhost
+// (utils/utils.go:163); DEBUG feeds the debug default (root.go:41). Both are
+// read when Root() is constructed, which is why resetUptermdEnv must clear
+// them before unmarshalForTest builds the command.
+var ambientEnv = []string{"PORT", "DEBUG"}
+
+// unsetEnv removes keys for the duration of the test and restores their prior
+// state afterwards. Go has t.Setenv but no t.Unsetenv.
+func unsetEnv(t *testing.T, keys ...string) {
+	t.Helper()
+	for _, k := range keys {
+		if old, ok := os.LookupEnv(k); ok {
+			t.Cleanup(func() { _ = os.Setenv(k, old) })
+		} else {
+			t.Cleanup(func() { _ = os.Unsetenv(k) })
+		}
+		require.NoError(t, os.Unsetenv(k))
+	}
+}
+
+// resetUptermdEnv clears every variable that can influence a decode.
+//
+// Call it as the FIRST line of a test, before setting the values under test —
+// it unsets, so calling it afterwards would discard them. Environment values
+// outrank config-file values in viper, so an ambient UPTERMD_* would otherwise
+// silently mask what a test asserts.
+func resetUptermdEnv(t *testing.T) {
+	t.Helper()
+	unsetEnv(t, uptermdEnv...)
+	unsetEnv(t, ambientEnv...)
+}
+
+// unmarshalForTest parses args against a fresh root command and decodes the
+// result, exercising the same path RunE uses.
+func unmarshalForTest(t *testing.T, args ...string) (server.Opt, error) {
+	t.Helper()
+	cmd := Root()
+	require.NoError(t, cmd.ParseFlags(args))
+
+	_, opt, err := resolveConfig(cmd)
+	return opt, err
+}
+
+func TestUnmarshalFlagsExpandsFlagValues(t *testing.T) {
+	resetUptermdEnv(t)
+	t.Setenv("FLY_MACHINE_ID", "d891")
+	t.Setenv("FLY_APP_NAME", "upterm")
+
+	opt, err := unmarshalForTest(t, "--node-addr", "${FLY_MACHINE_ID}.vm.${FLY_APP_NAME}.internal:2222")
+
+	require.NoError(t, err)
+	require.Equal(t, "d891.vm.upterm.internal:2222", opt.NodeAddr)
+}
+
+func TestUnmarshalFlagsExpandsEnvValues(t *testing.T) {
+	resetUptermdEnv(t)
+	t.Setenv("FLY_MACHINE_ID", "d891")
+	t.Setenv("FLY_APP_NAME", "upterm")
+	t.Setenv("UPTERMD_NODE_ADDR", "${FLY_MACHINE_ID}.vm.${FLY_APP_NAME}.internal:2222")
+
+	opt, err := unmarshalForTest(t)
+
+	require.NoError(t, err)
+	require.Equal(t, "d891.vm.upterm.internal:2222", opt.NodeAddr)
+}
+
+func TestUnmarshalFlagsExpandsConfigFileValues(t *testing.T) {
+	// Especially important here: an ambient UPTERMD_NODE_ADDR would outrank
+	// the config file and the test would assert nothing.
+	resetUptermdEnv(t)
+	t.Setenv("FLY_MACHINE_ID", "d891")
+	t.Setenv("FLY_APP_NAME", "upterm")
+
+	dir := t.TempDir()
+	path := dir + "/uptermd.yaml"
+	require.NoError(t, os.WriteFile(path,
+		[]byte("node-addr: ${FLY_MACHINE_ID}.vm.${FLY_APP_NAME}.internal:2222\n"), 0o600))
+
+	opt, err := unmarshalForTest(t, "--config", path)
+
+	require.NoError(t, err)
+	require.Equal(t, "d891.vm.upterm.internal:2222", opt.NodeAddr)
+}
+
+// Regression test: expansion must not disturb viper's default decode hooks,
+// which split comma-separated values into []string.
+func TestUnmarshalFlagsSplitsListsThenExpandsElements(t *testing.T) {
+	resetUptermdEnv(t)
+	t.Setenv("KEYS_DIR", "/etc/keys")
+	t.Setenv("UPTERMD_AUTHORIZED_KEYS", "${KEYS_DIR}/a,${KEYS_DIR}/b")
+
+	opt, err := unmarshalForTest(t)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"/etc/keys/a", "/etc/keys/b"}, opt.AuthorizedKeysFiles)
+}
+
+// Expansion must run exactly once. A hook-based implementation would expand
+// the whole string and then each element, turning "$${NAME}" into a
+// substitution or an error on the second pass.
+func TestUnmarshalFlagsExpandsListElementsExactlyOnce(t *testing.T) {
+	resetUptermdEnv(t)
+	t.Setenv("KEYS_DIR", "/etc/keys")
+	t.Setenv("UPTERMD_AUTHORIZED_KEYS", "$${KEYS_DIR}/a")
+
+	opt, err := unmarshalForTest(t)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"${KEYS_DIR}/a"}, opt.AuthorizedKeysFiles)
+}
+
+// Splitting happens before expansion, so a comma inside a substituted value
+// does not create a new element.
+func TestUnmarshalFlagsDoesNotSplitOnSubstitutedComma(t *testing.T) {
+	resetUptermdEnv(t)
+	t.Setenv("HOSTS", "a.example.com,b.example.com")
+	t.Setenv("UPTERMD_HOSTNAME", "${HOSTS}")
+
+	opt, err := unmarshalForTest(t)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"a.example.com,b.example.com"}, opt.Hostnames)
+}
+
+// A credential whose value contains a reference must survive verbatim.
+func TestUnmarshalFlagsDoesNotRescanSubstitutedValues(t *testing.T) {
+	// root.go:105 binds bare SENTRY_DSN ahead of UPTERMD_SENTRY_DSN;
+	// resetUptermdEnv clears both.
+	resetUptermdEnv(t)
+	t.Setenv("SECRET_DSN", "https://user:p${TOKEN}w@sentry.example.com/1")
+	t.Setenv("TOKEN", "should-not-appear")
+	t.Setenv("UPTERMD_SENTRY_DSN", "${SECRET_DSN}")
+
+	opt, err := unmarshalForTest(t)
+
+	require.NoError(t, err)
+	require.Equal(t, "https://user:p${TOKEN}w@sentry.example.com/1", opt.SentryDSN)
+}
+
+func TestUnmarshalFlagsFailsOnUnsetRequiredVariable(t *testing.T) {
+	resetUptermdEnv(t)
+	unsetEnv(t, "FLY_MACHINE_ID")
+	t.Setenv("UPTERMD_NODE_ADDR", "${FLY_MACHINE_ID}.vm.internal:2222")
+
+	_, err := unmarshalForTest(t)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `required variable "FLY_MACHINE_ID" is not set`)
+}
+
+// PORT and DEBUG reach the decoded struct through flag defaults rather than
+// viper's UPTERMD_ prefix. Setting them before the reset is deliberate: the
+// reset clearing them is exactly what this test asserts.
+func TestResetUptermdEnvClearsAmbientPortAndDebug(t *testing.T) {
+	t.Setenv("PORT", "9999")
+	t.Setenv("DEBUG", "1")
+
+	resetUptermdEnv(t)
+
+	opt, err := unmarshalForTest(t)
+
+	require.NoError(t, err)
+	require.Equal(t, "127.0.0.1:2222", opt.SSHAddr)
+	require.False(t, opt.Debug)
+}
+
+func TestFrontDoorFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		env     bool
+		timeout time.Duration
+	}{
+		{name: "defaults", timeout: 60 * time.Second},
+		{name: "flags", args: []string{"--handshake-timeout=8s"}, timeout: 8 * time.Second},
+		{name: "environment", env: true, timeout: 12 * time.Second},
+		{name: "flag overrides environment", env: true, args: []string{"--handshake-timeout=4s"}, timeout: 4 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetUptermdEnv(t)
+			if tc.env {
+				t.Setenv("UPTERMD_HANDSHAKE_TIMEOUT", "12s")
+			}
+			cmd := Root()
+			require.NoError(t, cmd.ParseFlags(tc.args))
+			_, opt, err := resolveConfig(cmd)
+			require.NoError(t, err)
+			require.Equal(t, tc.timeout, opt.HandshakeTimeout)
+		})
+	}
+}
+
+func TestNegativeHandshakeTimeout(t *testing.T) {
+	resetUptermdEnv(t)
+	cmd := Root()
+	require.NoError(t, cmd.ParseFlags([]string{"--handshake-timeout=-1s"}))
+	_, opt, err := resolveConfig(cmd)
+	require.NoError(t, err)
+	require.ErrorContains(t, opt.Validate(), "handshake-timeout")
+}
+
+func TestRemovedFrontDoorFlag(t *testing.T) {
+	for _, arg := range []string{"--stock-ssh", "--stock-ssh=false"} {
+		t.Run(arg, func(t *testing.T) {
+			require.ErrorContains(t, Root().ParseFlags([]string{arg}), "unknown flag: --stock-ssh")
+		})
+	}
+}
+
+func TestInternalAddrFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  string
+		want string
+	}{
+		{name: "default"},
+		{name: "flag", args: []string{"--internal-addr", "10.0.0.1:2223"}, want: "10.0.0.1:2223"},
+		{name: "environment", env: "10.0.0.2:2223", want: "10.0.0.2:2223"},
+		{name: "flag overrides environment", args: []string{"--internal-addr=10.0.0.1:2223"}, env: "10.0.0.2:2223", want: "10.0.0.1:2223"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetUptermdEnv(t)
+			if tc.env != "" {
+				t.Setenv("UPTERMD_INTERNAL_ADDR", tc.env)
+			}
+			opt, err := unmarshalForTest(t, tc.args...)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, opt.InternalAddr)
+		})
+	}
+
+	flag := Root().PersistentFlags().Lookup("internal-addr")
+	require.NotNil(t, flag)
+	require.Equal(t, "address for the internal listener that node hops and bridged WebSocket guests use; only other relay nodes should be able to reach it. When set, the public SSH listener refuses relay certificates", flag.Usage)
+}
+
+func TestStrictFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		env      bool
+		network  string
+		required bool
+	}{
+		{name: "defaults", network: "tcp"},
+		{name: "flags", args: []string{"--ssh-network=tcp4", "--ssh-proxy-protocol-required"}, network: "tcp4", required: true},
+		{name: "environment", env: true, network: "tcp6", required: true},
+		{name: "flags override environment", args: []string{"--ssh-network=tcp4", "--ssh-proxy-protocol-required=false"}, env: true, network: "tcp4"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetUptermdEnv(t)
+			if tc.env {
+				t.Setenv("UPTERMD_SSH_NETWORK", "tcp6")
+				t.Setenv("UPTERMD_SSH_PROXY_PROTOCOL_REQUIRED", "true")
+			}
+			opt, err := unmarshalForTest(t, tc.args...)
+			require.NoError(t, err)
+			require.Equal(t, tc.network, opt.SSHNetwork)
+			require.Equal(t, tc.required, opt.SSHProxyProtocolRequired)
+		})
+	}
+	flags := Root().PersistentFlags()
+	require.Equal(t, "network for the SSH listener: tcp (the address's own families), tcp4 or tcp6", flags.Lookup("ssh-network").Usage)
+	require.Equal(t, "require a PROXY protocol v2 header on every SSH connection, and close any connection without one. Needs --internal-addr. Only as trustworthy as the network: make sure nothing but your proxy can reach this listener", flags.Lookup("ssh-proxy-protocol-required").Usage)
+}
+
+func TestHopKeyFlags(t *testing.T) {
+	resetUptermdEnv(t)
+	opt, err := unmarshalForTest(t, "--hop-key", "h1,h2", "--hop-trusted-key", "key-one,key-two", "--hop-refuse-host-key")
+	require.NoError(t, err)
+	require.Equal(t, []string{"h1", "h2"}, opt.HopKeys)
+	require.Equal(t, []string{"key-one", "key-two"}, opt.HopTrustedKeys)
+	require.True(t, opt.HopRefuseHostKey)
+	cmd := Root()
+	require.Equal(t, "private key file(s) that sign node hops; the first signs. Without it, hops are signed with the server's own keys. Hosts are always sent certificates signed with the server's own keys", cmd.PersistentFlags().Lookup("hop-key").Usage)
+	require.Equal(t, "public key(s) whose signatures this node accepts on node hops, in addition to its hop keys", cmd.PersistentFlags().Lookup("hop-trusted-key").Usage)
+	require.Equal(t, "stop accepting node hops signed with the server's own keys", cmd.PersistentFlags().Lookup("hop-refuse-host-key").Usage)
+}
+
+func TestNodeTrustedKeyFlag(t *testing.T) {
+	resetUptermdEnv(t)
+	opt, err := unmarshalForTest(t, "--node-trusted-key", "key-one,key-two")
+	require.NoError(t, err)
+	require.Equal(t, []string{"key-one", "key-two"}, opt.NodeTrustedKeys)
+	require.Equal(t, "public key(s) this node accepts from another relay node it hops to, in addition to its own server keys. Add a new server key here on every node before any node presents it, and keep the old one listed until no node presents it", Root().PersistentFlags().Lookup("node-trusted-key").Usage)
+}
+
+// --legacy-hops is on unless turned off, and RefuseLegacyHops is its opposite,
+// from the command line, the environment or the config file.
+func TestLegacyHopsFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		env    string
+		config string
+		refuse bool
+	}{
+		{name: "default"},
+		{name: "flag off", args: []string{"--legacy-hops=false"}, refuse: true},
+		{name: "flag on", args: []string{"--legacy-hops"}},
+		{name: "environment", env: "false", refuse: true},
+		{name: "config file", config: "legacy-hops: false\n", refuse: true},
+		{name: "flag overrides environment", args: []string{"--legacy-hops=true"}, env: "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetUptermdEnv(t)
+			if tc.env != "" {
+				t.Setenv("UPTERMD_LEGACY_HOPS", tc.env)
+			}
+			args := tc.args
+			if tc.config != "" {
+				path := filepath.Join(t.TempDir(), "uptermd.yaml")
+				require.NoError(t, os.WriteFile(path, []byte(tc.config), 0o600))
+				args = append(args, "--config", path)
+			}
+			opt, err := unmarshalForTest(t, args...)
+			require.NoError(t, err)
+			require.Equal(t, tc.refuse, opt.RefuseLegacyHops)
+		})
+	}
+	t.Run("not a bool", func(t *testing.T) {
+		resetUptermdEnv(t)
+		t.Setenv("UPTERMD_LEGACY_HOPS", "flase")
+		_, err := unmarshalForTest(t)
+		require.ErrorContains(t, err, "legacy-hops")
+	})
+	flag := Root().PersistentFlags().Lookup("legacy-hops")
+	require.NotNil(t, flag)
+	require.Equal(t, "true", flag.DefValue)
+	require.Equal(t, "exchange node hops in the format that predates the hop gate, so this node can share a fleet with older ones; turn it off only once every node supports the gate", flag.Usage)
+}

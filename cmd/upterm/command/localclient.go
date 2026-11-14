@@ -1,0 +1,133 @@
+package command
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"time"
+
+	"github.com/owenthereal/upterm/attach"
+	"github.com/owenthereal/upterm/host/api"
+	"github.com/owenthereal/upterm/internal/termsize"
+	"github.com/owenthereal/upterm/internal/tty"
+	"golang.org/x/crypto/ssh"
+)
+
+// defaultLocalClientDrainTimeout bounds how long upterm host waits freely, after
+// the daemon has ended, for its own terminal to finish: the client drains
+// the channel into stdout and restores the terminal on its way out, and a
+// stdout nobody drains must not hold the exit forever. Past it the client is
+// cancelled — and still waited for, since cancellation is what makes it
+// finish.
+const defaultLocalClientDrainTimeout = 5 * time.Second
+
+// attachLocalTerminal attaches the local terminal to a session's attach
+// socket in the shape lt describes, holding raw mode and following resizes
+// for exactly as long as the attachment lasts. keys is the daemon's host
+// keys, kept beside socket since the two travel together. src is the session
+// ~? reports on; its keys are filled in here, from escape and whether this
+// terminal can be suspended.
+func attachLocalTerminal(ctx context.Context, socket string, keys []ssh.PublicKey, lt localTerminal, escape byte, src statusSource, stdin, stdout *os.File, logger *slog.Logger) (attach.Result, error) {
+	return attachLocalTerminalWith(ctx, socket, keys, lt, escape, src, "", stdin, stdout, tty.Owned, logger)
+}
+
+// attachLocalTerminalWith is attachLocalTerminal with the foreground-ownership
+// predicate injected, for the reason withRawTerminal takes one: job control
+// cannot be staged in-process, so a test that needs raw mode to be restored
+// has no way to be the foreground of the pty pair it opened. It also takes
+// notice, the line the session is asked to show once attached (see
+// attach.Terminal.Notice), which only a terminal in raw mode asks for: it is
+// said to someone typing into the session.
+func attachLocalTerminalWith(ctx context.Context, socket string, keys []ssh.PublicKey, lt localTerminal, escape byte, src statusSource, notice string, stdin, stdout *os.File, owned func(*os.File) bool, logger *slog.Logger) (attach.Result, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	client := &attach.Client{
+		Socket:   socket,
+		HostKeys: keys,
+		Stdin:    lt.stdin,
+		Stdout:   stdout,
+		Pty:      lt.pty,
+		Escape:   escape,
+		Logger:   logger,
+	}
+	if lt.sizeOf != nil {
+		client.Resizes = watchResize(ctx, lt.sizeOf)
+	}
+
+	if !lt.rawMode {
+		return client.Run(ctx)
+	}
+	raw := &rawTerminal{f: stdin, owned: owned}
+	if err := raw.enter(); err != nil {
+		return attach.Result{}, fmt.Errorf("unable to set terminal to raw mode: %w", err)
+	}
+	defer raw.restore()
+	if suspendSupported && suspendAvailable() {
+		client.Suspend = func() (termsize.Size, bool) { return suspendLocalTerminal(raw, stdout, stopSelf) }
+	}
+	// ~? only here, where keystrokes are read, and so in raw mode, which its
+	// \r\n-ended lines are written for. The keys it lists are this
+	// terminal's: its escape character, and ~^Z only where it suspends.
+	src.Escape, src.Suspend = escape, client.Suspend != nil
+	client.Status = terminalStatus(src, logger)
+	client.Approvals = true
+	client.Notice = notice
+	return client.Run(ctx)
+}
+
+// suspendLocalTerminal is the ~^Z hook's body, lifted out of the closure that
+// builds it so both halves of it can be pinned by a test: give the terminal
+// back before stopping and take it again after, so a shell prompt printed
+// while this process still held raw mode is not left without echo. The size
+// is measured after the resume, because the terminal may have been resized
+// while we were stopped.
+//
+// Re-entering is conditional on raw.owned, unlike the give-it-back half —
+// deliberately asymmetric, and not pushed into rawTerminal.enter itself,
+// whose contract elsewhere is to fail loudly when raw mode is unavailable
+// rather than silently no-op. ^Z then bg leaves this process resuming in the
+// background: the shell sent SIGCONT without handing the terminal back, and
+// SIGTTOU is ignored (host.InstallSignalPolicy), so the re-entering
+// tcsetattr would otherwise succeed against a terminal that is no longer
+// this process's to touch — writing raw termios over the foreground shell's,
+// exactly the hazard withRawTerminal's own comment describes for its
+// deferred restore.
+//
+// So a process continued in the background stops again, as that tcsetattr's
+// SIGTTOU would have stopped it had it not been ignored, and as ssh's ~^Z
+// does: the shell reports the job stopped, and fg brings it back, raw and
+// all. Each stop again is skipped if fg has already handed the terminal back
+// (stopSelf's unless). Reporting the terminal lost instead would detach the
+// client, and fg would find the job gone. Only a stop that is discarded ends
+// this in the background — the process group has been orphaned, so nothing
+// is left to continue it — and then the terminal is left cooked and reported
+// lost.
+//
+// It reports whether the terminal is this process's again, in raw mode: the
+// client puts the session's modes back on it only then.
+//
+// stop is stopSelf in production; a test injects one that does not actually
+// stop the process, so the terminal's state at the instant it runs — and
+// after this returns — can both be observed without staging real job
+// control.
+func suspendLocalTerminal(raw *rawTerminal, stdout *os.File, stop func(unless func() bool) bool) (termsize.Size, bool) {
+	raw.restore()
+	owns := func() bool { return raw.owned(raw.f) }
+	for continued := stop(nil); continued && !owns(); {
+		// Continued without the terminal: stop again until fg, unless fg
+		// hands it back before the stop is raised.
+		continued = stop(owns)
+	}
+	owned := owns() && raw.enter() == nil
+	size, _ := tty.Size(stdout)
+	return size, owned
+}
+
+// shouldNotifyClient reports whether a client arriving or leaving is worth a
+// desktop notification. The host's own terminal is not: the operator is
+// looking at it. Both sites ask the same question, because notifying only one
+// of them would announce a departure with no arrival — which is what every
+// `upterm attach` detach would look like.
+func shouldNotifyClient(c *api.Client) bool { return c.Kind != api.Client_HOST }

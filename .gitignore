@@ -5,3 +5,8 @@ release
 *.tfstate
 *.tfstate.backup
 dist
+bin
+CLAUDE.md
+.claude/
+*.exe
+*.exe~

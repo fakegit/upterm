@@ -1,15 +1,69 @@
 package host
 
 import (
-	"io/ioutil"
-	"net"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"golang.org/x/crypto/ssh/agent"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
 )
+
+func TestSignersFallback(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+	dir := t.TempDir()
+	invalid := filepath.Join(dir, "invalid")
+	require.NoError(t, os.WriteFile(invalid, []byte("not a private key"), 0600))
+
+	for _, tc := range []struct {
+		name string
+		keys []string
+	}{
+		{name: "no keys"},
+		{name: "missing key", keys: []string{filepath.Join(dir, "missing")}},
+		{name: "invalid key", keys: []string{invalid}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			signers, cleanup, err := Signers(tc.keys, false)
+			if cleanup != nil {
+				t.Cleanup(cleanup)
+			}
+			require.NoError(t, err)
+			require.Len(t, signers, 1, "generate a temporary key when no keys can be loaded")
+			message := []byte("authenticate with a generated key")
+			signature, err := signers[0].Sign(rand.Reader, message)
+			require.NoError(t, err)
+			require.NoError(t, signers[0].PublicKey().Verify(message, signature))
+		})
+	}
+}
+
+func TestSignersPreservesFileKey(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	block, err := ssh.MarshalPrivateKey(privateKey, "")
+	require.NoError(t, err)
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "key")
+	require.NoError(t, os.WriteFile(keyFile, pem.EncodeToMemory(block), 0600))
+
+	signers, cleanup, err := Signers([]string{filepath.Join(dir, "missing"), keyFile}, false)
+	if cleanup != nil {
+		t.Cleanup(cleanup)
+	}
+	require.NoError(t, err)
+	require.Len(t, signers, 1)
+	want, err := ssh.NewPublicKey(publicKey)
+	require.NoError(t, err)
+	require.Equal(t, want.Marshal(), signers[0].PublicKey().Marshal())
+}
 
 const (
 	// Passphrase is "1234"
@@ -64,6 +118,7 @@ XBcvbGIDxNBoIlPFRM+bqvIDC1sQi3MIh3l/NZQxxIkW/+I4uClYpmNGXPZaNZNhpdv1PJ
 a9rQ==
 -----END OPENSSH PRIVATE KEY-----
 `
+	// nolint
 	rsaPublicKey = `ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCt//y3H4heRi1+3bO+FsqKyGTw5YQnu6MChEaDJY2SJqFCHGEwBAWGsuaDZPb6P+V16I5u2H+MtKBWDbkVK9760DkAFimuQ4XTtIzPhyb+Jc95wvNW6pAYXoetVlZIbzNzMEykE41kOMq19SNS3snvE5mYzfd2B6AGw3T2SubfF6G0staxtEYwlsWP/N+YIR4yLz11bxwuuTee/eMldvKZfzQQXIuopANU2mnAmoOqsG0G+DKNuXw7F7zd7lxus8zBF3fszur7Sc9APbWab5phJXWzE81ME2Z0Rro3/l/5mD3YqmS6+jyIqlvqR150Uf/2rKawVgzxZWvQhe1+gGIktavL85dO9VnxA/BASYM0caqFY/KwVpAs/mZ18SpjgPaEzm3H5eeTJRFMrwRusyunPTDv8lmAAXsr/ZMhd1gBkDiGE/YuTfekv8rMbkZNeB2HuXavcRTuCqY8y44ehe+sRug9nwykPnfRqjIeAm9zh+zknfJGl5TONHKnEj5tudpUvTd38ZnOM+CTzMHbSDOwkSLAp9mCzrbWc6OIeVqsqibPmia4SxyP7wxnszfH1MOkuCmphiCzk4nicYDhMW6jjXhRKok4yNIU9wqj0MMEKS3RKblAzCu7VFVTDrLSJIzs7Ch0RIuGnVTQ5S4O156Kr9hL535k6c6/NUXbylXtuw==`
 
 	// Passphrase is "1234"
@@ -76,122 +131,9 @@ sSq5R8Qu+iqFOtgNFnPI1/wu22agUYxs3h6Su4Jv6WbySJpJhHhIN/6pZ4DZgj4zWGGSJl
 CUI+b0Gxfqa/HSKlS23Iu7ZeWoMakwvcg5A5M8E/ihBLSDNsCJU8pgZ9FD
 -----END OPENSSH PRIVATE KEY-----
 `
+	// nolint
 	ed25519PublicKey = `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA9dIfLyILssYzKIVY7UQenn2Il6cUeeYppVwDSAiqPz jou@oou-ltm.internal.salesforce.com`
 )
-
-func Test_signersFromSSHAgentForKeys(t *testing.T) {
-	type testCase struct {
-		name        string
-		publicKey   string
-		privateKey  string
-		passphrase  string
-		signerCount int
-		errMsg      string
-	}
-
-	cases := []testCase{
-		{
-			name:        "rsa private key wrong passphrase",
-			publicKey:   rsaPublicKey,
-			privateKey:  rsaPrivateKey,
-			passphrase:  "wrong passphrase",
-			signerCount: 0,
-			errMsg:      "error decrypting private key",
-		},
-		{
-			name:        "rsa private key correct passphrase",
-			publicKey:   rsaPublicKey,
-			privateKey:  rsaPrivateKey,
-			signerCount: 1,
-			passphrase:  "1234",
-		},
-		{
-			name:        "ed25519 private key wrong passphrase",
-			publicKey:   ed25519PublicKey,
-			privateKey:  ed25519PriavteKey,
-			passphrase:  "wrong passphrase",
-			signerCount: 0,
-			errMsg:      "error decrypting private key",
-		},
-		{
-			name:        "ed25519 private key correct passphrase",
-			publicKey:   ed25519PublicKey,
-			privateKey:  ed25519PriavteKey,
-			signerCount: 1,
-			passphrase:  "1234",
-		},
-		{
-			name:        "no private key",
-			signerCount: 0,
-			errMsg:      "SSH Agent does not contain any identities",
-		},
-	}
-
-	testSignersFromSSHAgent := func(t *testing.T, tc testCase) {
-		c1, c2 := net.Pipe()
-
-		defer c1.Close()
-		defer c2.Close()
-
-		client := agent.NewClient(c1)
-		go func() {
-			_ = agent.ServeAgent(agent.NewKeyring(), c2)
-		}()
-
-		var (
-			privateKeys []string
-			privateKey  = ""
-		)
-
-		if tc.privateKey != "" && tc.publicKey != "" {
-			dir := t.TempDir()
-			privateKey = filepath.Join(dir, "private_key")
-			if err := ioutil.WriteFile(privateKey, []byte(tc.privateKey), 0600); err != nil {
-				t.Fatal(err)
-			}
-			if err := ioutil.WriteFile(filepath.Join(dir, "private_key.pub"), []byte(tc.publicKey), 0600); err != nil {
-				t.Fatal(err)
-			}
-
-			privateKeys = []string{privateKey}
-		}
-
-		signers, err := signersFromSSHAgentForKeys(client, privateKeys, func(file string) ([]byte, error) {
-			if want, got := privateKey, file; want != got {
-				t.Fatalf("file mismatched, want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-			}
-
-			return []byte(tc.passphrase), nil
-		})
-
-		if want, got := tc.signerCount, len(signers); want != got {
-			t.Fatalf("number of signers mismatch: want=%d got=%d", want, got)
-		}
-
-		if err == nil && tc.errMsg != "" {
-			t.Fatal("error shouldn't be nil")
-		}
-
-		if err != nil && tc.errMsg == "" {
-			t.Fatalf("error should be nil but it's %s", err.Error())
-		}
-
-		if err != nil && !strings.Contains(err.Error(), tc.errMsg) {
-			t.Fatalf("unexpected error message, want=%q, got=%q", tc.errMsg, err.Error())
-		}
-	}
-
-	for _, cc := range cases {
-		c := cc
-
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-
-			testSignersFromSSHAgent(t, c)
-		})
-	}
-
-}
 
 func Test_signerFromFile(t *testing.T) {
 	cases := []struct {
@@ -231,7 +173,7 @@ func Test_signerFromFile(t *testing.T) {
 
 			dir := t.TempDir()
 			tmpfn := filepath.Join(dir, "private_key")
-			if err := ioutil.WriteFile(tmpfn, []byte(c.privateKey), 0600); err != nil {
+			if err := os.WriteFile(tmpfn, []byte(c.privateKey), 0600); err != nil {
 				t.Fatal(err)
 			}
 
@@ -256,4 +198,340 @@ func Test_signerFromFile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSignersWithRelaysThePassphrase: an encrypted key file is read with the
+// passphrase the injected prompt returns, and a prompt that cannot answer
+// skips the key and says so — the CLI's daemon has no terminal of its own.
+func TestSignersWithRelaysThePassphrase(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	block, err := ssh.MarshalPrivateKeyWithPassphrase(priv, "", []byte("open-sesame"))
+	require.NoError(t, err)
+	file := filepath.Join(t.TempDir(), "id_ed25519")
+	require.NoError(t, os.WriteFile(file, pem.EncodeToMemory(block), 0600))
+
+	t.Run("answered", func(t *testing.T) {
+		var asked string
+		signers, err := SignersFromFilesWith([]string{file}, func(f string) ([]byte, error) { asked = f; return []byte("open-sesame"), nil }, nil)
+		require.NoError(t, err)
+		require.Len(t, signers, 1)
+		require.Equal(t, file, asked)
+	})
+	t.Run("unanswered", func(t *testing.T) {
+		var skipped string
+		var reason error
+		signers, err := SignersFromFilesWith([]string{file},
+			func(string) ([]byte, error) { return nil, errors.New("no terminal") },
+			func(f string, err error) { skipped, reason = f, err })
+		require.NoError(t, err)
+		require.Empty(t, signers, "a key whose passphrase cannot be read is skipped, as it always was")
+		require.Equal(t, file, skipped)
+		require.ErrorContains(t, reason, "no terminal")
+	})
+}
+
+// failingPrompt is a passphrase prompt that must never be reached.
+func failingPrompt(t *testing.T) func(string) ([]byte, error) {
+	return func(file string) ([]byte, error) {
+		t.Fatalf("the passphrase prompt was called for %s", file)
+		return nil, nil
+	}
+}
+
+func TestIdentitySigners_EmptyListIsAnError(t *testing.T) {
+	_, cleanup, err := identitySigners(nil, "", failingPrompt(t))
+	require.Nil(t, cleanup)
+	require.EqualError(t, err, "private-key was supplied but names no files")
+}
+
+func TestIdentitySigners_MissingFileIsAnError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	_, _, err := identitySigners([]string{missing}, "", failingPrompt(t))
+	require.ErrorContains(t, err, "cannot read private key "+missing)
+}
+
+func TestIdentitySigners_UnparseableFileIsAnError(t *testing.T) {
+	junk := filepath.Join(t.TempDir(), "junk")
+	require.NoError(t, os.WriteFile(junk, []byte("not a key of any kind"), 0600))
+	_, _, err := identitySigners([]string{junk}, "", failingPrompt(t))
+	require.ErrorContains(t, err, "cannot parse private key "+junk)
+}
+
+// skPrivateKeyAuthMagic and the wire structs below mirror x/crypto's
+// openssh-key-v1 container (golang.org/x/crypto/ssh/keys.go, v0.57.0) well
+// enough to build a private-key file whose inner key type is
+// sk-ssh-ed25519@openssh.com: a FIDO/security-key handle, not a signable
+// private key. `ssh-keygen -t ed25519-sk` writes exactly this container
+// shape. x/crypto's parseOpenSSHPrivateKey type-switches on RSA, Ed25519 and
+// ECDSA only, so this key type falls to its default case and returns "ssh:
+// unhandled key type" — the failure this fix is about.
+const skPrivateKeyAuthMagic = "openssh-key-v1\x00"
+
+type skOpenSSHContainer struct {
+	CipherName   string
+	KdfName      string
+	KdfOpts      string
+	NumKeys      uint32
+	PubKey       []byte
+	PrivKeyBlock []byte
+}
+
+type skOpenSSHPrivateBlock struct {
+	Check1  uint32
+	Check2  uint32
+	Keytype string
+	Rest    []byte `ssh:"rest"`
+}
+
+type skEd25519PublicKeyWire struct {
+	Name        string
+	KeyBytes    []byte
+	Application string
+}
+
+// skEd25519PublicKeyBlob returns the wire-format public key blob for a
+// FIDO/security-key ed25519 identity: the shape ssh-keygen -t ed25519-sk
+// writes to <file>.pub, and what x/crypto's own parseSKEd25519 expects.
+func skEd25519PublicKeyBlob(pub ed25519.PublicKey) []byte {
+	return ssh.Marshal(skEd25519PublicKeyWire{
+		Name:        "sk-ssh-ed25519@openssh.com",
+		KeyBytes:    []byte(pub),
+		Application: "ssh:",
+	})
+}
+
+// skEd25519PrivateStub builds a genuine openssh-key-v1 private-key file
+// whose inner key type is sk-ssh-ed25519@openssh.com — a FIDO/security-key
+// stub. pub only needs to be 32 bytes; nothing reads it as a real key,
+// because x/crypto rejects the key type before it would get that far.
+func skEd25519PrivateStub(t *testing.T, pub ed25519.PublicKey) []byte {
+	t.Helper()
+
+	privBlock := ssh.Marshal(skOpenSSHPrivateBlock{
+		Check1:  0x2a2a2a2a,
+		Check2:  0x2a2a2a2a,
+		Keytype: "sk-ssh-ed25519@openssh.com",
+	})
+	container := ssh.Marshal(skOpenSSHContainer{
+		CipherName:   "none",
+		KdfName:      "none",
+		KdfOpts:      "",
+		NumKeys:      1,
+		PubKey:       skEd25519PublicKeyBlob(pub),
+		PrivKeyBlock: privBlock,
+	})
+	full := append([]byte(skPrivateKeyAuthMagic), container...)
+	return pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: full})
+}
+
+// TestSkEd25519PrivateStub_IsUnhandledKeyType pins the premise the sk-stub
+// tests in this package depend on: the synthetic private key really does
+// reach x/crypto's "ssh: unhandled key type" branch, the same one a real
+// `ssh-keygen -t ed25519-sk` private file hits.
+func TestSkEd25519PrivateStub_IsUnhandledKeyType(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	_, err = ssh.ParseRawPrivateKey(skEd25519PrivateStub(t, pub))
+	require.EqualError(t, err, "ssh: unhandled key type")
+}
+
+// The "no .pub sibling" sk-stub case used to stop here with the file
+// unresolvable, same as ordinary junk. It no longer does: the public key
+// embedded in the openssh-key-v1 container itself is now recovered and
+// tried against the agent, so the case needs an agent and lives with the
+// other agent-backed tests in signer_unix_test.go, as
+// TestIdentitySigners_SecurityKeyStubWithNoPubSiblingResolvesThroughAgent
+// and TestIdentitySigners_SecurityKeyStubWithNoPubSiblingNotHeldByAgentIsAnError.
+
+func TestIdentitySigners_UnencryptedFileNeedsNoAgent(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	block, err := ssh.MarshalPrivateKey(privateKey, "")
+	require.NoError(t, err)
+	keyFile := filepath.Join(t.TempDir(), "key")
+	require.NoError(t, os.WriteFile(keyFile, pem.EncodeToMemory(block), 0600))
+
+	// No agent socket at all: an unencrypted file must not want one.
+	signers, cleanup, err := identitySigners([]string{keyFile}, "", failingPrompt(t))
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	require.Len(t, signers, 1)
+	want, err := ssh.NewPublicKey(publicKey)
+	require.NoError(t, err)
+	require.Equal(t, want.Marshal(), signers[0].PublicKey().Marshal())
+}
+
+// TestIdentitySigners_DuplicateEntriesAreOfferedOnce covers naming one key
+// more than once, which OpenSSH collapses too: two entries, one identity.
+// Offered twice it would be probed twice during auth, and counted twice
+// against the server's limit on tries. Distinct keys are left alone, in the
+// order they were named.
+func TestIdentitySigners_DuplicateEntriesAreOfferedOnce(t *testing.T) {
+	dir := t.TempDir()
+	writeKey := func(name string) (string, ssh.PublicKey) {
+		t.Helper()
+		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		block, err := ssh.MarshalPrivateKey(privateKey, "")
+		require.NoError(t, err)
+		file := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(file, pem.EncodeToMemory(block), 0600))
+		sshPub, err := ssh.NewPublicKey(publicKey)
+		require.NoError(t, err)
+		return file, sshPub
+	}
+	keyFile, keyPub := writeKey("key")
+	otherFile, otherPub := writeKey("other")
+
+	t.Run("the same file twice", func(t *testing.T) {
+		signers, cleanup, err := identitySigners([]string{keyFile, keyFile}, "", failingPrompt(t))
+		require.NoError(t, err)
+		t.Cleanup(cleanup)
+		require.Len(t, signers, 1)
+		require.Equal(t, keyPub.Marshal(), signers[0].PublicKey().Marshal())
+	})
+
+	t.Run("distinct keys keep their places", func(t *testing.T) {
+		signers, cleanup, err := identitySigners([]string{keyFile, otherFile, keyFile}, "", failingPrompt(t))
+		require.NoError(t, err)
+		t.Cleanup(cleanup)
+		require.Len(t, signers, 2)
+		require.Equal(t, keyPub.Marshal(), signers[0].PublicKey().Marshal())
+		require.Equal(t, otherPub.Marshal(), signers[1].PublicKey().Marshal())
+	})
+
+	t.Run("a duplicate still has to resolve", func(t *testing.T) {
+		missing := filepath.Join(dir, "missing")
+		_, _, err := identitySigners([]string{keyFile, keyFile, missing}, "", failingPrompt(t))
+		require.ErrorContains(t, err, "cannot read private key "+missing)
+	})
+}
+
+func TestIdentitySigners_EncryptedFileWithNoAgentPrompts(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "key")
+	require.NoError(t, os.WriteFile(keyFile, []byte(ed25519PriavteKey), 0600))
+
+	t.Run("right passphrase", func(t *testing.T) {
+		prompts := 0
+		signers, cleanup, err := identitySigners([]string{keyFile}, "", func(string) ([]byte, error) {
+			prompts++
+			return []byte("1234"), nil
+		})
+		require.NoError(t, err)
+		t.Cleanup(cleanup)
+		require.Len(t, signers, 1)
+		require.Equal(t, 1, prompts)
+		want, _, _, _, err := ssh.ParseAuthorizedKey([]byte(ed25519PublicKey))
+		require.NoError(t, err)
+		require.Equal(t, want.Marshal(), signers[0].PublicKey().Marshal())
+	})
+
+	t.Run("wrong passphrase three times is an error, not a generated key", func(t *testing.T) {
+		prompts := 0
+		_, _, err := identitySigners([]string{keyFile}, "", func(string) ([]byte, error) {
+			prompts++
+			return []byte("wrong"), nil
+		})
+		require.ErrorContains(t, err, "error decrypting private key "+keyFile)
+		require.Equal(t, 3, prompts)
+	})
+}
+
+func TestIdentitySigners_PubSelectorWithNoAgentIsAnError(t *testing.T) {
+	pubFile := filepath.Join(t.TempDir(), "id.pub")
+	require.NoError(t, os.WriteFile(pubFile, []byte(ed25519PublicKey), 0600))
+	_, _, err := identitySigners([]string{pubFile}, "", failingPrompt(t))
+	require.ErrorContains(t, err, pubFile+": no SSH agent to look up")
+	require.ErrorContains(t, err, "SSH agent is not running")
+	require.NotContains(t, err.Error(), "to use the private key itself",
+		"nothing sits beside this .pub, so there is no private key to point at")
+}
+
+// TestIdentitySigners_PubSelectorHintsAtThePrivateKeyBeside covers the slip
+// this hint is for: `-i id.pub` when `id` is right there. The message must
+// still say exactly why the lookup failed, and then name the sibling. Both of
+// signerFor's failures are covered by one test only in the sense that they
+// share this one call site; here there is no agent at all.
+func TestIdentitySigners_PubSelectorHintsAtThePrivateKeyBeside(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "id")
+	require.NoError(t, os.WriteFile(keyFile, []byte(ed25519PriavteKey), 0600))
+	pubFile := keyFile + ".pub"
+	require.NoError(t, os.WriteFile(pubFile, []byte(ed25519PublicKey), 0600))
+
+	_, _, err := identitySigners([]string{pubFile}, "", failingPrompt(t))
+	require.ErrorContains(t, err, pubFile+": no SSH agent to look up")
+	require.ErrorContains(t, err, "a .pub file selects an agent key; name "+keyFile+" to use the private key itself")
+}
+
+// TestParseAuthorizedKeyRest_PinsTheMultiKeyCheck pins the premise the
+// multi-key check in identitySigner rests on: x/crypto hands back everything
+// after the key it parsed, blank and `#` comment lines included, and only
+// skips those on the *next* parse. So "rest is non-blank" and "another key
+// follows" are different questions, and an ordinary .pub answers yes to the
+// first and no to the second. The check asks the second.
+func TestParseAuthorizedKeyRest_PinsTheMultiKeyCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		in          string
+		restIsEmpty bool
+		anotherKey  bool
+	}{
+		{
+			name:        "one key and a trailing newline",
+			in:          ed25519PublicKey + "\n",
+			restIsEmpty: true,
+		},
+		{
+			name:        "a blank line and a # comment after the key",
+			in:          ed25519PublicKey + "\n\n# generated by ssh-keygen\n",
+			restIsEmpty: false,
+		},
+		{
+			name:        "two keys",
+			in:          ed25519PublicKey + "\n" + rsaPublicKey + "\n",
+			restIsEmpty: false,
+			anotherKey:  true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, _, rest, err := ssh.ParseAuthorizedKey([]byte(tc.in))
+			require.NoError(t, err)
+			require.Equal(t, tc.restIsEmpty, len(rest) == 0, "rest = %q", rest)
+
+			_, _, _, _, err = ssh.ParseAuthorizedKey(rest)
+			if tc.anotherKey {
+				require.NoError(t, err, "a second key parses out of what follows")
+			} else {
+				require.EqualError(t, err, "ssh: no key found")
+			}
+		})
+	}
+}
+
+func TestIdentitySigners_MultiKeyFileIsAnError(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "authorized_keys")
+	require.NoError(t, os.WriteFile(file, []byte(ed25519PublicKey+"\n"+rsaPublicKey+"\n"), 0600))
+	_, _, err := identitySigners([]string{file}, "", failingPrompt(t))
+	require.EqualError(t, err, file+" names more than one key; name a file with a single key")
+}
+
+// TestIdentitySigners_PubWithBlanksAndCommentsIsOneKey is what the multi-key
+// check must not catch: the trailing newline, blank line and comment that
+// ssh-keygen and editors leave around a single key. With no agent it gets as
+// far as the lookup and no further, which is exactly as far as it should.
+func TestIdentitySigners_PubWithBlanksAndCommentsIsOneKey(t *testing.T) {
+	pubFile := filepath.Join(t.TempDir(), "id.pub")
+	require.NoError(t, os.WriteFile(pubFile, []byte(ed25519PublicKey+"\n\n# generated by ssh-keygen\n"), 0600))
+	_, _, err := identitySigners([]string{pubFile}, "", failingPrompt(t))
+	require.ErrorContains(t, err, pubFile+": no SSH agent to look up", "the key was accepted; only the agent was missing")
+	require.NotContains(t, err.Error(), "more than one key")
+}
+
+func TestSigners_IdentitiesOnlyDoesNotFallBackToAGeneratedKey(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+	missing := filepath.Join(t.TempDir(), "missing")
+	_, _, err := Signers([]string{missing}, true)
+	require.ErrorContains(t, err, "cannot read private key "+missing)
 }

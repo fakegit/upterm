@@ -1,14 +1,17 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 
-	"github.com/gliderlabs/ssh"
+	"charm.land/ssh"
 	"github.com/oklog/run"
-	log "github.com/sirupsen/logrus"
 	gossh "golang.org/x/crypto/ssh"
+	"log/slog"
 )
 
 const (
@@ -26,28 +29,95 @@ type forwardedStreamlocalPayload struct {
 	Reserved0  string
 }
 
+// isExpectedShutdownError returns true if the error is expected during normal session shutdown
+func isExpectedShutdownError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Context cancellation is normal during shutdown
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+
+	// EOF and connection closed errors are normal during shutdown
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+
+	errStr := err.Error()
+	// Common shutdown-related error messages
+	shutdownMessages := []string{
+		"closed",
+		"connection reset",
+		"broken pipe",
+		"use of closed network connection",
+	}
+
+	for _, msg := range shutdownMessages {
+		if strings.Contains(errStr, msg) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// sshOpenUnanswered is x/crypto's error for a channel open still waiting for
+// its answer when the connection ends (mux.go). There is no exported error to
+// match on, so match the text: if it ever drifts the refusal is simply logged
+// as an error, which is the safe direction to fail in.
+const sshOpenUnanswered = "ssh: unexpected packet in response to channel open: <nil>"
+
+// refusedForHostLeaving reports whether err is the SSH proxy refusing a channel
+// open because its connection from the host is ending. The open either reached
+// the proxy once that connection had started shutting down, or was waiting for
+// the host's answer when it ended, which the proxy passes on in x/crypto's
+// words.
+func refusedForHostLeaving(err error) bool {
+	var rejection *gossh.OpenChannelError
+	if !errors.As(err, &rejection) || rejection.Reason != gossh.ConnectionFailed {
+		return false
+	}
+	return rejection.Message == sshPeerDisconnected || rejection.Message == sshOpenUnanswered
+}
+
 func newStreamlocalForwardHandler(
-	sessionRepo *sessionRepo,
+	work *sshSessionWork,
+	sessionManager *SessionManager,
 	sessionDialListener SessionDialListener,
-	logger log.FieldLogger,
+	sessions *localSessions,
+	logger *slog.Logger,
 ) *streamlocalForwardHandler {
 	return &streamlocalForwardHandler{
-		sessionRepo:         sessionRepo,
+		work:                work,
+		sessionManager:      sessionManager,
 		sessionDialListener: sessionDialListener,
-		forwards:            make(map[string]net.Listener),
+		sessions:            sessions,
+		forwards:            make(map[string]forward),
 		logger:              logger,
 	}
 }
 
 type streamlocalForwardHandler struct {
-	sessionRepo         *sessionRepo
+	work                *sshSessionWork
+	sessionManager      *SessionManager
 	sessionDialListener SessionDialListener
-	forwards            map[string]net.Listener
-	logger              log.FieldLogger
+	sessions            *localSessions
+	forwards            map[string]forward // by session ID
+	logger              *slog.Logger
 	sync.Mutex
 }
 
-func (h *streamlocalForwardHandler) listen(ctx ssh.Context, ln net.Listener, sessionID string, logger log.FieldLogger) error {
+// forward is a registration's session socket listener. The socket is named by
+// the session ID, which a newer registration of the same ID binds after a
+// takeover, so the listener is kept with the registration that bound it.
+type forward struct {
+	reg *Registration
+	ln  net.Listener
+}
+
+func (h *streamlocalForwardHandler) listen(ctx ssh.Context, ln net.Listener, sessionID string, logger *slog.Logger) error {
 	conn := ctx.Value(ssh.ContextKeyConn).(*gossh.ServerConn)
 
 	for {
@@ -56,61 +126,105 @@ func (h *streamlocalForwardHandler) listen(ctx ssh.Context, ln net.Listener, ses
 			return err
 		}
 
-		go func(sessionID string, logger log.FieldLogger) {
-			payload := gossh.Marshal(&forwardedStreamlocalPayload{
-				SocketPath: sessionID,
-			})
-			ch, reqs, err := conn.OpenChannel(forwardedStreamlocalChannelType, payload)
-			if err != nil {
-				logger.WithError(err).Error("error opening channel")
-				c.Close()
-				return
-			}
+		go h.handleConnection(ctx, conn, c, sessionID, logger)
+	}
+}
 
-			closeAll := func() {
-				ch.Close()
-				c.Close()
-			}
+func (h *streamlocalForwardHandler) handleConnection(ctx ssh.Context, conn *gossh.ServerConn, localConn net.Conn, sessionID string, logger *slog.Logger) {
+	defer func() {
+		if err := localConn.Close(); err != nil {
+			logger.Debug("error closing local connection", "error", err)
+		}
+	}()
 
-			var g run.Group
-			{
-				g.Add(func() error {
-					gossh.DiscardRequests(reqs)
-					return nil
-				}, func(err error) {
-					closeAll()
-				})
-			}
-			{
-				g.Add(func() error {
-					_, err := io.Copy(ch, c)
-					return err
-				}, func(err error) {
-					closeAll()
-				})
-			}
-			{
-				g.Add(func() error {
-					_, err := io.Copy(c, ch)
-					return err
-				}, func(err error) {
-					closeAll()
-				})
-			}
+	payload := gossh.Marshal(&forwardedStreamlocalPayload{
+		SocketPath: sessionID,
+	})
 
-			if err := g.Run(); err != nil {
-				logger.WithError(err).Error("error listening connection")
-			}
-		}(sessionID, logger)
+	ch, reqs, err := conn.OpenChannel(forwardedStreamlocalChannelType, payload)
+	if err != nil {
+		// A guest that arrives as its host leaves is turned away: there is no
+		// host to take its tunnel. Its connection fails as it must, but nothing
+		// is wrong with the relay, so it is a warning.
+		level := slog.LevelError
+		if refusedForHostLeaving(err) {
+			level = slog.LevelWarn
+		}
+		logger.Log(ctx, level, "error opening channel", "error", err)
+		return
+	}
+	defer func() {
+		if err := ch.Close(); err != nil {
+			logger.Debug("error closing SSH channel", "error", err)
+		}
+	}()
+
+	// Whichever side finishes first, close both. Without this, a guest
+	// disconnecting leaves the channel to the host open until the host next
+	// writes output, so the host cannot tell that the guest has left.
+	closeBoth := func(error) {
+		_ = localConn.Close()
+		_ = ch.Close()
+	}
+
+	var g run.Group
+
+	// Context cancellation handler. ctx is the host's connection, which
+	// outlives every guest on it, so the interrupt has to end this actor too:
+	// otherwise Run waits for the host to disconnect, holding the guest's
+	// connection and channel until it does.
+	{
+		execute, interrupt := run.ContextHandler(ctx)
+		g.Add(execute, func(err error) {
+			interrupt(err)
+			closeBoth(err)
+		})
+	}
+
+	// SSH request handler
+	{
+		g.Add(func() error {
+			gossh.DiscardRequests(reqs)
+			return nil
+		}, closeBoth)
+	}
+
+	// Copy from local to SSH channel
+	{
+		g.Add(func() error {
+			_, err := io.Copy(ch, localConn)
+			return err
+		}, closeBoth)
+	}
+
+	// Copy from SSH channel to local
+	{
+		g.Add(func() error {
+			_, err := io.Copy(localConn, ch)
+			return err
+		}, closeBoth)
+	}
+
+	if err := g.Run(); err != nil && err != context.Canceled && !isExpectedShutdownError(err) {
+		logger.Error("error handling connection", "error", err)
 	}
 }
 
 func (h *streamlocalForwardHandler) Handler(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (bool, []byte) {
+	work, ok := h.work.enter()
+	if !ok {
+		return false, nil
+	}
+	defer work.done()
+	return h.handle(work, ctx, srv, req)
+}
+
+func (h *streamlocalForwardHandler) handle(work *sshWorkRef, ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (bool, []byte) {
 	switch req.Type {
 	case streamlocalForwardChannelType:
 		var reqPayload streamlocalChannelForwardMsg
 		if err := gossh.Unmarshal(req.Payload, &reqPayload); err != nil {
-			h.logger.WithError(err).Error("error parsing streamlocal payload")
+			h.logger.Error("error parsing streamlocal payload", "error", err)
 			return false, []byte(err.Error())
 		}
 
@@ -119,41 +233,69 @@ func (h *streamlocalForwardHandler) Handler(ctx ssh.Context, srv *ssh.Server, re
 		}
 
 		sessionID := reqPayload.SocketPath
-		logger := h.logger.WithFields(log.Fields{"session-id": sessionID})
+		logger := h.logger.With("session-id", sessionID)
 
-		// validate session exists
-		if _, err := h.sessionRepo.Get(sessionID); err != nil {
+		// Only the connection that registered a session may open its tunnel,
+		// and only while that registration is still the one this node serves.
+		// The store is shared across nodes, so existence alone proves nothing
+		// about who is asking; an ended registration whose store release
+		// failed must not be reopened uncounted; and a replaced one must not
+		// take the socket from its successor.
+		reg := ownedRegistration(ctx, sessionID)
+		if reg == nil {
+			logger.Warn("rejected forward for session not created on this connection")
+			return false, []byte("session not created on this connection")
+		}
+		if !h.sessions.active(reg) {
+			logger.Warn("rejected forward for ended session")
+			return false, []byte("session has ended")
+		}
+		if _, err := h.sessionManager.GetSession(sessionID); err != nil {
 			return false, []byte(err.Error())
 		}
 
-		ln, err := h.sessionDialListener.Listen(sessionID)
+		groupWork := work.child()
+		ln, err := h.bind(groupWork, reg)
 		if err != nil {
-			logger.WithError(err).Error("error listening socketing")
+			groupWork.done()
+		}
+		if errors.Is(err, errForwardEnded) {
+			logger.Warn("rejected forward for ended session")
+			return false, []byte("session has ended")
+		}
+		if err != nil {
+			logger.Error("error listening socket", "error", err)
 			return false, []byte(err.Error())
 		}
 
-		h.trackListener(sessionID, ln)
-
+		// ctx is the host's connection, which can outlive the tunnel: a cancel
+		// or a takeover closes the listener while the host stays. The
+		// interrupt ends this actor too, so the group ends with the listener.
 		var g run.Group
 		{
-			g.Add(func() error {
-				<-ctx.Done()
-				return ctx.Err()
-			}, func(err error) {
-				h.closeListener(sessionID)
+			execute, interrupt := run.ContextHandler(ctx)
+			g.Add(execute, func(err error) {
+				interrupt(err)
+				h.closeListener(reg)
 			})
 		}
 		{
 			g.Add(func() error {
 				return h.listen(ctx, ln, sessionID, logger)
 			}, func(err error) {
-				h.closeListener(sessionID)
+				h.closeListener(reg)
 			})
 		}
 
 		go func(sessionID string) {
+			defer groupWork.done()
 			if err := g.Run(); err != nil {
-				h.logger.WithError(err).WithField("session-id", sessionID).Debug("error handling ssh session")
+				// Log expected shutdown errors at debug level, critical errors at error level
+				if isExpectedShutdownError(err) {
+					h.logger.Debug("ssh session ended", "session-id", sessionID)
+				} else {
+					h.logger.Error("error handling ssh session", "error", err, "session-id", sessionID)
+				}
 			}
 		}(sessionID)
 
@@ -161,12 +303,17 @@ func (h *streamlocalForwardHandler) Handler(ctx ssh.Context, srv *ssh.Server, re
 	case cancelStreamlocalForwardChannelType:
 		var reqPayload streamlocalChannelForwardMsg
 		if err := gossh.Unmarshal(req.Payload, &reqPayload); err != nil {
-			h.logger.WithError(err).Error("error parsing steamlocal payload")
+			h.logger.Error("error parsing streamlocal payload", "error", err)
 			return false, []byte(err.Error())
 		}
 
 		sessionID := reqPayload.SocketPath
-		h.closeListener(sessionID)
+		reg := ownedRegistration(ctx, sessionID)
+		if reg == nil {
+			h.logger.Warn("rejected cancel for session not created on this connection", "session-id", sessionID)
+			return false, []byte("session not created on this connection")
+		}
+		h.closeListener(reg)
 
 		return true, nil
 
@@ -175,22 +322,108 @@ func (h *streamlocalForwardHandler) Handler(ctx ssh.Context, srv *ssh.Server, re
 	}
 }
 
-func (h *streamlocalForwardHandler) trackListener(sessionID string, ln net.Listener) {
+// errForwardEnded refuses a forward whose registration ended, or was replaced,
+// before it could bind.
+var errForwardEnded = errors.New("session has ended")
+
+// bind listens on reg's session socket and records the listener as reg's,
+// provided reg is still the registration this node serves. The check, the bind
+// and the record all happen under the handler lock, which a takeover's evict
+// takes too: a forward that began before the takeover either binds before the
+// old listener is closed, and is closed with it, or finds its registration
+// replaced. It can't bind after that close and take the socket's name from the
+// successor.
+//
+// A listener still held by a registration this node no longer serves is
+// closed first, under the same lock. Takeovers can overlap: when a later one
+// overtakes a takeover that hasn't yet closed the listener it replaced, that
+// listener would otherwise keep the socket's name from the registration this
+// node now serves. A listener of the registration this node serves is never
+// closed here, so a second forward from it still fails.
+func (h *streamlocalForwardHandler) bind(work *sshWorkRef, reg *Registration) (net.Listener, error) {
 	h.Lock()
-	defer h.Unlock()
-	h.forwards[sessionID] = ln
+	if !h.sessions.active(reg) {
+		h.Unlock()
+		return nil, errForwardEnded
+	}
+	var evicted *Registration
+	if fwd, ok := h.forwards[reg.ID()]; ok && !h.sessions.active(fwd.reg) {
+		if err := fwd.ln.Close(); err != nil {
+			h.logger.Error("error closing a replaced registration's listener", "error", err, "session-id", reg.ID())
+		}
+		delete(h.forwards, reg.ID())
+		evicted = fwd.reg
+	}
+	ln, err := h.sessionDialListener.Listen(reg.ID())
+	if err == nil {
+		h.forwards[reg.ID()] = forward{reg: reg, ln: ln}
+	}
+	h.Unlock()
+
+	// In the background, as a takeover releases the registration it replaced:
+	// ending releases the store entry, and a slow Consul call mustn't hold up
+	// the reply to reg's forward. The release is conditional, so it leaves
+	// reg's entry alone.
+	if evicted != nil {
+		child := work.child()
+		go func() { defer child.done(); h.sessions.end(evicted) }()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return ln, nil
 }
 
-func (h *streamlocalForwardHandler) closeListener(sessionID string) {
+func (h *streamlocalForwardHandler) trackListener(reg *Registration, ln net.Listener) {
+	h.Lock()
+	defer h.Unlock()
+	h.forwards[reg.ID()] = forward{reg: reg, ln: ln}
+}
+
+// untrack closes reg's listener and stops tracking it, and reports whether reg
+// had one. A listener for reg's ID that another registration bound is left
+// alone, so a replaced registration's late cleanup can't close its successor's
+// socket; so is one of another home's, however identical. reg's home is
+// retired before its listener closes.
+func (h *streamlocalForwardHandler) untrack(reg *Registration) bool {
 	h.Lock()
 	defer h.Unlock()
 
-	ln, ok := h.forwards[sessionID]
-	if ok {
-		ln.Close()
+	fwd, ok := h.forwards[reg.ID()]
+	if !ok || !fwd.reg.Same(reg) || fwd.reg.home != reg.home {
+		// Already closed, or not reg's
+		return false
 	}
+	h.sessions.fence(reg)
+	logger := h.logger.With("session-id", reg.ID())
+	if err := fwd.ln.Close(); err != nil {
+		logger.Error("error closing listener", "error", err)
+	} else {
+		logger.Debug("closed listener")
+	}
+	delete(h.forwards, reg.ID())
+	return true
+}
 
-	delete(h.forwards, sessionID)
+// closeListener closes reg's listener and ends reg, before it returns: a
+// host's cancel is answered only once its registration is released.
+func (h *streamlocalForwardHandler) closeListener(reg *Registration) {
+	if h.untrack(reg) {
+		// Outside the lock: ending releases the store entry, and a Consul call
+		// can be slow.
+		h.sessions.end(reg)
+	}
+}
 
-	h.sessionRepo.Delete(sessionID)
+// evict closes reg's listener, as closeListener does, but ends reg in the
+// background. A takeover evicts the registration it replaced: ending releases
+// the store entry, and a slow Consul call mustn't hold up the new
+// registration's reply or the close of the old connection, which takes its
+// guests with it. The release is conditional, so it leaves the successor's
+// entry alone.
+func (h *streamlocalForwardHandler) evict(work *sshWorkRef, reg *Registration) {
+	if h.untrack(reg) {
+		child := work.child()
+		go func() { defer child.done(); h.sessions.end(reg) }()
+	}
 }

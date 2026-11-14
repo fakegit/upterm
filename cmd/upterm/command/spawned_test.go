@@ -1,0 +1,1585 @@
+package command
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/owenthereal/upterm/attach"
+	"github.com/owenthereal/upterm/cmd/upterm/command/internal/bootstrap"
+	"github.com/owenthereal/upterm/host"
+	"github.com/owenthereal/upterm/host/api"
+	"github.com/owenthereal/upterm/host/sessiondir"
+	"github.com/owenthereal/upterm/internal/logging"
+	"github.com/owenthereal/upterm/internal/termsize"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
+	"google.golang.org/protobuf/proto"
+)
+
+// scriptedDaemon is the far end of a spawn: a bootstrap.Child driven by a
+// script, standing in for the daemon process.
+type scriptedDaemon struct {
+	child *bootstrap.Child
+	// open is what the session the daemon creates reports. Set before
+	// startup.
+	open bool
+	// launchID is the launch the daemon claims, "launch-1" unless a case
+	// about the record sets it before startup.
+	launchID string
+	// sessionID is the ID the daemon creates the session under and reports
+	// as it starts, as a real daemon reports the one the relay gave it:
+	// "sid-1" unless a case about the ID sets it before startup.
+	sessionID string
+	ready     chan struct{} // closed once spawn has built the child
+	gone      chan struct{} // closed when the child's watcher fires (parent left while armed)
+
+	// amend, when set, adds to the session the daemon reports as created,
+	// for a case about what a daemon reports beyond the basics.
+	amend func(*api.GetSessionResponse)
+}
+
+func newScriptedDaemon(t *testing.T) (spawnFunc, *scriptedDaemon) {
+	t.Helper()
+	d := &scriptedDaemon{launchID: "launch-1", sessionID: "sid-1", ready: make(chan struct{}), gone: make(chan struct{})}
+	spawn := func(opts spawnOptions) (net.Conn, *os.Process, error) {
+		require.NotEmpty(t, opts.name)
+		require.NotEmpty(t, opts.logPath)
+		a, b := net.Pipe()
+		t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+		d.child = bootstrap.NewChild(a, func() { close(d.gone) })
+		close(d.ready)
+		return b, nil, nil
+	}
+	return spawn, d
+}
+
+// await hands the script the child once spawn has built it. A channel rather
+// than polling the field: spawn runs on run's goroutine and the script runs
+// on its own, and an unsynchronised read of the field is a data race -race is
+// right to report.
+func (d *scriptedDaemon) await() *bootstrap.Child {
+	select {
+	case <-d.ready:
+	case <-time.After(5 * time.Second):
+		panic("the session never spawned a daemon")
+	}
+	return d.child
+}
+
+// startup runs the child's side up to and including started, on its own
+// goroutine, reporting the decision it was given.
+func (d *scriptedDaemon) startup(t *testing.T, name string) <-chan api.Accept_Decision {
+	t.Helper()
+	hostKey := testHostKeyLine(t)
+	got := make(chan api.Accept_Decision, 1)
+	go func() {
+		child := d.await()
+		_ = child.Claimed(&api.Claimed{Name: name, LaunchId: d.launchID, AdminSocket: "/run/a.sock", AttachSocket: "/run/t.sock", LogPath: "/var/log/upterm.log", Pid: 4242})
+		created := &api.GetSessionResponse{SessionId: d.sessionID, Host: "ssh://127.0.0.1:2222", NodeAddr: "127.0.0.1:2222", SshUser: "u", Command: []string{"bash"}, Open: d.open}
+		if d.amend != nil {
+			d.amend(created)
+		}
+		dec, err := child.SessionCreated(created)
+		got <- dec
+		if err != nil || dec != api.Accept_ACCEPTED {
+			child.Failed(bootstrap.Failure{Text: "declined", Abandoned: true})
+			return
+		}
+		_ = child.Listening("/run/t.sock", []string{hostKey})
+	}()
+	return got
+}
+
+func (d *scriptedDaemon) start() {
+	d.startWith(sessiondir.StatusReady)
+}
+
+// startWith is start for a case about the status the daemon publishes: the
+// record's status travels in Started and the parent prints what it is given.
+// The join state is a real daemon's with no timeout set.
+func (d *scriptedDaemon) startWith(status string) {
+	d.startWithJoinState(status, &api.JoinState{})
+}
+
+// startWithJoinState is start for a case about the join state the daemon
+// holds as it reports readiness.
+func (d *scriptedDaemon) startWithJoinState(status string, js *api.JoinState) {
+	child := d.await()
+	child.Disarm()
+	_ = child.Started(d.sessionID, status, js)
+}
+
+func newSession(t *testing.T, spawn spawnFunc, client clientFunc, stdout, stderr *bytes.Buffer) *spawnedSession {
+	t.Helper()
+	return &spawnedSession{
+		name:         "s",
+		logPath:      "/var/log/upterm.log",
+		stdout:       stdout,
+		stderr:       stderr,
+		spawn:        spawn,
+		display:      func(context.Context, *api.GetSessionResponse, string) error { return nil },
+		attachClient: client,
+		logger:       discardLogger(),
+		logWarning:   &logWarning{w: stderr},
+	}
+}
+
+// TestSpawnedSessionNamesTheLogWhenTheSpawnFails pins that a failure to spawn
+// the daemon names the log only when the spawn got far enough to have opened
+// one. spawn_unix.go and spawn_windows.go each os.OpenFile the log
+// themselves, so a failure before that point (nonce, bootstrap directory,
+// listener) has no log to point at, and naming one that is not there would
+// mislead.
+func TestSpawnedSessionNamesTheLogWhenTheSpawnFails(t *testing.T) {
+	t.Run("log exists", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "upterm.log")
+		require.NoError(t, os.WriteFile(logPath, nil, 0o600))
+		spawn := func(spawnOptions) (net.Conn, *os.Process, error) {
+			return nil, nil, errors.New("boom")
+		}
+		var stdout, stderr bytes.Buffer
+		s := newSession(t, spawn, nil, &stdout, &stderr)
+		s.logPath = logPath
+
+		err := s.run(context.Background())
+		require.ErrorContains(t, err, "boom")
+		require.ErrorContains(t, err, "(see "+logPath+")")
+	})
+	t.Run("no log yet", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "upterm.log") // never created
+		spawn := func(spawnOptions) (net.Conn, *os.Process, error) {
+			return nil, nil, errors.New("boom")
+		}
+		var stdout, stderr bytes.Buffer
+		s := newSession(t, spawn, nil, &stdout, &stderr)
+		s.logPath = logPath
+
+		err := s.run(context.Background())
+		require.ErrorContains(t, err, "boom")
+		require.NotContains(t, err.Error(), "(see")
+	})
+	t.Run("log not opened", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "upterm.log")
+		require.NoError(t, os.WriteFile(logPath, nil, 0o600))
+		spawn := func(opts spawnOptions) (net.Conn, *os.Process, error) {
+			opts.logOff(&fs.PathError{Op: "open", Path: opts.logPath, Err: errors.New("permission denied")})
+			return nil, nil, errors.New("boom")
+		}
+		var stdout, stderr bytes.Buffer
+		s := newSession(t, spawn, nil, &stdout, &stderr)
+		s.logPath = logPath
+
+		err := s.run(context.Background())
+		require.ErrorContains(t, err, "boom")
+		require.NotContains(t, err.Error(), "(see", "nothing of this run is in it")
+	})
+}
+
+// A spawn that can't open the log warns once in a run, however often it
+// spawns again (a name retry), and the session goes on. The root's
+// pre-run shares the warning: TestHostWithoutItsLogWarnsOnce.
+func TestASpawnWithoutItsLogWarnsOnce(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	warning := &logWarning{w: &stderr}
+	for range 2 {
+		spawn, d := newScriptedDaemon(t)
+		withoutLog := func(opts spawnOptions) (net.Conn, *os.Process, error) {
+			opts.logOff(&fs.PathError{Op: "open", Path: opts.logPath, Err: errors.New("permission denied")})
+			return spawn(opts)
+		}
+		s := newSession(t, withoutLog, nil, &stdout, &stderr)
+		s.detach, s.logWarning = true, warning
+		dec := d.startup(t, "s")
+		go func() { <-dec; d.start() }()
+		require.NoError(t, s.run(context.Background()))
+	}
+	require.Equal(t, "upterm: warning: can't open the log file /var/log/upterm.log: permission denied; logging is off\n", stderr.String())
+}
+
+// A session whose spawn couldn't open the log points no line at it:
+// nothing of the session is in it. With the log, the lines still do.
+func TestASessionWithoutItsLogPointsNoLineAtIt(t *testing.T) {
+	// The disconnect below is checked against the record; there is none
+	// under these roots, so the check has no answer to give.
+	setupSessionRoots(t)
+	for _, logOff := range []bool{false, true} {
+		see := " (see /var/log/upterm.log)"
+		if logOff {
+			see = ""
+		}
+		spawnFor := func() (spawnFunc, *scriptedDaemon) {
+			spawn, d := newScriptedDaemon(t)
+			if !logOff {
+				return spawn, d
+			}
+			return func(opts spawnOptions) (net.Conn, *os.Process, error) {
+				opts.logOff(&fs.PathError{Op: "open", Path: opts.logPath, Err: errors.New("permission denied")})
+				return spawn(opts)
+			}, d
+		}
+
+		// The command couldn't start.
+		spawn, d := spawnFor()
+		var stdout, stderr bytes.Buffer
+		s := newSession(t, spawn, nil, &stdout, &stderr)
+		go func() { d.await().Failed(bootstrap.Failure{Text: "exec: no such file"}) }()
+		require.EqualError(t, s.run(context.Background()), "session s could not start: exec: no such file"+see, "log off: %v", logOff)
+
+		// The local terminal was disconnected.
+		spawn, d = spawnFor()
+		attached := make(chan string, 1)
+		result := make(chan attach.Result, 1)
+		stdout.Reset()
+		stderr.Reset()
+		s = newSession(t, spawn, fakeClient(attached, result), &stdout, &stderr)
+		d.startup(t, "s")
+		go func() {
+			<-attached
+			d.start()
+			result <- attach.Result{Reason: attach.Disconnected}
+		}()
+		_ = s.run(context.Background())
+		require.Contains(t, stderr.String(), "\r\nupterm: this terminal was disconnected"+see+"; upterm couldn't check the session. upterm session list shows what's running\r\n", "log off: %v", logOff)
+	}
+}
+
+// upterm host checks the launch it started, not the name: the session it
+// attached to is the one it may send the operator back to, and a name another
+// launch holds now is somebody else's session.
+func TestHostChecksTheLaunchItStartedAfterADisconnect(t *testing.T) {
+	setupSessionRoots(t)
+	dir := claimSession(t, "s")
+	releaseAtEnd(t, dir)
+	require.NoError(t, dir.Update(func(r *sessiondir.Record) { r.Status = sessiondir.StatusReady }))
+
+	for _, tc := range []struct {
+		launch, want string
+	}{
+		{dir.LaunchID(), "upterm: this terminal was disconnected (see /var/log/upterm.log); the session is still running. Reattach with upterm attach s"},
+		{"launch-1", "upterm: this terminal was disconnected, and the session has ended (see /var/log/upterm.log); another session now uses the name s"},
+	} {
+		spawn, d := newScriptedDaemon(t)
+		d.launchID = tc.launch
+		attached := make(chan string, 1)
+		result := make(chan attach.Result, 1)
+		var stdout, stderr bytes.Buffer
+		s := newSession(t, spawn, fakeClient(attached, result), &stdout, &stderr)
+		d.startup(t, "s")
+		go func() {
+			<-attached
+			d.start()
+			result <- attach.Result{Reason: attach.Disconnected}
+		}()
+		var ec ExitCodeError
+		require.ErrorAs(t, s.run(context.Background()), &ec)
+		require.Equal(t, exitDisconnected, ec.Code)
+		require.NoError(t, ec.Err, "the line is the whole account")
+		require.Equal(t, "\r\n"+tc.want+"\r\n", stderr.String())
+	}
+}
+
+func TestSpawnedSessionDetachPrintsJSON(t *testing.T) {
+	// The JSON reads the session's record; there is none under these roots.
+	setupSessionRoots(t)
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach, s.jsonOut = true, true
+	dec := d.startup(t, "s")
+	go func() { <-dec; d.start() }()
+
+	require.NoError(t, s.run(context.Background()))
+
+	var info sessionInfo
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &info))
+	require.Equal(t, "s", info.Name)
+	require.Equal(t, "launch-1", info.LaunchID)
+	require.Equal(t, sessiondir.StatusReady, info.Status,
+		"the status the daemon published, which for a healthy session is ready")
+	require.Equal(t, "sid-1", info.SessionID)
+	require.Equal(t, "/run/a.sock", info.AdminSocket)
+	require.Equal(t, "/run/t.sock", info.AttachSocket)
+	require.Equal(t, "/var/log/upterm.log", info.LogPath)
+	require.Equal(t, 4242, info.Pid)
+	require.Equal(t, "ssh u@127.0.0.1 -p 2222", info.SSHCommand)
+	require.Equal(t, "upterm join ssh://u@127.0.0.1:2222", info.JoinCommand)
+	require.Equal(t, sessiondir.ReasonUnknown, info.Reason,
+		"reason is a key `session info -o json` always publishes; this shape has to match it")
+	require.Equal(t, joinStateFromDaemon, info.JoinStateSource,
+		"joinStateSource is a key `session info -o json` always publishes; this shape has to match it too, "+
+			"and a daemon that reported its join state is the source even when there is no timeout")
+	require.Equal(t, "ssh://127.0.0.1:2222", info.Host)
+	require.Equal(t, "anyone", info.Access, "the daemon reported no authorized keys")
+	require.Empty(t, stderr.String())
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &got))
+	// Both counts are there, as they always were, and say they weren't
+	// counted: nothing asked the daemon who is connected.
+	require.Equal(t, float64(0), got["clientCount"])
+	require.Equal(t, float64(0), got["guestCount"])
+	require.Equal(t, false, got["countsKnown"])
+	// This daemon reported none of what guests may do, so none of it is
+	// printed: unknown, not false.
+	for _, key := range []string{"startConfirmed", "readOnly", "fileTransfer", "fileTransferApprovalRequired", "localForwarding"} {
+		require.NotContains(t, got, key)
+	}
+	// And no record says anything about the tunnel.
+	for _, key := range []string{"reconnect", "tunnelLostAt", "tunnelReason", "tunnelError", "nextAttemptAt"} {
+		require.NotContains(t, got, key)
+	}
+
+	// The parent left after started; the daemon's watcher stays quiet.
+	select {
+	case <-d.gone:
+		t.Fatal("a parent that exits after started must not be read as abandonment")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestSpawnedSessionDetachPrintsJoinTimeout pins that a session started with
+// --join-timeout reports it as the daemon holds it: Started carries the
+// daemon's snapshot, taken once the timeout is counting, so the JSON has the
+// deadline a `session info` run a moment later would show, not an inference
+// from the flag.
+func TestSpawnedSessionDetachPrintsJoinTimeout(t *testing.T) {
+	setupSessionRoots(t)
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach, s.jsonOut = true, true
+	deadline := time.Date(2026, 9, 25, 12, 10, 0, 0, time.UTC)
+	dec := d.startup(t, "s")
+	go func() {
+		<-dec
+		d.startWithJoinState(sessiondir.StatusReady,
+			&api.JoinState{TimeoutNanos: int64(10 * time.Minute), DeadlineUnixNano: deadline.UnixNano()})
+	}()
+
+	require.NoError(t, s.run(context.Background()))
+
+	require.Contains(t, stdout.String(), `"joinTimeout": "10m"`)
+	require.Contains(t, stdout.String(), `"joinDeadline": "2026-09-25T12:10:00Z"`)
+	require.Contains(t, stdout.String(), `"joinStateSource": "daemon"`)
+	require.Empty(t, stderr.String())
+}
+
+// TestSpawnedSessionDetachPrintsTheStatusItWasGiven: the JSON's status is the
+// daemon's report, not this process's assumption. The record is written by the
+// daemon and can say something other than ready by the time readiness is
+// published -- a tunnel down by then gives reconnecting, or disconnected on a
+// relay that cannot reconnect -- and `upterm session info` would then answer
+// that for the launch this JSON describes.
+func TestSpawnedSessionDetachPrintsTheStatusItWasGiven(t *testing.T) {
+	setupSessionRoots(t)
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach, s.jsonOut = true, true
+	dec := d.startup(t, "s")
+	go func() { <-dec; d.startWith(sessiondir.StatusDisconnected) }()
+
+	require.NoError(t, s.run(context.Background()))
+
+	var info sessionInfo
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &info))
+	require.Equal(t, sessiondir.StatusDisconnected, info.Status,
+		"the parent prints the status the record carried, not ready by assumption")
+	require.Equal(t, "sid-1", info.SessionID, "the session is up; only its tunnel is not")
+}
+
+// The tunnel's state is the record's, as `session info` reads it, since
+// started carries the status and not the outage behind it. The outage is
+// printed only while the record still says the status that was reported, so
+// that the object describes one state of the session; reconnect is the
+// relay's and never changes, so any record of the launch has it. Times come
+// out in UTC, whatever zone the record was written in.
+func TestSpawnedSessionDetachPrintsTheTunnelFromTheRecord(t *testing.T) {
+	lost := time.Date(2026, 10, 13, 5, 0, 0, 0, time.FixedZone("PDT", -7*3600))
+	for _, tc := range []struct {
+		name      string
+		reported  string // the status started carries
+		recorded  string // the record's status when the parent reads it
+		ownLaunch bool
+		want      map[string]any
+	}{
+		{"the record says the status reported", sessiondir.StatusReconnecting, sessiondir.StatusReconnecting, true, map[string]any{
+			"reconnect":     "supported",
+			"tunnelLostAt":  "2026-10-13T12:00:00Z",
+			"tunnelReason":  "network",
+			"tunnelError":   "dial tcp 127.0.0.1:2222: connect: connection refused",
+			"nextAttemptAt": "2026-10-13T12:00:30Z",
+		}},
+		{"the tunnel went down after the status was reported", sessiondir.StatusReady, sessiondir.StatusReconnecting, true, map[string]any{
+			"reconnect": "supported",
+		}},
+		{"the record is another launch's", sessiondir.StatusReconnecting, sessiondir.StatusReconnecting, false, map[string]any{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupSessionRoots(t)
+			dir := claimSession(t, "s")
+			releaseAtEnd(t, dir)
+			require.NoError(t, dir.Update(func(r *sessiondir.Record) {
+				r.Status = tc.recorded
+				r.Reconnect = sessiondir.ReconnectSupported
+				r.TunnelLostAt = lost
+				r.TunnelReason = sessiondir.TunnelReasonNetwork
+				r.TunnelError = "dial tcp 127.0.0.1:2222: connect: connection refused"
+				r.NextAttemptAt = lost.Add(30 * time.Second)
+			}))
+
+			spawn, d := newScriptedDaemon(t)
+			if tc.ownLaunch {
+				d.launchID = dir.LaunchID()
+			}
+			var stdout, stderr bytes.Buffer
+			s := newSession(t, spawn, nil, &stdout, &stderr)
+			s.detach, s.jsonOut = true, true
+			dec := d.startup(t, "s")
+			go func() { <-dec; d.startWith(tc.reported) }()
+			require.NoError(t, s.run(context.Background()))
+
+			var got map[string]any
+			require.NoError(t, json.Unmarshal(stdout.Bytes(), &got))
+			require.Equal(t, tc.reported, got["status"], "the status is the one reported, whatever the record says now")
+			tunnel := map[string]any{}
+			for _, key := range []string{"reconnect", "tunnelLostAt", "tunnelReason", "tunnelError", "nextAttemptAt"} {
+				if v, ok := got[key]; ok {
+					tunnel[key] = v
+				}
+			}
+			require.Equal(t, tc.want, tunnel)
+		})
+	}
+}
+
+// What guests may do is what the daemon reported as it created the session:
+// a false it reported is printed as false, since only a daemon that knows
+// says it at all.
+func TestSpawnedSessionDetachPrintsWhatGuestsMayDo(t *testing.T) {
+	setupSessionRoots(t)
+	spawn, d := newScriptedDaemon(t)
+	d.amend = func(r *api.GetSessionResponse) {
+		r.AuthorizedKeys = []*api.AuthorizedKey{{Comment: "github:alice", PublicKeyFingerprints: []string{"SHA256:alice"}}}
+		r.StartConfirmed = proto.Bool(false)
+		r.ReadOnly = proto.Bool(true)
+		r.FileTransfer = proto.String("downloads")
+		r.FileTransferApprovalRequired = proto.Bool(false)
+		r.LocalForwarding = proto.Bool(false)
+	}
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach, s.jsonOut = true, true
+	dec := d.startup(t, "s")
+	go func() { <-dec; d.start() }()
+	require.NoError(t, s.run(context.Background()))
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &got))
+	require.Equal(t, "allowlist", got["access"])
+	require.Equal(t, false, got["startConfirmed"])
+	require.Equal(t, true, got["readOnly"])
+	require.Equal(t, "downloads", got["fileTransfer"])
+	require.Equal(t, false, got["fileTransferApprovalRequired"])
+	require.Equal(t, false, got["localForwarding"])
+}
+
+// TestSpawnedSessionDetachRefusesAStatuslessReport: no daemon that speaks this
+// exchange sends an empty status, and the exchange is unreleased, so one is a
+// bug in this binary rather than an older daemon to accommodate. Refused
+// rather than printed, because `"status": ""` is a value no script can branch
+// on -- the same hole as printing a status nobody vouched for.
+func TestSpawnedSessionDetachRefusesAStatuslessReport(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach, s.jsonOut = true, true
+	dec := d.startup(t, "s")
+	go func() { <-dec; d.startWith("") }()
+
+	err := s.run(context.Background())
+	require.ErrorContains(t, err, "reported no status")
+	require.ErrorContains(t, err, "/var/log/upterm.log", "the log is where the reason will be")
+	require.Empty(t, stdout.String(), "nothing may be printed for a report that cannot be trusted")
+}
+
+// An open session -- anyone with its ID can join, and nobody was asked -- is
+// warned about as it starts, on stderr, whatever stdout is carrying; and the
+// JSON a script reads says so too. TestSpawnedSessionDetachPrintsJSON pins
+// that a session that isn't open gets neither.
+func TestSpawnedSessionWarnsThatItIsOpen(t *testing.T) {
+	for _, jsonOut := range []bool{false, true} {
+		t.Run(fmt.Sprintf("json=%t", jsonOut), func(t *testing.T) {
+			setupSessionRoots(t)
+			spawn, d := newScriptedDaemon(t)
+			d.open = true
+			var stdout, stderr bytes.Buffer
+			s := newSession(t, spawn, nil, &stdout, &stderr)
+			s.detach, s.jsonOut = true, jsonOut
+			dec := d.startup(t, "s")
+			go func() { <-dec; d.start() }()
+
+			require.NoError(t, s.run(context.Background()))
+
+			require.Equal(t, "upterm: warning: anyone with the session ID can join; restrict who can with --authorized-user or --authorized-keys\n", stderr.String())
+			if jsonOut {
+				var info sessionInfo
+				require.NoError(t, json.Unmarshal(stdout.Bytes(), &info))
+				require.True(t, info.Open)
+			}
+		})
+	}
+}
+
+// An open session that runs guests' commands without asking says what is at
+// stake: anyone with the session ID can run commands as you. One whose
+// guests' commands are asked about, refused or replaced by a forced command
+// gets the open-session warning, and one with an allowlist neither.
+func TestAnOpenSessionThatRunsGuestsCommandsSaysSo(t *testing.T) {
+	const open = "upterm: warning: anyone with the session ID can join; restrict who can with --authorized-user or --authorized-keys\n"
+	for _, tc := range []struct {
+		execution string
+		open      bool
+		want      string
+	}{
+		{"granted", true, "upterm: warning: anyone with the session ID can join and run commands as you; restrict who can with --authorized-user or --authorized-keys\n"},
+		{"approval", true, open},
+		{"off", true, open},
+		{"forced", true, open},
+		{"granted", false, ""},
+	} {
+		t.Run(fmt.Sprintf("%s, open=%t", tc.execution, tc.open), func(t *testing.T) {
+			setupSessionRoots(t)
+			spawn, d := newScriptedDaemon(t)
+			d.open = tc.open
+			d.amend = func(r *api.GetSessionResponse) { r.Execution = proto.String(tc.execution) }
+			var stdout, stderr bytes.Buffer
+			s := newSession(t, spawn, nil, &stdout, &stderr)
+			s.detach = true
+			dec := d.startup(t, "s")
+			go func() { <-dec; d.start() }()
+
+			require.NoError(t, s.run(context.Background()))
+			require.Equal(t, tc.want, stderr.String())
+		})
+	}
+}
+
+func TestSpawnedSessionDetachPrintsHowToAttach(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach = true
+	dec := d.startup(t, "s")
+	go func() { <-dec; d.start() }()
+	require.NoError(t, s.run(context.Background()))
+	require.Equal(t, "Session s is running in the background. Attach with upterm attach s; stop it with upterm session stop s.\n", stdout.String())
+}
+
+// A session that is up but not ready -- its tunnel down by the time it
+// reported readiness -- is not "running" the way a ready one is, and the line
+// says what the view's Hint row would, from the record of the launch this
+// process started, as a sentence of its own. A record that doesn't say, or is
+// another launch's, adds nothing.
+func TestSpawnedSessionDetachSaysWhatIsWrongWhenNotReady(t *testing.T) {
+	const hint = "This relay doesn't support reconnecting, so guests can't reach this session again. Restart it for a new connect string."
+	for _, tc := range []struct {
+		name      string
+		ownLaunch bool
+		reason    string
+		want      string
+	}{
+		{"the record says why", true, sessiondir.TunnelReasonReconnectUnsupported,
+			"Session s is running in the background. " + hint + " Attach with upterm attach s; stop it with upterm session stop s.\n"},
+		{"a hint that starts with the product's name keeps it lowercase", true, sessiondir.TunnelReasonNetwork,
+			"Session s is running in the background. upterm can't reach the relay; it keeps retrying. Attach with upterm attach s; stop it with upterm session stop s.\n"},
+		{"the record doesn't say", true, "",
+			"Session s is running in the background. Attach with upterm attach s; stop it with upterm session stop s.\n"},
+		{"the record is another launch's", false, sessiondir.TunnelReasonReconnectUnsupported,
+			"Session s is running in the background. Attach with upterm attach s; stop it with upterm session stop s.\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupSessionRoots(t)
+			dir := claimSession(t, "s")
+			releaseAtEnd(t, dir)
+			require.NoError(t, dir.Update(func(r *sessiondir.Record) {
+				r.Status = sessiondir.StatusDisconnected
+				r.TunnelReason = tc.reason
+			}))
+
+			spawn, d := newScriptedDaemon(t)
+			if tc.ownLaunch {
+				d.launchID = dir.LaunchID()
+			}
+			var stdout, stderr bytes.Buffer
+			s := newSession(t, spawn, nil, &stdout, &stderr)
+			s.detach = true
+			dec := d.startup(t, "s")
+			go func() { <-dec; d.startWith(sessiondir.StatusDisconnected) }()
+
+			require.NoError(t, s.run(context.Background()))
+			require.Equal(t, tc.want, stdout.String())
+		})
+	}
+}
+
+// The key hint names ~. and ~?, so it is said only to a terminal where both
+// work: one whose keystrokes this process reads (its stdin is the foreground's
+// own) and whose output is a terminal, which ~? needs to know it is writing
+// outside the session's sequences. Piped (upterm host -- cmd | tee log) or
+// in the background, the keys reach nothing.
+func TestHostKeyHintOnlyWhereTheKeysWork(t *testing.T) {
+	pty := &attach.Pty{Term: "xterm", Size: termsize.Default}
+	stdin := strings.NewReader("")
+	require.Equal(t, keyHint('~', true), hostKeyHint(localTerminal{pty: pty, stdin: stdin, rawMode: true}, '~', true))
+	require.Empty(t, hostKeyHint(localTerminal{stdin: stdin, rawMode: true}, '~', true), "stdout piped: ~. works and ~? doesn't")
+	require.Empty(t, hostKeyHint(localTerminal{pty: pty}, '~', true), "in the background: no keystroke is read")
+	require.Empty(t, hostKeyHint(localTerminal{}, '~', true), "neither")
+	require.Empty(t, hostKeyHint(localTerminal{pty: pty, stdin: stdin, rawMode: true}, 0, true), "--escape-char none")
+}
+
+func TestKeyHint(t *testing.T) {
+	require.Equal(t, "upterm: ~. detaches, ~? shows the session's status and keys, ~a reviews requests", keyHint('~', false))
+	require.Equal(t, "upterm: ~. detaches, ~? shows the session's status and keys, ~a reviews requests; with ssh's default ~ escape, type ~~., ~~? and ~~a", keyHint('~', true))
+	require.Equal(t, "upterm: ^. detaches, ^? shows the session's status and keys, ^a reviews requests", keyHint('^', true))
+	require.Empty(t, keyHint(0, true))
+}
+
+// The key hint is the last thing upterm host says before the session: after
+// the banner, and after the warning an open session gets. Only a foreground
+// session the operator started is told it: a detached one has no keys to
+// press, and a declined one has no session.
+func TestTheKeyHintFollowsTheBanner(t *testing.T) {
+	hint := keyHint('~', false)
+	for _, tc := range []struct {
+		name    string
+		open    bool
+		decline bool
+		want    string
+	}{
+		{"started", false, false, "BANNER\n" + hint + "\n"},
+		{"started open", true, false, "BANNER\n" + openSessionWarning + "\n" + hint + "\n"},
+		{"declined", false, true, "BANNER\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spawn, d := newScriptedDaemon(t)
+			d.open = tc.open
+			attached := make(chan string, 1)
+			result := make(chan attach.Result, 1)
+			// One buffer for everything this process says, so the order is
+			// what the operator would read.
+			var out bytes.Buffer
+			s := newSession(t, spawn, fakeClient(attached, result), &out, &out)
+			s.keyHint, s.hintOut = hint, &out
+			s.display = func(context.Context, *api.GetSessionResponse, string) error {
+				out.WriteString("BANNER\n")
+				if tc.decline {
+					return UserDiscardedError{}
+				}
+				return nil
+			}
+			d.startup(t, "s")
+			if !tc.decline {
+				go func() {
+					<-attached
+					d.start()
+					result <- attach.Result{Reason: attach.Exited}
+				}()
+			}
+
+			_ = s.run(context.Background())
+			require.Equal(t, tc.want, out.String())
+		})
+	}
+
+	t.Run("detached", func(t *testing.T) {
+		spawn, d := newScriptedDaemon(t)
+		var stdout, stderr, hintOut bytes.Buffer
+		s := newSession(t, spawn, nil, &stdout, &stderr)
+		s.detach = true
+		s.keyHint, s.hintOut = hint, &hintOut
+		dec := d.startup(t, "s")
+		go func() { <-dec; d.start() }()
+
+		require.NoError(t, s.run(context.Background()))
+		require.Empty(t, hintOut.String())
+		require.NotContains(t, stdout.String()+stderr.String(), hint)
+	})
+}
+
+// stoppedTerminal is a terminal that stops at the write containing mark:
+// that write parks until the terminal is resumed, then is taken whole, and
+// every other write is taken at once. entered closes as the marked write
+// parks.
+type stoppedTerminal struct {
+	mark             string
+	resumed, entered chan struct{}
+	resume, enter    sync.Once
+
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func newStoppedTerminal(mark string) *stoppedTerminal {
+	return &stoppedTerminal{mark: mark, resumed: make(chan struct{}), entered: make(chan struct{})}
+}
+
+func (s *stoppedTerminal) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(s.mark)) {
+		s.enter.Do(func() { close(s.entered) })
+		<-s.resumed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *stoppedTerminal) Resume() { s.resume.Do(func() { close(s.resumed) }) }
+
+func (s *stoppedTerminal) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// On the terminal the attach client is about to take, the key hint, and the
+// open-session warning ahead of it, are written as the banner is,
+// synchronously, and so before the client takes it. A write given up on at a
+// bound would go on in the background and land once a stopped terminal
+// resumed, amid the session's output and outside everything that keeps that
+// output in turn. The warning is written so with no key hint too, as with
+// --escape-char none: the client takes the terminal all the same.
+func TestTheLinesBeforeTheSessionAreWrittenBeforeTheTerminalIsHandedOver(t *testing.T) {
+	hint := keyHint('~', false)
+	for _, tc := range []struct {
+		name string
+		open bool
+		hint string
+		stop string // the line the terminal stops at
+		want string
+	}{
+		{"the key hint", false, hint, hint, hint + "\n"},
+		{"the open-session warning", true, hint, openSessionWarning, openSessionWarning + "\n" + hint + "\n"},
+		{"the open-session warning with no key hint", true, "", openSessionWarning, openSessionWarning + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spawn, d := newScriptedDaemon(t)
+			d.open = tc.open
+			attached := make(chan string, 1)
+			result := make(chan attach.Result, 1)
+			terminal := newStoppedTerminal(tc.stop)
+			t.Cleanup(terminal.Resume)
+			var seen atomic.Pointer[string]
+			client := fakeClient(attached, result)
+			var stdout, stderr bytes.Buffer
+			s := newSession(t, spawn, func(ctx context.Context, socket string, keys []ssh.PublicKey, src statusSource) (attach.Result, error) {
+				written := terminal.String()
+				seen.Store(&written)
+				return client(ctx, socket, keys, src)
+			}, &stdout, &stderr)
+			// The terminal is stderr, which is where the hint goes when it is
+			// one.
+			s.stderr, s.keyHint, s.hintOut = terminal, tc.hint, terminal
+			d.startup(t, "s")
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			ran := make(chan error, 1)
+			go func() { ran <- s.run(ctx) }()
+
+			select {
+			case <-terminal.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the line was never written")
+			}
+			select {
+			case <-attached:
+				t.Fatal("the attach client started while the line was still being written")
+			case <-time.After(5 * logging.LogBound):
+			}
+			terminal.Resume()
+			select {
+			case <-attached:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the attach client never started")
+			}
+			require.Equal(t, tc.want, *seen.Load(), "written whole before the client started")
+
+			d.start()
+			result <- attach.Result{Reason: attach.Exited}
+			require.NoError(t, <-ran)
+		})
+	}
+}
+
+// Where no terminal is handed over from here, or stderr isn't the one that
+// is, the open-session warning keeps its bound: stderr may be a pipe nobody
+// drains, and a startup held on it would hold the session. So for a detached
+// session, even with stderr a terminal, and for one whose stderr isn't the
+// terminal, with its key hint on stdout or with none.
+func TestTheOpenSessionWarningIsBoundedWhereTheTerminalIsNotHandedOver(t *testing.T) {
+	hint := keyHint('~', false)
+	for _, tc := range []struct {
+		name       string
+		detach     bool
+		onTerminal bool // stderr is the terminal, where the hint would go
+		hint       string
+	}{
+		{"detached", true, true, hint},
+		{"stderr isn't the terminal", false, false, hint},
+		{"stderr isn't the terminal, and no key hint", false, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spawn, d := newScriptedDaemon(t)
+			d.open = true
+			attached := make(chan string, 1)
+			result := make(chan attach.Result, 1)
+			// A client even when detached, which never starts one: it is the
+			// detach that says no terminal is handed over.
+			client := fakeClient(attached, result)
+			stopped := newStoppedTerminal(openSessionWarning)
+			t.Cleanup(stopped.Resume)
+			var stdout, stderr, hintOut bytes.Buffer
+			s := newSession(t, spawn, client, &stdout, &stderr)
+			s.detach = tc.detach
+			s.stderr, s.keyHint, s.hintOut = stopped, tc.hint, &hintOut
+			if tc.onTerminal {
+				s.hintOut = stopped
+			}
+			dec := d.startup(t, "s")
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			ran := make(chan error, 1)
+			go func() { ran <- s.run(ctx) }()
+
+			if tc.detach {
+				go func() { <-dec; d.start() }()
+			} else {
+				select {
+				case <-attached:
+				case <-time.After(5 * time.Second):
+					t.Fatal("the attach client never started past a stopped stderr")
+				}
+				d.start()
+				result <- attach.Result{Reason: attach.Exited}
+			}
+			select {
+			case err := <-ran:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the session was held on a stopped stderr")
+			}
+			said := hintOut.String()
+			if tc.onTerminal {
+				said = stopped.String()
+			}
+			require.Equal(t, tc.hint != "" && !tc.detach, strings.Contains(said, hint))
+		})
+	}
+}
+
+// fakeClient attaches on cue and ends how it is told.
+func fakeClient(attached chan<- string, result <-chan attach.Result) clientFunc {
+	return func(ctx context.Context, socket string, keys []ssh.PublicKey, _ statusSource) (attach.Result, error) {
+		if len(keys) == 0 {
+			return attach.Result{}, errors.New("no keys")
+		}
+		attached <- socket
+		select {
+		case r := <-result:
+			return r, nil
+		case <-ctx.Done():
+			return attach.Result{Reason: attach.Detached}, nil
+		}
+	}
+}
+
+func TestSpawnedSessionForegroundExitStatuses(t *testing.T) {
+	// The disconnect is checked against the record, which these roots keep
+	// away from the real state directory.
+	setupSessionRoots(t)
+	// exitsWith is a case that ends with status code and, before it, one
+	// line or none.
+	exitsWith := func(code int, line string) func(*testing.T, error, string) {
+		return func(t *testing.T, err error, stderr string) {
+			if line == "" {
+				require.Empty(t, stderr)
+			} else {
+				require.Equal(t, "\r\n"+line+"\r\n", stderr)
+			}
+			if code == 0 {
+				require.NoError(t, err)
+				return
+			}
+			var ec ExitCodeError
+			require.ErrorAs(t, err, &ec)
+			require.Equal(t, code, ec.Code)
+			// The line is the whole account: a nil Err is what makes Exit
+			// print nothing more after it.
+			require.NoError(t, ec.Err)
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		res   attach.Result
+		check func(*testing.T, error, string)
+	}{
+		{"detached", attach.Result{Reason: attach.Detached},
+			exitsWith(0, "upterm: detached; the session continues. Reattach with upterm attach s, or stop it with upterm session stop s")},
+		{"exited 0", attach.Result{Reason: attach.Exited, Status: 0, Cause: attach.Cause{Kind: attach.CauseExited}}, exitsWith(0, "")},
+		{"exited 0, an older daemon", attach.Result{Reason: attach.Exited, Status: 0}, exitsWith(0, "")},
+		{"exited 7", attach.Result{Reason: attach.Exited, Status: 7, Cause: attach.Cause{Kind: attach.CauseExited}},
+			exitsWith(7, "upterm: the session ended with status 7")},
+		{"exited 7, an older daemon", attach.Result{Reason: attach.Exited, Status: 7},
+			exitsWith(7, "upterm: the session ended with status 7")},
+		{"stopped", attach.Result{Reason: attach.Exited, Status: 1, Cause: attach.Cause{Kind: attach.CauseStopped}},
+			exitsWith(1, "upterm: the session was stopped")},
+		{"signalled", attach.Result{Reason: attach.Exited, Status: 1, Cause: attach.Cause{Kind: attach.CauseSignaled, Signal: "TERM"}},
+			exitsWith(1, "upterm: the session ended by signal SIGTERM")},
+		{"join timeout", attach.Result{Reason: attach.Exited, Status: 0, Cause: attach.Cause{Kind: attach.CauseJoinTimeout}},
+			exitsWith(0, "")},
+		{"disconnected", attach.Result{Reason: attach.Disconnected},
+			exitsWith(exitDisconnected, "upterm: this terminal was disconnected (see /var/log/upterm.log); upterm couldn't check the session. upterm session list shows what's running")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spawn, d := newScriptedDaemon(t)
+			attached := make(chan string, 1)
+			result := make(chan attach.Result, 1)
+			var stdout, stderr bytes.Buffer
+			s := newSession(t, spawn, fakeClient(attached, result), &stdout, &stderr)
+			d.startup(t, "s")
+			go func() {
+				// assert, not require: a require here would Goexit this
+				// goroutine, leaving the test hung on a daemon that never
+				// starts rather than failed on the mismatch.
+				assert.Equal(t, "/run/t.sock", <-attached)
+				d.start()
+				result <- tc.res
+			}()
+			tc.check(t, s.run(context.Background()), stderr.String())
+		})
+	}
+}
+
+func TestSpawnedSessionRedrawsATakenName(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach = true
+	go func() { d.await().Failed(bootstrap.Failure{Text: "name in use: s", NameInUse: true}) }()
+	err := s.run(context.Background())
+	require.ErrorIs(t, err, sessiondir.ErrNameInUse, "runWithGeneratedNameRetry redraws on exactly this error")
+	require.EqualError(t, err, "a running session is already named s; attach with upterm attach s, or pick another --name")
+}
+
+// spawnTaken runs a detached session named name whose daemon answers that the
+// name is taken where the run was placed, with text, or, when start is set,
+// starts it.
+func spawnTaken(t *testing.T, name, text string, start bool) error {
+	t.Helper()
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.name, s.detach = name, true
+	if start {
+		dec := d.startup(t, name)
+		go func() {
+			<-dec
+			d.start()
+		}()
+	} else {
+		go func() { d.await().Failed(bootstrap.Failure{Text: text, Verbatim: true, NameTaken: true}) }()
+	}
+	return s.run(context.Background())
+}
+
+// A generated name taken where the run was placed is redrawn as one a local
+// session holds is: a fresh name for each spawn, and the same log line for
+// each redraw.
+func TestNameTakenRedrawsAGeneratedName(t *testing.T) {
+	logs := &capturingHandler{}
+	var names []string
+	err := runWithNameRetry(slog.New(logs), "", generatedNames(), func(name string) error {
+		names = append(names, name)
+		return spawnTaken(t, name, "taken here", len(names) == 3)
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, Exit(nil, err, io.Discard))
+	require.Equal(t, []string{"bash-0001", "bash-0002", "bash-0003"}, names)
+	require.Equal(t, redrawLogs("bash-0001", "bash-0002"), logs.captured())
+}
+
+// A name the operator gave that is taken where the run was placed is not
+// redrawn, and the operator is told what the broker said, never that a local
+// session holds the name; so is a generated name taken on every draw.
+func TestNameTakenPrintsTheBrokersTextForAnExplicitName(t *testing.T) {
+	t.Run("explicit", func(t *testing.T) {
+		logs := &capturingHandler{}
+		var names []string
+		err := runWithNameRetry(slog.New(logs), "mine", generatedNames(), func(name string) error {
+			names = append(names, name)
+			return spawnTaken(t, name, "taken here", false)
+		})
+		require.ErrorIs(t, err, host.ErrNameTaken)
+		require.Equal(t, []string{"mine"}, names)
+		require.Empty(t, logs.captured())
+		var stderr bytes.Buffer
+		require.Equal(t, 1, Exit(nil, err, &stderr))
+		require.Equal(t, "upterm: taken here\n(see /var/log/upterm.log)\n", stderr.String())
+		require.NotContains(t, stderr.String(), "attach with upterm attach")
+	})
+	t.Run("taken on every draw", func(t *testing.T) {
+		var names []string
+		err := runWithNameRetry(discardLogger(), "", generatedNames(), func(name string) error {
+			names = append(names, name)
+			return spawnTaken(t, name, "taken here", false)
+		})
+		require.Len(t, names, maxGeneratedNameAttempts)
+		var stderr bytes.Buffer
+		require.Equal(t, 1, Exit(nil, err, &stderr))
+		require.Equal(t, "upterm: taken here\n(see /var/log/upterm.log)\n", stderr.String())
+	})
+}
+
+// A broker's error is printed in the broker's words, made safe for a
+// terminal: lines kept, the prefix on the first only, and the log's pointer
+// on a line of its own, never as a session that could not start.
+func TestBrokerErrorReachesTheOperatorVerbatim(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	go func() { d.await().Failed(bootstrap.Failure{Text: "line one\nline\x1btwo", Verbatim: true}) }()
+	err := s.run(context.Background())
+	require.NotErrorIs(t, err, host.ErrNameTaken)
+	var out bytes.Buffer
+	require.Equal(t, 1, Exit(nil, err, &out))
+	require.Equal(t, "upterm: line one\nline�two\n(see /var/log/upterm.log)\n", out.String())
+	require.NotContains(t, out.String(), "could not start")
+}
+
+func TestSpawnedSessionDeclineIsNotAnError(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.display = func(context.Context, *api.GetSessionResponse, string) error { return UserDiscardedError{} }
+	dec := d.startup(t, "s")
+	err := s.run(context.Background())
+	require.Equal(t, api.Accept_DECLINED, <-dec)
+	var discarded UserDiscardedError
+	require.ErrorAs(t, err, &discarded, "shareRunE maps this to exit 0")
+}
+
+// A detached session asks its start question too, and one declined there
+// never starts: nothing says it is running, and the answer reaches the
+// daemon. One accepted there goes to the background as with --accept.
+func TestADetachedSessionStartsOnlyWhenItsQuestionIsAnsweredYes(t *testing.T) {
+	t.Run("declined", func(t *testing.T) {
+		spawn, d := newScriptedDaemon(t)
+		var stdout, stderr bytes.Buffer
+		s := newSession(t, spawn, nil, &stdout, &stderr)
+		s.detach = true
+		s.display = func(context.Context, *api.GetSessionResponse, string) error { return UserDiscardedError{} }
+		dec := d.startup(t, "s")
+		err := s.run(context.Background())
+		require.Equal(t, api.Accept_DECLINED, <-dec)
+		require.ErrorAs(t, err, new(UserDiscardedError), "shareRunE maps this to exit 0")
+		require.Empty(t, stdout.String())
+	})
+	t.Run("accepted", func(t *testing.T) {
+		spawn, d := newScriptedDaemon(t)
+		var stdout, stderr bytes.Buffer
+		s := newSession(t, spawn, nil, &stdout, &stderr)
+		s.detach = true
+		asked := false
+		s.display = func(context.Context, *api.GetSessionResponse, string) error { asked = true; return nil }
+		dec := d.startup(t, "s")
+		go func() { <-dec; d.start() }()
+		require.NoError(t, s.run(context.Background()))
+		require.True(t, asked)
+		require.Equal(t, "Session s is running in the background. Attach with upterm attach s; stop it with upterm session stop s.\n", stdout.String())
+	})
+}
+
+// Ctrl-C at the accept prompt, as the foreground host meets it: answered
+// INTERRUPTED, and what run returns exits 130 with nothing said.
+func TestSpawnedSessionInterruptedIsSilent130(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.display = func(context.Context, *api.GetSessionResponse, string) error { return UserInterruptedError{} }
+	dec := d.startup(t, "s")
+	err := s.run(context.Background())
+	require.Equal(t, api.Accept_INTERRUPTED, <-dec)
+	require.Equal(t, exitInterrupted, Exit(nil, mapUserAction(nil, err), &stderr))
+	require.Empty(t, stderr.String())
+}
+
+// SIGTERM at the accept prompt: the daemon is told the session is not to
+// start, and what run returns exits 143 with nothing said.
+func TestSpawnedSessionTerminatedAtThePromptIsSilent143(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.display = func(context.Context, *api.GetSessionResponse, string) error { return UserTerminatedError{} }
+	dec := d.startup(t, "s")
+	err := s.run(context.Background())
+	require.Equal(t, api.Accept_INTERRUPTED, <-dec)
+	require.Equal(t, 143, Exit(nil, mapUserAction(nil, err), &stderr))
+	require.Empty(t, stderr.String())
+}
+
+func TestSpawnedSessionReportsADaemonThatDied(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach = true
+	go func() { _ = d.await().Close() }()
+	err := s.run(context.Background())
+	require.ErrorIs(t, err, bootstrap.ErrDaemonGone)
+	require.ErrorContains(t, err, "/var/log/upterm.log", "the log is where the answer is")
+}
+
+// The terminal's ~? reports on the launch this process started, at the admin
+// socket that launch claimed: the name can pass to another launch while the
+// terminal is attached.
+func TestSpawnedSessionGivesItsTerminalTheLaunchItClaimed(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	attached := make(chan statusSource, 1)
+	client := func(_ context.Context, _ string, _ []ssh.PublicKey, src statusSource) (attach.Result, error) {
+		attached <- src
+		return attach.Result{Reason: attach.Detached}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, client, &stdout, &stderr)
+	d.startup(t, "s")
+	got := make(chan statusSource, 1)
+	go func() {
+		src := <-attached
+		d.start()
+		got <- src
+	}()
+	require.NoError(t, s.run(context.Background()))
+	require.Equal(t, statusSource{Name: "s", LaunchID: "launch-1", AdminSocket: "/run/a.sock"}, <-got)
+}
+
+// A terminal that never attached leaves the daemon with a gate nobody will
+// open; the parent closes its end at once so the daemon abandons now rather
+// than after its own timeout.
+func TestSpawnedSessionAbandonsWhenItsTerminalCannotAttach(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	client := func(context.Context, string, []ssh.PublicKey, statusSource) (attach.Result, error) {
+		return attach.Result{}, errors.New("dial unix /run/t.sock: connection refused")
+	}
+	s := newSession(t, spawn, client, &stdout, &stderr)
+	d.startup(t, "s")
+	err := s.run(context.Background())
+	require.ErrorContains(t, err, "could not attach the local terminal to session s")
+	select {
+	case <-d.gone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the daemon was not told")
+	}
+}
+
+func TestSpawnedSessionTimingDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		started, drain         time.Duration
+		wantStarted, wantDrain time.Duration
+	}{
+		{"zero", 0, 0, 15 * time.Second, 5 * time.Second},
+		{"negative", -time.Second, -time.Nanosecond, 15 * time.Second, 5 * time.Second},
+		{"positive", 100 * time.Millisecond, 300 * time.Millisecond, 100 * time.Millisecond, 300 * time.Millisecond},
+		{"independent defaults", 100 * time.Millisecond, 0, 100 * time.Millisecond, 5 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &spawnedSession{startedWaitTimeout: tc.started, localClientDrainTimeout: tc.drain}
+			started, drain := s.waits()
+			require.Equal(t, tc.wantStarted, started)
+			require.Equal(t, tc.wantDrain, drain)
+		})
+	}
+}
+
+// runTimingSession joins the parent even on Fatal. A fake holding terminal
+// restoration must be released (with a later defer) before this cleanup runs.
+func runTimingSession(s *spawnedSession) (<-chan error, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		done <- s.runWithDetachContext(ctx, context.WithCancel)
+	}()
+	return done, func() {
+		cancel()
+		synctest.Wait()
+		<-finished
+	}
+}
+
+func requireSessionPending(t *testing.T, done <-chan error, message string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("%s: run returned %v", message, err)
+	default:
+	}
+}
+
+// restoringTerminal separates cancellation from restoration, just as a real
+// attach callback can still hold raw mode after its context is cancelled.
+type restoringTerminal struct {
+	attached  chan string
+	cancelled chan struct{}
+	restore   chan struct{}
+	restored  chan struct{}
+	once      sync.Once
+}
+
+func newRestoringTerminal() *restoringTerminal {
+	return &restoringTerminal{
+		attached: make(chan string, 1), cancelled: make(chan struct{}),
+		restore: make(chan struct{}), restored: make(chan struct{}),
+	}
+}
+
+func (c *restoringTerminal) release() { c.once.Do(func() { close(c.restore) }) }
+
+func (c *restoringTerminal) attach(ctx context.Context, socket string, _ []ssh.PublicKey, _ statusSource) (attach.Result, error) {
+	c.attached <- socket
+	<-ctx.Done()
+	close(c.cancelled)
+	<-c.restore
+	close(c.restored)
+	return attach.Result{Reason: attach.Detached}, nil
+}
+
+// TestSpawnedSessionWaitsForItsTerminalWhenTheSessionFails pins that a parent
+// about to report a failed startup still waits for the client that holds the
+// terminal.
+//
+// attachLocalTerminal restores raw mode only when its own callback returns,
+// so returning here while the client is still inside it exits with the
+// operator's terminal raw — and a command that cannot be exec'd is the
+// ordinary way in: the terminal attaches, the gate opens, the exec fails, and
+// the daemon reports failed microseconds later.
+func TestSpawnedSessionWaitsForItsTerminalWhenTheSessionFails(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		spawn, d := newScriptedDaemon(t)
+		terminal := newRestoringTerminal()
+		var stdout, stderr bytes.Buffer
+		s := newSession(t, spawn, terminal.attach, &stdout, &stderr)
+		s.localClientDrainTimeout = 100 * time.Millisecond
+		d.startup(t, "s")
+		done, stop := runTimingSession(s)
+		defer stop()
+		defer terminal.release()
+		require.Equal(t, "/run/t.sock", <-terminal.attached)
+		d.await().Failed(bootstrap.Failure{Text: "exec: no such file"})
+		synctest.Wait()
+
+		time.Sleep(100*time.Millisecond - time.Nanosecond)
+		synctest.Wait()
+		select {
+		case <-terminal.cancelled:
+			t.Fatal("terminal cancelled before the drain boundary")
+		default:
+		}
+		requireSessionPending(t, done, "before the drain boundary")
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		select {
+		case <-terminal.cancelled:
+		default:
+			t.Fatal("terminal was not cancelled at the drain boundary")
+		}
+		requireSessionPending(t, done, "terminal restoration is still pending after cancellation")
+		terminal.release()
+		synctest.Wait()
+		select {
+		case <-terminal.restored:
+		default:
+			t.Fatal("the fake terminal did not restore")
+		}
+		require.ErrorContains(t, <-done, "session s could not start: exec: no such file")
+	})
+}
+
+// A terminal that attached and left before the command started waits for the
+// daemon's verdict, bounded, and never guesses.
+func TestSpawnedSessionWaitsForTheVerdictAfterAnEarlyDetach(t *testing.T) {
+	for _, started := range []bool{true, false} {
+		name := "nothing arrives"
+		if started {
+			name = "started arrives"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				spawn, d := newScriptedDaemon(t)
+				attached := make(chan string, 1)
+				result := make(chan attach.Result, 1)
+				var stdout, stderr bytes.Buffer
+				s := newSession(t, spawn, fakeClient(attached, result), &stdout, &stderr)
+				s.startedWaitTimeout = 300 * time.Millisecond
+				d.startup(t, "s")
+				done, stop := runTimingSession(s)
+				defer stop()
+				require.Equal(t, "/run/t.sock", <-attached)
+				result <- attach.Result{Reason: attach.Detached}
+				synctest.Wait() // the client has left and armed its verdict timer
+				requireSessionPending(t, done, "after early detach")
+				if started {
+					time.Sleep(100 * time.Millisecond)
+					d.start()
+					synctest.Wait()
+					require.NoError(t, <-done)
+					require.Contains(t, stderr.String(), "the session continues")
+					select {
+					case <-d.gone:
+						t.Fatal("the parent closed its end before the daemon disarmed")
+					default:
+					}
+					return
+				}
+				time.Sleep(300*time.Millisecond - time.Nanosecond)
+				synctest.Wait()
+				requireSessionPending(t, done, "before the verdict boundary")
+				time.Sleep(time.Nanosecond)
+				synctest.Wait()
+				select {
+				case err := <-done:
+					require.ErrorContains(t, err, "did not report whether the command started within 300ms")
+				default:
+					t.Fatal("missing verdict did not fail at the verdict boundary")
+				}
+				require.NotContains(t, stderr.String(), "the session continues", "never claimed on the strength of the client's result")
+			})
+		})
+	}
+}
+
+func TestSpawnedSessionWaitsAreIndependent(t *testing.T) {
+	t.Run("verdict", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var done [2]<-chan error
+			for i, bound := range []time.Duration{100 * time.Millisecond, 300 * time.Millisecond} {
+				spawn, d := newScriptedDaemon(t)
+				attached := make(chan string, 1)
+				result := make(chan attach.Result, 1)
+				var stdout, stderr bytes.Buffer
+				s := newSession(t, spawn, fakeClient(attached, result), &stdout, &stderr)
+				s.startedWaitTimeout = bound
+				s.localClientDrainTimeout = bound
+				d.startup(t, "s")
+				var stop func()
+				done[i], stop = runTimingSession(s)
+				defer stop()
+				<-attached
+				result <- attach.Result{Reason: attach.Detached}
+				synctest.Wait()
+			}
+			time.Sleep(100*time.Millisecond - time.Nanosecond)
+			synctest.Wait()
+			requireSessionPending(t, done[0], "short verdict before its boundary")
+			requireSessionPending(t, done[1], "long verdict before the short boundary")
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			select {
+			case err := <-done[0]:
+				require.ErrorContains(t, err, "within 100ms")
+			default:
+				t.Fatal("short verdict did not expire at its own boundary")
+			}
+			requireSessionPending(t, done[1], "long verdict at the short boundary")
+			time.Sleep(200*time.Millisecond - time.Nanosecond)
+			synctest.Wait()
+			requireSessionPending(t, done[1], "long verdict before its own boundary")
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			select {
+			case err := <-done[1]:
+				require.ErrorContains(t, err, "within 300ms")
+			default:
+				t.Fatal("long verdict did not expire at its own boundary")
+			}
+		})
+	})
+	t.Run("drain", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var done [2]<-chan error
+			var terminals [2]*restoringTerminal
+			for i, bound := range []time.Duration{100 * time.Millisecond, 300 * time.Millisecond} {
+				spawn, d := newScriptedDaemon(t)
+				terminal := newRestoringTerminal()
+				terminals[i] = terminal
+				var stdout, stderr bytes.Buffer
+				s := newSession(t, spawn, terminal.attach, &stdout, &stderr)
+				s.startedWaitTimeout = bound
+				s.localClientDrainTimeout = bound
+				d.startup(t, "s")
+				var stop func()
+				done[i], stop = runTimingSession(s)
+				defer stop()
+				defer terminal.release()
+				<-terminal.attached
+				d.await().Failed(bootstrap.Failure{Text: "exec: no such file"})
+				synctest.Wait()
+			}
+			time.Sleep(100*time.Millisecond - time.Nanosecond)
+			synctest.Wait()
+			for _, terminal := range terminals {
+				select {
+				case <-terminal.cancelled:
+					t.Fatal("a terminal was cancelled before the short drain boundary")
+				default:
+				}
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			select {
+			case <-terminals[0].cancelled:
+			default:
+				t.Fatal("short drain did not cancel at its own boundary")
+			}
+			select {
+			case <-terminals[1].cancelled:
+				t.Fatal("long drain cancelled at the short boundary")
+			default:
+			}
+			for _, result := range done {
+				requireSessionPending(t, result, "terminal restoration pending")
+			}
+			terminals[0].release()
+			synctest.Wait()
+			require.ErrorContains(t, <-done[0], "exec: no such file")
+			time.Sleep(200*time.Millisecond - time.Nanosecond)
+			synctest.Wait()
+			select {
+			case <-terminals[1].cancelled:
+				t.Fatal("long drain cancelled before its own boundary")
+			default:
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			select {
+			case <-terminals[1].cancelled:
+			default:
+				t.Fatal("long drain did not cancel at its own boundary")
+			}
+			requireSessionPending(t, done[1], "long terminal restoration pending")
+			terminals[1].release()
+			synctest.Wait()
+			require.ErrorContains(t, <-done[1], "exec: no such file")
+		})
+	})
+}
+
+// TestSpawnedSessionRefusesAnUnreadableHostKey pins that the parent refuses a
+// host key it cannot parse, without ever starting the attach client on it,
+// and tells the daemon at once rather than leaving it to its own timeout.
+//
+// run is driven from a goroutine with its own bounded wait, rather than
+// called inline: the path this pins is what closes the parent's end of the
+// connection at all, so a regression that drops that close leaves nothing to
+// unblock parent.Run's Recv, and the test must fail on its own timeout
+// instead of hanging until the package's.
+func TestSpawnedSessionRefusesAnUnreadableHostKey(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	client := func(context.Context, string, []ssh.PublicKey, statusSource) (attach.Result, error) {
+		t.Error("the client must not be started with keys that did not parse")
+		return attach.Result{}, nil
+	}
+	s := newSession(t, spawn, client, &stdout, &stderr)
+	go func() {
+		child := d.await()
+		_ = child.Claimed(&api.Claimed{Name: "s", LaunchId: "l", AttachSocket: "/run/t.sock"})
+		if dec, err := child.SessionCreated(&api.GetSessionResponse{SessionId: "sid", Host: "ssh://127.0.0.1:2222", NodeAddr: "127.0.0.1:2222", SshUser: "u"}); err != nil || dec != api.Accept_ACCEPTED {
+			return
+		}
+		_ = child.Listening("/run/t.sock", []string{"not a key"})
+	}()
+	runDone := make(chan error, 1)
+	go func() { runDone <- s.run(context.Background()) }()
+	select {
+	case err := <-runDone:
+		require.ErrorContains(t, err, "cannot be read")
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return for an unreadable host key; the parent must close its end rather than wait")
+	}
+	select {
+	case <-d.gone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the daemon was not told")
+	}
+}
+
+// TestSpawnedSessionReportsAnAbandonmentItDidNotCause pins that an
+// abandonment the operator did not cause -- the daemon reporting no initial
+// client rather than this process's own decline or interrupt -- is reported
+// as the session never having started, not folded into the generic
+// could-not-start case.
+func TestSpawnedSessionReportsAnAbandonmentItDidNotCause(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach = true
+	go func() { d.await().Failed(bootstrap.Failure{Text: "no initial client", Abandoned: true}) }()
+	err := s.run(context.Background())
+	require.EqualError(t, err, "session s was not started: no initial client")
+}
+
+// TestSpawnedSessionSendsInterruptedForADisplayFailure pins that a display
+// error which is not a decline (UserDiscardedError) is answered as
+// INTERRUPTED, not DECLINED -- the two put the daemon through different
+// abandonment paths, and only DECLINED is the operator saying no.
+func TestSpawnedSessionSendsInterruptedForADisplayFailure(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach = true
+	s.display = func(context.Context, *api.GetSessionResponse, string) error { return errors.New("terminal went away") }
+	dec := d.startup(t, "s")
+	_ = s.run(context.Background())
+	require.Equal(t, api.Accept_INTERRUPTED, <-dec)
+}
+
+// TestSpawnedSessionDetachRefusesAMissingClaim pins that --detach refuses to
+// print a session whose claim never arrived, rather than printing a report
+// built on a nil Claimed.
+func TestSpawnedSessionDetachRefusesAMissingClaim(t *testing.T) {
+	spawn, d := newScriptedDaemon(t)
+	var stdout, stderr bytes.Buffer
+	s := newSession(t, spawn, nil, &stdout, &stderr)
+	s.detach = true
+	s.jsonOut = true
+	go func() {
+		child := d.await()
+		// No Claimed.
+		if dec, err := child.SessionCreated(&api.GetSessionResponse{SessionId: "sid", Host: "ssh://127.0.0.1:2222", NodeAddr: "127.0.0.1:2222", SshUser: "u"}); err != nil || dec != api.Accept_ACCEPTED {
+			return
+		}
+		child.Disarm()
+		_ = child.Started("sid", sessiondir.StatusReady, &api.JoinState{})
+	}()
+	err := s.run(context.Background())
+	require.ErrorContains(t, err, "never reported its claim")
+	require.Empty(t, stdout.String(), "nothing a script would parse is printed")
+}

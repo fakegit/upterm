@@ -2,19 +2,218 @@ syntax = "proto3";
 
 package server;
 
+option go_package = "github.com/owenthereal/upterm/server";
+
 message CreateSessionRequest {
-    string hostUser = 1;
-    repeated bytes hostPublicKeys = 2;
-    repeated bytes clientAuthorizedKeys = 3;
+  string hostUser = 1;
+  repeated bytes hostPublicKeys = 2;
+  repeated bytes clientAuthorizedKeys = 3;
+  // The next three fields claim a session ID derived from the host's key. The
+  // relay honours them only with a proof; a request without one gets a random
+  // ID.
+  //
+  // The per-run secret the ID derives from, together with the single host key
+  // in hostPublicKeys.
+  bytes sessionSecret = 4;
+  // Orders registrations of the same ID; at least 1.
+  uint64 generation = 5;
+  // The host key's signature over this connection's SSH session ID, the
+  // secret and the generation.
+  bytes hostKeyProof = 6;
+  // Set only for a run whose registration and guests an external authority
+  // decides. A relay that can't honour it refuses the registration; it never
+  // registers the run as a local session instead.
+  DelegatedSession delegated_session = 7;
 }
 
 message CreateSessionResponse {
-    string sessionID = 1;
-    string nodeAddr = 2;
+  string sessionID = 1;
+  string nodeAddr = 2;
+  string ssh_user = 3; // SSH username for client connections
+  // True when this relay admits any host key (no --authorized-keys), so a
+  // host can authenticate a redial with its session key alone.
+  bool sessionKeyRedial = 4;
+  // The answer to a delegated registration: the request's protocol and
+  // external session ID echoed exactly, with the disposition and its revision.
+  DelegatedSession delegated_session = 5;
+}
+
+// Ingress is where a guest's connection entered the relay fleet.
+enum Ingress {
+  // A relay that predates the field, or a connection whose entry point
+  // this relay can't establish.
+  INGRESS_UNSPECIFIED = 0;
+  // The public SSH listener.
+  INGRESS_SSH = 1;
+  // A WebSocket listener, on the node that terminated the guest's SSH.
+  INGRESS_WEBSOCKET = 2;
 }
 
 message AuthRequest {
-    string client_version = 1;
-    string remote_addr = 2;
-    bytes authorized_key = 3;
+  string client_version = 1;
+  string remote_addr = 2;
+  bytes authorized_key = 3;
+  // The relay's own end of the guest's connection, as remote_addr is the
+  // guest's: the server half of the SSH_CONNECTION a guest's forced command
+  // sees. Empty from a relay that predates it.
+  string local_addr = 4;
+  // Where the guest's connection entered the fleet. Hops carry it unchanged.
+  Ingress ingress = 5;
+  // The NodeAddr of the node where the guest's connection entered; empty
+  // when ingress is INGRESS_UNSPECIFIED. Hops carry it unchanged.
+  string ingress_node = 6;
+  // The SSH session ID of the guest's own connection, at the node that
+  // terminated it. Hops carry it unchanged.
+  bytes ingress_connection = 7;
+  // The SSH user the guest typed at the ingress node.
+  string typed_address = 8;
+  // The routing ID the ingress node resolved that user to.
+  string target_routing_id = 9;
+  // The ingress node's --node-id; empty when it has none.
+  string ingress_node_id = 10;
+  // A random ID the ingress node gave this guest's admission attempt.
+  string connection_id = 11;
+  // 1 when the ingress node runs the hop gate for this hop; 0 for a hop in the
+  // format that predates the gate.
+  uint32 gate_protocol = 12;
+}
+
+// What the authority decided about a delegated session. Only current admits
+// guests. stopped ends the hosted command; withdrawn ends remote access and
+// leaves the command running locally. Both are final.
+enum DelegatedDisposition {
+  DELEGATED_UNSPECIFIED = 0;
+  DELEGATED_CURRENT = 1;
+  DELEGATED_STOPPED = 2;
+  DELEGATED_WITHDRAWN = 3;
+}
+
+// A delegated registration. The request carries the protocol and the external
+// session ID, with no disposition; the response echoes both exactly and adds
+// the disposition and its revision. The protocol is explicit, so a relay that
+// doesn't speak it can never treat the run as a local session.
+message DelegatedSession {
+  string protocol = 1;
+  string external_session_id = 2;
+  reserved 3, 4;
+  DelegatedDisposition disposition = 5;
+  // Orders the dispositions of one external session; at least 1 in a response.
+  uint64 decision_revision = 6;
+}
+
+// The host finished local startup.
+message DelegatedReady {}
+
+// The hosted command's actual outcome. exit_status is zero when the status
+// isn't known.
+message DelegatedExit {
+  sint32 exit_status = 1;
+  bool status_known = 2;
+}
+
+// A host's report on its own delegated registration, sent as
+// upterm-delegated-control@upterm.dev. sequence starts at 1 for each
+// generation and rises by one per report; a retried report repeats its
+// sequence and body exactly.
+message DelegatedControlRequest {
+  string external_session_id = 1;
+  uint64 generation = 2;
+  uint64 sequence = 3;
+  reserved 5, 7;
+  oneof event {
+    DelegatedReady ready = 4;
+    DelegatedExit exit = 6;
+  }
+}
+
+message DelegatedControlReply {
+  string external_session_id = 1;
+  uint64 generation = 2;
+  uint64 acknowledged_sequence = 3;
+  DelegatedDisposition disposition = 4;
+  uint64 decision_revision = 5;
+}
+
+// A decision the relay pushes to a host, as upterm-delegated-decision@upterm.dev.
+message DelegatedDecision {
+  string external_session_id = 1;
+  uint64 generation = 2;
+  DelegatedDisposition disposition = 3;
+  uint64 decision_revision = 4;
+}
+
+// The host received a decision. It says nothing of what the host has done.
+message DelegatedDecisionAck {
+  string external_session_id = 1;
+  uint64 generation = 2;
+  uint64 decision_revision = 3;
+}
+
+enum DelegatedErrorCode {
+  DELEGATED_ERROR_UNSPECIFIED = 0;
+  // Retryable: the same request may succeed later.
+  DELEGATED_UNAVAILABLE = 1;
+  DELEGATED_INVALID_REQUEST = 2;
+  // A newer registration replaced this one's transport.
+  DELEGATED_STALE_GENERATION = 3;
+  DELEGATED_UNSUPPORTED = 4;
+}
+
+// The body of a refused delegated request.
+message DelegatedError { DelegatedErrorCode code = 1; }
+
+enum GateMode {
+  GATE_MODE_UNSPECIFIED = 0;
+  GATE_MODE_LOCAL = 1;
+  GATE_MODE_DELEGATED = 2;
+}
+
+// The exact live registration a home node holds, as it answers the gate.
+message GateRegistration {
+  GateMode mode = 1;
+  string account_id = 2;
+  string session_id = 3;
+  uint64 generation = 4;
+  string routing_id = 5;
+  repeated bytes run_public_keys = 6;
+  bytes registration_id = 7;
+  string home_node = 8;
+  string home_node_id = 9;
+  string home_boot_id = 10;
+}
+
+message GateModeRequest {
+  uint32 protocol = 1;
+  bytes nonce = 2;
+  string routing_id = 3;
+}
+
+message GateModeReply {
+  uint32 protocol = 1;
+  bytes nonce = 2;
+  GateRegistration registration = 3;
+}
+
+message GateAdmission {
+  uint32 protocol = 1;
+  bytes mode_nonce = 2;
+  GateRegistration registration = 3;
+  string ingress_node_id = 4;
+  string connection_id = 5;
+  bytes ingress_ssh_session_id = 6;
+  string key_fingerprint = 7;
+  uint64 sequence = 8;
+  repeated string capabilities = 9;
+}
+
+message GateHeldRequest {
+  uint32 protocol = 1;
+  bytes mode_nonce = 2;
+  GateRegistration registration = 3;
+  uint64 sequence = 4;
+}
+
+message GateHeldReply {
+  GateHeldRequest request = 1;
+  bool held = 2;
 }

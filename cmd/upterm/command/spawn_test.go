@@ -1,0 +1,210 @@
+package command
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/owenthereal/upterm/cmd/upterm/command/internal/bootstrap"
+	"github.com/owenthereal/upterm/host/api"
+	"github.com/stretchr/testify/require"
+)
+
+// TestSpawnHelperProcess is the child of TestSpawnDaemonHandsTheChildItsChannel:
+// the test binary re-executed with UPTERM_SPAWN_HELPER=1. It reports what it
+// finds on its stdout, which the parent pointed at the log file, and exits.
+//
+// The two transports have almost nothing in common — one inherits a
+// socketpair, the other dials a listener — and this is what they are both
+// held to: the daemon's name arrives, the variables that carried it are gone
+// before the hosted command can see them, and the child learns when the
+// parent leaves. What only one platform can answer is reported by
+// reportPlatformFindings and required by requirePlatformReports.
+func TestSpawnHelperProcess(t *testing.T) {
+	if os.Getenv("UPTERM_SPAWN_HELPER") != "1" {
+		return
+	}
+	defer os.Exit(0)
+	report := func(k, v string) { fmt.Printf("REPORT %s=%s\n", k, v) }
+
+	// Read before bootstrapConn, which unsets it. What the parent does with
+	// it is the platform's business: a descriptor number on one side, a
+	// socket path whose directory must already be gone on the other.
+	report("handoff", os.Getenv(daemonHandoffEnv))
+	report("settings", strconv.Quote(os.Getenv(handoffEnv)))
+	conn, name, err := bootstrapConn()
+	if err != nil || conn == nil {
+		report("bootstrap", fmt.Sprintf("err=%v nil=%v", err, conn == nil))
+		return
+	}
+	report("name", name)
+	report("env_unset", strconv.FormatBool(daemonEnvCleared()))
+	reportPlatformFindings(report, conn)
+	fmt.Fprintln(os.Stderr, "STDERR_MARKER")
+
+	// Echo one message, then wait for the parent to go: the only proof that
+	// this process holds no copy of the parent's end.
+	c := bootstrap.NewConn(conn)
+	if m, err := c.Recv(); err == nil {
+		_ = c.Send(m)
+	}
+	_, err = c.Recv()
+	// Any read error is what bootstrap.Child treats as the parent leaving.
+	// EOF is the shape a graceful close takes, which is stricter than the
+	// contract and so is required only where the transport guarantees it.
+	report("parent_gone", strconv.FormatBool(err != nil))
+	report("eof", strconv.FormatBool(errors.Is(err, io.EOF)))
+	// The sentinel, and it has to stay the last line written here. The parent
+	// polls the log until it sees this and then requires every other report
+	// out of the snapshot it took — so a report emitted after the sentinel can
+	// be required in the instant before it exists. Polling for parent_gone,
+	// which is no longer last, made eof exactly that kind of flake.
+	report("done", "true")
+}
+
+func TestSpawnDaemonHandsTheChildItsChannel(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "upterm.log")
+	conn, proc, err := spawnDaemon(spawnOptions{
+		executable: os.Args[0],
+		args:       []string{"-test.run=^TestSpawnHelperProcess$"},
+		env:        append(os.Environ(), "UPTERM_SPAWN_HELPER=1"),
+		name:       "helper-1",
+		logPath:    logPath,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, proc)
+	// The child's stdout and stderr are the log, and Windows will not remove a
+	// file another process has open. Its last report is not its exit: under
+	// -race, os.Exit first sleeps for the race runtime's atexit_sleep_ms, a
+	// second by default, with the log still open, and that outlasted
+	// t.TempDir's own retries often enough to fail the Windows job. So the
+	// child is waited out here, registered after t.TempDir so it runs first,
+	// on every way out of the test. This Wait races spawnDaemon's own reaper
+	// and may lose it with an error, but either way it returns only once the
+	// child has exited. One that hasn't within the bound is stuck rather than
+	// slow, and is killed rather than left to hold the log.
+	t.Cleanup(func() {
+		exited := make(chan struct{})
+		go func() {
+			_, _ = proc.Wait()
+			close(exited)
+		}()
+		select {
+		case <-exited:
+		case <-time.After(10 * time.Second):
+			t.Error("the child was still running 10s after the test finished with it; killing it")
+			_ = proc.Kill()
+			<-exited
+		}
+	})
+	defer func() { _ = conn.Close() }()
+
+	c := bootstrap.NewConn(conn)
+	require.NoError(t, c.Send(&api.Startup{Msg: &api.Startup_Print{Print: &api.Print{Text: "ping"}}}))
+	m, err := c.Recv()
+	require.NoError(t, err)
+	require.Equal(t, "ping", m.GetPrint().GetText(), "the child answers on the channel it was given")
+
+	require.NoError(t, conn.Close())
+	// Waited on rather than any earlier report, because everything below is
+	// required out of one snapshot of the log: the poll has to be for the last
+	// line the child writes or a later one can be required before it lands.
+	require.Eventually(t, func() bool {
+		b, _ := os.ReadFile(logPath)
+		return strings.Contains(string(b), "REPORT done=true")
+	}, 10*time.Second, 50*time.Millisecond, "the child never finished reporting; the usual reason is that it never noticed the parent close, because it holds a copy of the parent's end")
+
+	b, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	log := string(b)
+	for _, want := range []string{
+		"REPORT name=helper-1",
+		"REPORT env_unset=true",
+		"REPORT parent_gone=true",
+		"STDERR_MARKER",
+	} {
+		require.Contains(t, log, want)
+	}
+	requirePlatformReports(t, log)
+}
+
+// A log that can't be opened doesn't stop the daemon: its stdout and
+// stderr go to the null device, and the spawn says why, once.
+func TestSpawnDaemonStartsWithoutItsLog(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "state")
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+	logPath := filepath.Join(file, "upterm.log") // under a regular file
+	var offs []error
+	conn, proc, err := spawnDaemon(spawnOptions{
+		executable: os.Args[0],
+		args:       []string{"-test.run=^TestSpawnHelperProcess$"},
+		env:        append(os.Environ(), "UPTERM_SPAWN_HELPER=1"),
+		name:       "helper-1",
+		logPath:    logPath,
+		logOff:     func(err error) { offs = append(offs, err) },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		exited := make(chan struct{})
+		go func() {
+			_, _ = proc.Wait()
+			close(exited)
+		}()
+		select {
+		case <-exited:
+		case <-time.After(10 * time.Second):
+			t.Error("the child was still running 10s after the test finished with it; killing it")
+			_ = proc.Kill()
+			<-exited
+		}
+	})
+	defer func() { _ = conn.Close() }()
+
+	c := bootstrap.NewConn(conn)
+	require.NoError(t, c.Send(&api.Startup{Msg: &api.Startup_Print{Print: &api.Print{Text: "ping"}}}))
+	m, err := c.Recv()
+	require.NoError(t, err)
+	require.Equal(t, "ping", m.GetPrint().GetText(), "the child runs without its log")
+	require.Len(t, offs, 1)
+	require.Error(t, offs[0])
+}
+
+func TestSpawnDaemonRequiresANameAndALog(t *testing.T) {
+	_, _, err := spawnDaemon(spawnOptions{logPath: filepath.Join(t.TempDir(), "x")})
+	require.Error(t, err)
+	_, _, err = spawnDaemon(spawnOptions{name: "x"})
+	require.Error(t, err)
+}
+
+func TestBootstrapConnIsNilOutsideADaemon(t *testing.T) {
+	t.Setenv(daemonHandoffEnv, "")
+	_ = os.Unsetenv(daemonHandoffEnv)
+	conn, name, err := bootstrapConn()
+	require.NoError(t, err)
+	require.Nil(t, conn)
+	require.Empty(t, name)
+}
+
+// TestMain's fork-bomb guard names both transports' handoff variables
+// literally rather than through a constant, because it has to fire for a
+// Windows-shaped environment inside a binary built for this platform — that
+// is the only place it can be proved before the Windows job runs it for real.
+// This is what keeps the literals honest: whichever platform runs, the
+// variable this build actually hands a daemon is one the guard knows.
+func TestTestMainGuardKnowsThisPlatformsHandoff(t *testing.T) {
+	// Both cleared first, this platform's set last. startedAsDaemon is an OR,
+	// so a run that inherited the other transport's variable — a hand-run of
+	// this binary with a Windows-shaped environment, say — would satisfy it
+	// without this test having proved anything about the one below.
+	t.Setenv("UPTERM_DAEMON_FD", "")
+	t.Setenv("UPTERM_DAEMON_SOCKET", "")
+	t.Setenv(daemonHandoffEnv, "set")
+	require.True(t, startedAsDaemon(),
+		"TestMain's guard does not know %s: a test that reached the real spawn would re-run this whole suite in a child, once per spawn", daemonHandoffEnv)
+}

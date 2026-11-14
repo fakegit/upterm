@@ -1,0 +1,215 @@
+package internal
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"syscall"
+
+	"github.com/owenthereal/upterm/internal/termsize"
+)
+
+// errNoPty is what a shared handle answers once it is known that no pty
+// will ever be set: the gate timed out or the command failed to start.
+var errNoPty = errors.New("session ended before its command started")
+
+// sharedPTY is the command's pty as the doors see it.
+//
+// It exists because the host door serves before the command starts: the
+// first host client's subscription is what the command's start waits for,
+// so that client's input and resize requests can arrive before there is a
+// pty to deliver them to. Writes wait for the pty; the last geometry Setsize
+// is given before it exists is what the pty is opened with -- each is already
+// the minimum across the terminals attached so far, computed by
+// resizeWindow, so the most recent one is the current answer, unless the
+// last of those terminals has left since, which forgets it. Everything else
+// delegates.
+type sharedPTY struct {
+	ready chan struct{}
+	done  chan struct{}
+
+	mu      sync.Mutex
+	ptmx    PTY
+	initial termsize.Size
+	once    sync.Once
+}
+
+func newSharedPTY() *sharedPTY {
+	return &sharedPTY{ready: make(chan struct{}), done: make(chan struct{})}
+}
+
+// set publishes the pty. Once.
+//
+// If a size was recorded while the pty did not exist, it is applied here
+// before ready closes -- the gap Setsize's fast path otherwise leaves open:
+// cmd.Start reads initialSize once, before this runs, so a size recorded
+// between that read and this call would otherwise never be looked at again.
+//
+// Applied under mu, not after releasing it. Between publishing s.ptmx and
+// applying the recorded size, a concurrent Setsize would take the delegating
+// branch and set the pty to the size it was actually asked for — and then
+// this call would put the older recorded size back over it, which is the
+// very thing this handle exists to prevent. The ioctl costs microseconds;
+// correctness of the last-writer is worth holding the lock for it.
+//
+// A pinned session (--pty-size) is not a special case: its Setsize already
+// reports success without moving anything. The error is dropped because
+// there is nothing here to tell — no logger, and no caller that could act
+// on it — and the size is reasserted by the next resize either way.
+func (s *sharedPTY) set(p PTY) {
+	s.once.Do(func() {
+		s.mu.Lock()
+		s.ptmx = p
+		if s.initial.Valid() {
+			_ = p.Setsize(s.initial.Rows, s.initial.Cols)
+		}
+		s.mu.Unlock()
+		close(s.ready)
+	})
+}
+
+// abandon says no pty is coming, releasing every waiter with errNoPty.
+func (s *sharedPTY) abandon() {
+	s.once.Do(func() { close(s.done) })
+}
+
+// forgetInitialSize drops the geometry Setsize recorded for the command to
+// open with, if the pty does not exist yet. It is how terminalWindows says that
+// the last terminal that gave one has gone: no terminal is left to take a
+// minimum across, so nothing will correct the record, and a client that
+// attaches afterwards -- a viewer with no terminal -- would open the command
+// at the size of one that is no longer there.
+//
+// Once the pty exists this does nothing: a pty keeps the size it has when its
+// last terminal leaves, and there is no opening size left to forget. Under mu,
+// like Setsize's record-or-delegate decision, so a pty published between the
+// two is never told to forget.
+func (s *sharedPTY) forgetInitialSize() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptmx == nil {
+		s.initial = termsize.Size{}
+	}
+}
+
+func (s *sharedPTY) initialSize() termsize.Size {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.initial
+}
+
+// wait blocks until the pty exists or never will.
+func (s *sharedPTY) wait() (PTY, error) {
+	select {
+	case <-s.ready:
+	case <-s.done:
+		return nil, errNoPty
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ptmx, nil
+}
+
+func (s *sharedPTY) Write(p []byte) (int, error) {
+	return s.WriteContext(context.Background(), p)
+}
+
+func (s *sharedPTY) WriteContext(ctx context.Context, p []byte) (int, error) {
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-s.done:
+		return 0, errNoPty
+	case <-s.ready:
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	ptmx := s.ptmx
+	s.mu.Unlock()
+	return ptyInputWriter(ctx, ptmx).Write(p)
+}
+
+func (s *sharedPTY) Read(p []byte) (int, error) {
+	ptmx, err := s.wait()
+	if err != nil {
+		return 0, err
+	}
+	return ptmx.Read(p)
+}
+
+// Setsize before the pty exists records the geometry it will open with, and
+// reports success: the resize will have happened, at open. Once the pty
+// exists it delegates.
+//
+// The decision -- record or delegate -- is made under mu in one step rather
+// than by consulting the ready channel and then separately locking: the
+// latter left a window between the two where a resize could land after
+// ready closed but before the lock was taken, and fall through recorded
+// nowhere.
+func (s *sharedPTY) Setsize(h, w int) error {
+	s.mu.Lock()
+	if s.ptmx == nil {
+		if size := (termsize.Size{Cols: w, Rows: h}); size.Valid() {
+			s.initial = size
+		}
+		s.mu.Unlock()
+		return nil
+	}
+	ptmx := s.ptmx
+	s.mu.Unlock()
+	return ptmx.Setsize(h, w)
+}
+
+// Redraw before the pty exists is a no-op: there is no process to nudge, and
+// the client that arrived early has nothing to repaint — the command's first
+// output is still ahead of it. Never waits, unlike Write: the nudge runs on
+// the attaching client's handler, which must reach its actors.
+func (s *sharedPTY) Redraw() error {
+	select {
+	case <-s.ready:
+	default:
+		return nil
+	}
+	s.mu.Lock()
+	ptmx := s.ptmx
+	s.mu.Unlock()
+	return ptmx.Redraw()
+}
+
+func (s *sharedPTY) Close() error {
+	ptmx, err := s.wait()
+	if err != nil {
+		return nil
+	}
+	return ptmx.Close()
+}
+
+func (s *sharedPTY) Wait() error {
+	ptmx, err := s.wait()
+	if err != nil {
+		return err
+	}
+	return ptmx.Wait()
+}
+
+func (s *sharedPTY) Kill() error {
+	ptmx, err := s.wait()
+	if err != nil {
+		return err
+	}
+	return ptmx.Kill()
+}
+
+// Signal delegates once the pty exists. Nothing in this session calls it
+// before then — the command's own teardown holds the pty cmd.Start returned,
+// not this handle — but the handle stands in for PTY everywhere a guest
+// session sees the command, so it must answer to the whole interface.
+func (s *sharedPTY) Signal(sig syscall.Signal) error {
+	ptmx, err := s.wait()
+	if err != nil {
+		return err
+	}
+	return ptmx.Signal(sig)
+}

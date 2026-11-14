@@ -1,23 +1,28 @@
 name: Release
 on:
   push:
-    tags: 'v*'
+    tags:
+      - 'v*'
+permissions:
+  contents: write
+  packages: write
 jobs:
-  release:
-    name: Upload releases
+  build-and-release:
+    name: Release binaries and Docker images
+    uses: ./.github/workflows/build-and-release.yaml
+    with:
+      snapshot: false
+      docker_repo: ghcr.io/owenthereal/upterm/uptermd
+    secrets: inherit
+  deploy:
+    name: Deploy app
     runs-on: ubuntu-latest
-    if: "!contains(github.ref, '-')" # skip prereleases
+    needs: [build-and-release]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: 1.17
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v2
-        with:
-          version: latest
-          args: release --rm-dist
+      - uses: actions/checkout@v7
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy to Fly.io
+        run: |
+          flyctl deploy --image "ghcr.io/owenthereal/upterm/uptermd:${GITHUB_REF_NAME}"
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

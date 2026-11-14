@@ -1,0 +1,2456 @@
+package attach
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	gssh "charm.land/ssh"
+	"github.com/owenthereal/upterm/internal/termsize"
+	"github.com/owenthereal/upterm/upterm"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
+)
+
+const testTimeout = 10 * time.Second
+
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	root := "/tmp"
+	if runtime.GOOS == "windows" {
+		root = ""
+	}
+	dir, err := os.MkdirTemp(root, "up")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// runAsync runs c on a goroutine and hands back its Result. Run's error is
+// reported through t rather than dropped: a zero Result is indistinguishable
+// from Detached, so a test that discarded the error would pass on a setup
+// failure. t.Errorf is safe from a goroutine; FailNow is not, hence Errorf.
+func runAsync(t *testing.T, ctx context.Context, c *Client) <-chan Result {
+	t.Helper()
+	done := make(chan Result, 1)
+	go func() {
+		res, err := c.Run(ctx)
+		if err != nil {
+			t.Errorf("Run: %v", err)
+		}
+		done <- res
+	}()
+	return done
+}
+
+// A failure to attach is printed after "upterm: ", as upterm attach's line,
+// the foreground host's or join's, so it carries no package prefix of its
+// own: the dialer's text already says what failed.
+func TestClientErrorsCarryNoPackagePrefix(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := ssh.NewSignerFromKey(key)
+	require.NoError(t, err)
+	dialErr := errors.New("dial unix /run/u/s/attach.sock: connect: no such file or directory")
+	c := &Client{Socket: "/run/u/s/attach.sock", Stdout: io.Discard, HostKeys: []ssh.PublicKey{signer.PublicKey()},
+		dial: func(context.Context, string) (net.Conn, error) { return nil, dialErr }}
+
+	_, err = c.Run(context.Background())
+	require.ErrorIs(t, err, dialErr)
+	require.EqualError(t, err, dialErr.Error())
+}
+
+// fakeDoor owns the raw connections accepted by this test's SSH server.
+// Closing those originals also covers connections still in the handshake.
+type fakeDoor struct {
+	socket     string
+	key        ssh.PublicKey
+	listener   net.Listener
+	server     *gssh.Server
+	acceptDone chan struct{}
+	accepted   chan *doorConn
+	mu         sync.Mutex
+	records    []*doorConn
+	byRaw      map[net.Conn]*doorConn
+	acceptErr  error
+	stopOnce   sync.Once
+	stopErr    error
+}
+
+type doorConn struct {
+	raw     net.Conn
+	entered chan struct{}
+	done    chan struct{} // closed only after HandleConn returns
+}
+
+func serveDoor(t *testing.T, handler func(gssh.Session)) *fakeDoor {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := ssh.NewSignerFromKey(key)
+	require.NoError(t, err)
+	return serveDoorWithSigners(t, "a.sock", []gssh.Signer{signer}, handler)
+}
+
+func serveDoorWithSigners(t *testing.T, name string, signers []gssh.Signer, handler func(gssh.Session)) *fakeDoor {
+	t.Helper()
+	require.NotEmpty(t, signers)
+	if handler == nil {
+		handler = gssh.DefaultHandler
+	}
+	socket := filepath.Join(shortTempDir(t), name)
+	listener, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	door := &fakeDoor{
+		socket: socket, key: signers[0].PublicKey(), listener: listener,
+		acceptDone: make(chan struct{}), accepted: make(chan *doorConn, 1),
+		byRaw: make(map[net.Conn]*doorConn),
+	}
+	door.server = &gssh.Server{
+		HostSigners:       signers,
+		Handler:           handler,
+		PublicKeyHandler:  func(gssh.Context, gssh.PublicKey) bool { return true },
+		ChannelHandlers:   maps.Clone(gssh.DefaultChannelHandlers),
+		RequestHandlers:   maps.Clone(gssh.DefaultRequestHandlers),
+		SubsystemHandlers: maps.Clone(gssh.DefaultSubsystemHandlers),
+		ConnCallback: func(_ gssh.Context, raw net.Conn) net.Conn {
+			door.mu.Lock()
+			record := door.byRaw[raw]
+			door.mu.Unlock()
+			if record != nil {
+				select {
+				case record.entered <- struct{}{}:
+				default:
+				}
+			}
+			return raw
+		},
+	}
+	t.Cleanup(func() {
+		if err := door.stop(); err != nil {
+			t.Errorf("door stop: %v", err)
+		}
+	})
+	go door.accept()
+	return door
+}
+
+func (d *fakeDoor) accept() {
+	defer close(d.acceptDone)
+	for {
+		raw, err := d.listener.Accept()
+		if err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				d.mu.Lock()
+				d.acceptErr = err
+				d.mu.Unlock()
+			}
+			return
+		}
+		record := &doorConn{raw: raw, entered: make(chan struct{}, 1), done: make(chan struct{})}
+		d.mu.Lock()
+		d.records = append(d.records, record)
+		d.byRaw[raw] = record
+		d.mu.Unlock()
+		select {
+		case d.accepted <- record:
+		default:
+		}
+		go func() {
+			d.server.HandleConn(raw)
+			close(record.done)
+		}()
+	}
+}
+
+func (d *fakeDoor) stop() error {
+	d.stopOnce.Do(func() { d.stopErr = d.stopDoor() })
+	return d.stopErr
+}
+
+func (d *fakeDoor) stopDoor() error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var result error
+	if err := d.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		result = errors.Join(result, fmt.Errorf("close door listener: %w", err))
+	}
+	select {
+	case <-d.acceptDone:
+	case <-ctx.Done():
+		return errors.Join(result, fmt.Errorf("door accept did not return: %w", ctx.Err()))
+	}
+	d.mu.Lock()
+	records := slices.Clone(d.records)
+	acceptErr := d.acceptErr
+	d.mu.Unlock()
+	if acceptErr != nil {
+		result = errors.Join(result, fmt.Errorf("door accept: %w", acceptErr))
+	}
+	for i, record := range records {
+		if err := record.raw.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			result = errors.Join(result, fmt.Errorf("close original %d: %w", i, err))
+		}
+	}
+	for i, record := range records {
+		select {
+		case <-record.done:
+		case <-ctx.Done():
+			result = errors.Join(result, fmt.Errorf("door handler %d did not return: %w", i, ctx.Err()))
+		}
+	}
+	return result
+}
+
+// fallbackClose is independent of stopOnce, so a failed or mutated stop cannot
+// strand a held original. The regression tests install it before assertions.
+func (d *fakeDoor) fallbackClose(t *testing.T, peer net.Conn) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	var result error
+	if err := d.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		result = errors.Join(result, fmt.Errorf("fallback listener close: %w", err))
+	}
+	select {
+	case <-d.acceptDone:
+	case <-ctx.Done():
+		result = errors.Join(result, fmt.Errorf("fallback accept did not return: %w", ctx.Err()))
+	}
+	d.mu.Lock()
+	records := slices.Clone(d.records)
+	d.mu.Unlock()
+	for _, record := range records {
+		if err := record.raw.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			result = errors.Join(result, fmt.Errorf("fallback original close: %w", err))
+		}
+	}
+	if peer != nil {
+		if err := peer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			result = errors.Join(result, fmt.Errorf("fallback peer close: %w", err))
+		}
+	}
+	joined := 0
+	for _, record := range records {
+		select {
+		case <-record.done:
+			joined++
+		case <-ctx.Done():
+			result = errors.Join(result, fmt.Errorf("fallback handler did not return: %w", ctx.Err()))
+		}
+	}
+	t.Logf("door fallback: originals=%d handlers-returned=%d", len(records), joined)
+	if result != nil {
+		t.Errorf("door fallback: %v", result)
+	}
+}
+
+// pin is the HostKeys a Client needs to attach to door.
+func (d *fakeDoor) pin() []ssh.PublicKey { return []ssh.PublicKey{d.key} }
+
+func TestClientRequestsAPtyWithTheGivenGeometryAndForwardsBothWays(t *testing.T) {
+	gotPty := make(chan gssh.Pty, 1)
+	door := serveDoor(t, func(s gssh.Session) {
+		pty, _, ok := s.Pty()
+		require.True(t, ok)
+		gotPty <- pty
+		// Echo one line back, then exit 3.
+		buf := make([]byte, 64)
+		n, _ := s.Read(buf)
+		_, _ = s.Write(append([]byte("echo:"), buf[:n]...))
+		_ = s.Exit(3)
+	})
+
+	var out bytes.Buffer
+	// Held open after the line: EOF on Stdin is a detach, and a finite
+	// reader would race the remote exit.
+	pr, pw := io.Pipe()
+	go func() { _, _ = pw.Write([]byte("hello\n")) }()
+	defer func() { _ = pw.Close() }()
+	c := &Client{
+		Socket: door.socket, HostKeys: door.pin(), Stdin: pr, Stdout: &out,
+		Pty: &Pty{Term: "xterm-256color", Size: termsize.Size{Cols: 132, Rows: 43}},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Result{Reason: Exited, Status: 3}, res)
+
+	pty := <-gotPty
+	require.Equal(t, "xterm-256color", pty.Term)
+	require.Equal(t, 132, pty.Window.Width)
+	require.Equal(t, 43, pty.Window.Height)
+	// charm's default session handler emulates a pty for a pty session and
+	// rewrites LF to CRLF on the way out (session.go:145-149, pty.go:27-38),
+	// unlike the daemon's raw session; the client forwards the wire bytes
+	// verbatim, which is what this asserts.
+	require.Equal(t, "echo:hello\r\n", out.String())
+}
+
+// A terminal is left in whatever modes the session put it in, and the termios
+// settings this client restores around the attachment say nothing about them.
+// Detaching from a full-screen program therefore used to hand back a terminal
+// on the alternate screen, with no cursor and with the mouse reporting clicks
+// as input — the session's own doing, for the session's own purposes, still
+// in force over a shell that knows nothing about it.
+//
+// Undone from what the session actually sent, so what is asserted here is
+// exactly the reverse of what the door wrote, in the order a terminal has to
+// receive it: off the alternate screen first.
+func TestClientPutsTheTerminalBackInTheModesItCameIn(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.WriteString(s, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006hfull screen")
+		_ = s.Exit(0)
+	})
+
+	var out bytes.Buffer
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: &out,
+		Pty: &Pty{Term: "xterm", Size: termsize.Default}}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Result{Reason: Exited}, res)
+
+	require.Equal(t, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006hfull screen"+
+		"\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1006l", out.String())
+}
+
+// blockingOnLastSink takes everything until the write it is told to stop on,
+// and blocks there: a terminal that stops between the session's last byte and
+// the cleanup after it, which is the moment the mode restore happens.
+type blockingOnLastSink struct {
+	stopAfter int
+
+	mu      sync.Mutex
+	writes  int
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingOnLastSink) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	b.writes++
+	n := b.writes
+	b.mu.Unlock()
+	if n > b.stopAfter {
+		b.once.Do(func() { close(b.entered) })
+		<-b.release // the terminal stays stopped until fixture cleanup
+	}
+	return len(p), nil
+}
+
+// A terminal that stops taking bytes must not keep Run from returning, and
+// that now includes the write that puts its modes back: it runs after the
+// session has ended, on a descriptor Run does not own, so nothing could
+// interrupt it. Within the same bound as the drain it follows, because the
+// two are the same terminal and it is the total the caller is waiting on.
+func TestClientReturnsWhenTheTerminalStopsOnTheModeRestore(t *testing.T) {
+	lim := terminalLimits{outputDrain: 200 * time.Millisecond}
+
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.WriteString(s, "\x1b[?1049h\x1b[?25lfull screen")
+		_ = s.Exit(0)
+	})
+
+	sink := &blockingOnLastSink{stopAfter: 1, entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(sink.release) })
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: sink,
+		Pty: &Pty{Term: "xterm", Size: termsize.Default}, limits: lim}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	returned := make(chan Result, 1)
+	go func() {
+		res, err := c.Run(ctx)
+		require.NoError(t, err)
+		returned <- res
+	}()
+
+	select {
+	case <-sink.entered:
+	case <-time.After(testTimeout):
+		t.Fatal("the restore write never reached the stopped terminal")
+	}
+	// The drain configured, 200 ms, < this guard, 3 s, < the default drain,
+	// 5 s: a Run that waited out the default instead of its own limit fails
+	// here, and one that kept to its limit has seconds to spare.
+	select {
+	case res := <-returned:
+		require.Equal(t, Result{Reason: Exited}, res, "the session's own ending is still what is reported")
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run was held by a terminal that stopped on the mode restore")
+	}
+}
+
+// And nothing is appended for a viewer redirected into a pipe or a file:
+// there is no terminal in any modes, and mode sequences in a captured log are
+// noise in somebody's output.
+func TestClientWithoutPtyWritesNoModeRestore(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.WriteString(s, "\x1b[?1049h\x1b[?25lfull screen")
+		_ = s.Exit(0)
+	})
+
+	var out bytes.Buffer
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: &out}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	_, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "\x1b[?1049h\x1b[?25lfull screen", out.String())
+}
+
+func TestClientWithoutPtyIsAViewer(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _, ok := s.Pty()
+		require.False(t, ok, "no pty was requested")
+		_, _ = io.WriteString(s, "output for a viewer")
+		_ = s.Exit(0)
+	})
+	var out bytes.Buffer
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: &out}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Result{Reason: Exited, Status: 0}, res)
+	require.Equal(t, "output for a viewer", out.String())
+}
+
+func TestClientHoldsInputOpenWhenStdinIsNil(t *testing.T) {
+	// The server reads input; a client with nil Stdin must not send EOF, or a
+	// viewer would end the session it is watching. The handler exits only when
+	// the test tells it to, after proving the read is still blocked.
+	release := make(chan struct{})
+	readReturned := make(chan struct{})
+	door := serveDoor(t, func(s gssh.Session) {
+		go func() {
+			buf := make([]byte, 1)
+			_, _ = s.Read(buf)
+			close(readReturned)
+		}()
+		<-release
+		_ = s.Exit(0)
+	})
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: io.Discard}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	select {
+	case <-readReturned:
+		t.Fatal("the session saw EOF on its input; a nil Stdin must hold it open")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	require.Equal(t, Result{Reason: Exited}, <-done)
+}
+
+func TestClientEscapeDetaches(t *testing.T) {
+	closed := make(chan struct{})
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.Copy(io.Discard, s) // returns when the client's input ends
+		close(closed)
+		// No Exit: the client left, and the server may close without a status.
+	})
+	pr, pw := io.Pipe()
+	var out bytes.Buffer
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdin: pr, Stdout: &out, Escape: '~',
+		Pty: &Pty{Term: "xterm", Size: termsize.Default}}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	_, err := pw.Write([]byte("typed\r~."))
+	require.NoError(t, err)
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(testTimeout):
+		t.Fatal("~. did not detach")
+	}
+	select {
+	case <-closed:
+	case <-time.After(testTimeout):
+		t.Fatal("the session did not see the client leave")
+	}
+}
+
+// winSize is a captured WindowChange, for asserting what the client resized
+// the session to after a resume.
+type winSize struct{ Rows, Cols int }
+
+// signalRecordingDoor records every window-change and signal request its
+// session receives, once its pty has been read, so a test can assert what a
+// resume delivered. ptyRead barriers the same way TestClientForwardsWindowChanges'
+// does: charm has nothing synchronising a window-change against Pty(), so a
+// send before the door has called it would be lost.
+type signalRecordingDoor struct {
+	ptyRead chan struct{}
+
+	mu    sync.Mutex
+	sizes []winSize
+	sigs  []string
+}
+
+func newSignalRecordingDoor() *signalRecordingDoor {
+	return &signalRecordingDoor{ptyRead: make(chan struct{})}
+}
+
+func (d *signalRecordingDoor) handle(s gssh.Session) {
+	_, winCh, ok := s.Pty()
+	if !ok {
+		return
+	}
+	sigCh := make(chan gssh.Signal, 8)
+	s.Signals(sigCh)
+	close(d.ptyRead)
+	for {
+		select {
+		case w, ok := <-winCh:
+			if !ok {
+				return
+			}
+			if w.Width == 80 && w.Height == 24 {
+				continue // the pty-req's own window, which charm delivers first
+			}
+			d.mu.Lock()
+			d.sizes = append(d.sizes, winSize{Rows: w.Height, Cols: w.Width})
+			d.mu.Unlock()
+		case sig := <-sigCh:
+			d.mu.Lock()
+			d.sigs = append(d.sigs, string(sig))
+			d.mu.Unlock()
+		}
+	}
+}
+
+func (d *signalRecordingDoor) windowChanges() []winSize {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]winSize(nil), d.sizes...)
+}
+
+func (d *signalRecordingDoor) signals() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.sigs...)
+}
+
+// The hook stands in for the terminal: it records that it was called and
+// reports the size the terminal has on resume, which is how a resize that
+// happened while the process was stopped reaches the session.
+func TestClient_SuspendSequenceCallsTheHookThenResizesAndNudges(t *testing.T) {
+	var calls atomic.Int32
+	door := newSignalRecordingDoor()
+	d := serveDoor(t, door.handle)
+
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: d.socket, HostKeys: d.pin(), Stdin: pr, Stdout: io.Discard, Escape: '~',
+		Pty: &Pty{Term: "xterm", Size: termsize.Default}}
+	c.Suspend = func() (termsize.Size, bool) {
+		calls.Add(1)
+		return termsize.Size{Rows: 24, Cols: 100}, true
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	select {
+	case <-door.ptyRead:
+	case <-time.After(testTimeout):
+		t.Fatal("the door never read the pty")
+	}
+
+	_, err := pw.Write([]byte("\r~\x1a"))
+	require.NoError(t, err)
+
+	deadline := time.Now().Add(testTimeout)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, int32(1), calls.Load())
+
+	for len(door.windowChanges()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, []winSize{{Rows: 24, Cols: 100}}, door.windowChanges())
+
+	for len(door.signals()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, []string{"WINCH"}, door.signals())
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+// Suspend nil: the two bytes reach the session, so a platform without job
+// control shows ^Z to the command rather than swallowing it.
+func TestClient_SuspendSequenceIsPassedThroughWithoutAHook(t *testing.T) {
+	door := newRecordingDoor()
+	d := serveDoor(t, door.handle)
+
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: d.socket, HostKeys: d.pin(), Stdin: pr, Stdout: io.Discard, Escape: '~'}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	select {
+	case <-door.started:
+	case <-time.After(testTimeout):
+		t.Fatal("the shell never started")
+	}
+
+	_, err := pw.Write([]byte("\r~\x1a"))
+	require.NoError(t, err)
+
+	deadline := time.Now().Add(testTimeout)
+	for door.taken() != "\r~\x1a" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, "\r~\x1a", door.taken(), "with no Suspend hook both escape bytes are the session's")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+// syncSink is a terminal that takes every write and can be read back while
+// the client is still writing to it.
+type syncSink struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// suspendScreen is what a full-screen program leaves a terminal in: the
+// alternate screen, with no cursor.
+const suspendScreen = "\x1b[?1049h\x1b[?25lfull screen"
+
+// suspendingDoor writes suspendScreen, then whatever arrives on more, and
+// hands every signal its session receives to sigs — the WINCH a resume ends
+// with is how a test knows the suspend has finished.
+func suspendingDoor(t *testing.T, sigs chan<- gssh.Signal, more <-chan string) *fakeDoor {
+	t.Helper()
+	return serveDoor(t, func(s gssh.Session) {
+		s.Signals(sigs)
+		_, _ = io.WriteString(s, suspendScreen)
+		for {
+			select {
+			case p := <-more:
+				_, _ = io.WriteString(s, p)
+			case <-s.Context().Done():
+				return
+			}
+		}
+	})
+}
+
+// waitFor polls cond until it holds or testTimeout passes, and fails with msg
+// if it never does.
+func waitFor(t *testing.T, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(testTimeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ~^Z hands the terminal to the shell, whose prompt used to be drawn on
+// whatever the session had left there: the alternate screen, with no cursor
+// — what a detach undoes, and for the same reason. So the terminal is taken
+// out of the session's modes before the hook stops the process, and put back
+// into them once it is running again, before the WINCH that has the program
+// repaint: the repaint lands where the program believes it is drawing.
+func TestClient_SuspendTakesTheTerminalOutOfTheSessionsModesAndBack(t *testing.T) {
+	const restore = "\x1b[?1049l\x1b[?25h"
+	sigs := make(chan gssh.Signal, 1)
+	d := suspendingDoor(t, sigs, nil)
+
+	var out syncSink
+	atStop := make(chan string, 1)
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: d.socket, HostKeys: d.pin(), Stdin: pr, Stdout: &out, Escape: '~',
+		Pty: &Pty{Term: "xterm", Size: termsize.Default},
+		Suspend: func() (termsize.Size, bool) {
+			atStop <- out.String()
+			return termsize.Size{}, true
+		}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	waitFor(t, func() bool { return out.String() == suspendScreen }, "the session's screen never reached the terminal")
+	_, err := pw.Write([]byte("\r~\x1a"))
+	require.NoError(t, err)
+
+	select {
+	case got := <-atStop:
+		require.Equal(t, suspendScreen+restore, got, "out of the session's modes by the time the process stops")
+	case <-time.After(testTimeout):
+		t.Fatal("the hook was never called")
+	}
+	select {
+	case <-sigs:
+	case <-time.After(testTimeout):
+		t.Fatal("the resume never nudged the session")
+	}
+	require.Equal(t, suspendScreen+restore+"\x1b[?25l\x1b[?1049h", out.String())
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+// Resumed without the terminal — continued in the background, by bg — the
+// client has nothing left to draw on: the terminal is the foreground job's,
+// and SIGTTOU, ignored, stops no write to it. So the attachment ends there,
+// having written nothing more: not the session's modes, not the output the
+// session sent meanwhile, not a repaint, and not the restore a detach
+// otherwise ends with, since the terminal left the session's modes on the
+// way out.
+func TestClient_SuspendResumedWithoutTheTerminalDetaches(t *testing.T) {
+	sigs := make(chan gssh.Signal, 1)
+	more := make(chan string, 1)
+	d := suspendingDoor(t, sigs, more)
+
+	var out syncSink
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: d.socket, HostKeys: d.pin(), Stdin: pr, Stdout: &out, Escape: '~',
+		Pty: &Pty{Term: "xterm", Size: termsize.Default},
+		Suspend: func() (termsize.Size, bool) {
+			more <- "while stopped"
+			// Long enough for the output copy to have it, were it to write
+			// it.
+			time.Sleep(200 * time.Millisecond)
+			return termsize.Size{}, false
+		}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	waitFor(t, func() bool { return out.String() == suspendScreen }, "the session's screen never reached the terminal")
+	_, err := pw.Write([]byte("\r~\x1a"))
+	require.NoError(t, err)
+
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(testTimeout):
+		t.Fatal("a client resumed without its terminal stayed attached")
+	}
+	require.Equal(t, suspendScreen+"\x1b[?1049l\x1b[?25h", out.String(), "nothing written after the restore")
+}
+
+func (b *blockingOnLastSink) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.writes
+}
+
+// A mode write the terminal does not take within the bound is still in
+// flight, parked in a Write nothing can interrupt, and a second writer
+// started beside it can interleave with it the moment the terminal recovers.
+// So Stdout is given up, as the drain gives it up after a session ends, and
+// the attachment with it: nothing more is written — no snapshot, no session
+// output, no restore on the way out. A restore the terminal did not take also
+// means the process is not stopped: the attachment is over, and fg would
+// only bring back a detach.
+func TestClient_SuspendDetachesWhenTheTerminalDoesNotTakeAModeWrite(t *testing.T) {
+	lim := terminalLimits{outputDrain: 200 * time.Millisecond}
+
+	for _, tc := range []struct {
+		name       string
+		stopAfter  int  // writes the terminal takes: the screen, then the restore
+		wantHooked bool // whether the process is stopped
+	}{
+		{name: "the restore", stopAfter: 1, wantHooked: false},
+		{name: "the snapshot", stopAfter: 2, wantHooked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sigs := make(chan gssh.Signal, 1)
+			more := make(chan string, 1)
+			d := suspendingDoor(t, sigs, more)
+
+			sink := &blockingOnLastSink{stopAfter: tc.stopAfter, entered: make(chan struct{}), release: make(chan struct{})}
+			t.Cleanup(func() { close(sink.release) })
+			var hooked atomic.Bool
+			pr, pw := io.Pipe()
+			defer func() { _ = pw.Close() }()
+			c := &Client{Socket: d.socket, HostKeys: d.pin(), Stdin: pr, Stdout: sink, Escape: '~',
+				Pty: &Pty{Term: "xterm", Size: termsize.Default},
+				Suspend: func() (termsize.Size, bool) {
+					hooked.Store(true)
+					more <- "while stopped"
+					return termsize.Size{}, true
+				},
+				limits: lim}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := runAsync(t, ctx, c)
+
+			waitFor(t, func() bool { return sink.count() == 1 }, "the session's screen never reached the terminal")
+			_, err := pw.Write([]byte("\r~\x1a"))
+			require.NoError(t, err)
+
+			select {
+			case res := <-done:
+				require.Equal(t, Result{Reason: Detached}, res)
+			case <-time.After(testTimeout):
+				t.Fatal("a terminal that did not take a mode write kept the attachment")
+			}
+			require.Equal(t, tc.wantHooked, hooked.Load())
+			require.Equal(t, tc.stopAfter+1, sink.count(), "nothing written after the write the terminal did not take")
+		})
+	}
+}
+
+// Nothing the session sends may reach the terminal between the two: drawn
+// there, it lands on the shell's screen, and a mode it sets makes a liar of
+// the restore. Held until the modes are back, it lands after them.
+func TestClient_SuspendHoldsTheSessionsOutputUntilTheTerminalIsBack(t *testing.T) {
+	sigs := make(chan gssh.Signal, 1)
+	more := make(chan string, 1)
+	d := suspendingDoor(t, sigs, more)
+
+	var out syncSink
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: d.socket, HostKeys: d.pin(), Stdin: pr, Stdout: &out, Escape: '~',
+		Pty: &Pty{Term: "xterm", Size: termsize.Default},
+		Suspend: func() (termsize.Size, bool) {
+			more <- "while stopped"
+			// Long enough for the output copy to have written it, were it
+			// free to.
+			time.Sleep(200 * time.Millisecond)
+			return termsize.Size{}, true
+		}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	waitFor(t, func() bool { return out.String() == suspendScreen }, "the session's screen never reached the terminal")
+	_, err := pw.Write([]byte("\r~\x1a"))
+	require.NoError(t, err)
+
+	select {
+	case <-sigs:
+	case <-time.After(testTimeout):
+		t.Fatal("the resume never nudged the session")
+	}
+	waitFor(t, func() bool { return strings.HasSuffix(out.String(), "while stopped") }, "the held output never arrived")
+	require.Equal(t, suspendScreen+"\x1b[?1049l\x1b[?25h"+"\x1b[?25l\x1b[?1049h"+"while stopped", out.String())
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+// The output is held by taking it from the copy, which can be parked in a
+// write to a terminal that has stopped taking bytes, and nothing interrupts
+// that. So ~^Z waits for it only within the bound a detach's drain has, and
+// past it the client detaches without stopping, as it does when the terminal
+// does not take a mode write: the input — and ~. with it — is not parked
+// behind a write that may never return, and the process is not stopped with
+// that write still in flight, to complete over the foreground shell's screen
+// once bg has continued it.
+func TestClient_SuspendDetachesWhenATerminalStoppedTakingOutput(t *testing.T) {
+	lim := terminalLimits{outputDrain: 200 * time.Millisecond}
+
+	sigs := make(chan gssh.Signal, 1)
+	more := make(chan string, 1)
+	d := suspendingDoor(t, sigs, more)
+
+	sink := newBlockedSink()
+	var hooked atomic.Bool
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: d.socket, HostKeys: d.pin(), Stdin: pr, Stdout: sink, Escape: '~',
+		Pty: &Pty{Term: "xterm", Size: termsize.Default},
+		Suspend: func() (termsize.Size, bool) {
+			hooked.Store(true)
+			return termsize.Size{}, true
+		},
+		limits: lim}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	select {
+	case <-sink.entered:
+	case <-time.After(testTimeout):
+		t.Fatal("the session's screen never reached the terminal")
+	}
+	more <- "queued behind the parked write"
+	_, err := pw.Write([]byte("\r~\x1a"))
+	require.NoError(t, err)
+
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(5 * time.Second):
+		t.Fatal("~^Z was held by a terminal that stopped taking output")
+	}
+	require.False(t, hooked.Load(), "the process must not be stopped with a write still in flight")
+
+	close(sink.release)
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, 1, sink.count(), "nothing written once the parked write is released")
+}
+
+func TestClientStdinEOFDetaches(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.Copy(io.Discard, s)
+	})
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdin: bytes.NewReader(nil), Stdout: io.Discard}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Result{Reason: Detached}, res, "a terminal that has gone away is a detach, not a session error")
+}
+
+func TestClientReportsAConnectionClosedWithoutStatusAsDisconnected(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		conn := s.Context().Value(gssh.ContextKeyConn).(*ssh.ServerConn)
+		_ = conn.Close() // what the stall watchdog does
+	})
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: io.Discard}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Result{Reason: Disconnected}, res)
+}
+
+// Two details of the libraries shape this test. charm pushes the pty-req's own
+// window into winCh before any window-change (session.go:373), so the handler
+// forwards only the resize and skips that first value. And x/crypto fills the
+// pixel fields from the cell count (w*8, h*8, session.go:243-251), so the
+// assertion is on the cells rather than on the whole Window.
+//
+// ptyRead is a barrier, not decoration: charm writes sess.pty.Window on a
+// window-change (session.go:412) with nothing synchronising it against the
+// read in Pty() (session.go:222), so the resize is sent only once the handler
+// has finished reading the pty.
+func TestClientForwardsWindowChanges(t *testing.T) {
+	got := make(chan gssh.Window, 4)
+	ptyRead := make(chan struct{})
+	door := serveDoor(t, func(s gssh.Session) {
+		_, winCh, ok := s.Pty()
+		require.True(t, ok)
+		close(ptyRead)
+		for w := range winCh {
+			if w.Width != 100 {
+				continue // the pty-req's own window, which charm delivers first
+			}
+			got <- w
+			_ = s.Exit(0)
+			return
+		}
+	})
+	resizes := make(chan termsize.Size, 1)
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: io.Discard,
+		Pty: &Pty{Term: "xterm", Size: termsize.Default}, Resizes: resizes}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := runAsync(t, ctx, c)
+	select {
+	case <-ptyRead:
+	case <-time.After(testTimeout):
+		t.Fatal("the handler never read the pty")
+	}
+	resizes <- termsize.Size{Cols: 100, Rows: 30}
+	select {
+	case w := <-got:
+		require.Equal(t, 100, w.Width)
+		require.Equal(t, 30, w.Height)
+	case <-time.After(testTimeout):
+		t.Fatal("window change never arrived")
+	}
+	<-done
+}
+
+// A remote exit is a remote exit even while input is being forwarded: the
+// input actor is unblocked by internal cleanup on every ending, and that must
+// not be mistaken for the terminal going away.
+func TestClientReportsARemoteExitWhileForwardingInput(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		time.Sleep(100 * time.Millisecond)
+		_ = s.Exit(5)
+	})
+	pr, pw := io.Pipe() // held open while the client runs: a terminal nobody types on
+	t.Cleanup(func() { _ = pw.Close() })
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdin: pr, Stdout: io.Discard,
+		Pty: &Pty{Term: "xterm", Size: termsize.Default}}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Result{Reason: Exited, Status: 5}, res)
+}
+
+// slowSink delivers every write after a pause: output is provably still in
+// flight when the session ends.
+type slowSink struct {
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	delay time.Duration
+}
+
+func (s *slowSink) Write(p []byte) (int, error) {
+	time.Sleep(s.delay)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *slowSink) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Len()
+}
+
+// Delivery into SSH is not delivery into stdout. Run must not return until
+// what the session sent has reached Stdout, or an immediate-exit command's
+// output is cut off by whatever the caller does next — exiting, usually.
+func TestClientDrainsOutputBeforeReturning(t *testing.T) {
+	const payload = 256 << 10
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = s.Write(bytes.Repeat([]byte("x"), payload))
+		_ = s.Exit(0)
+	})
+	sink := &slowSink{delay: 5 * time.Millisecond}
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: sink}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Result{Reason: Exited}, res)
+	require.Equal(t, payload, sink.Len(), "Run returned with output still undelivered to Stdout")
+}
+
+// blockedSink blocks in its first write until released and counts the writes
+// it was asked for: a stopped terminal, and a record of what reached it.
+type blockedSink struct {
+	entered chan struct{} // closed when the first write is in progress
+	release chan struct{}
+	once    sync.Once
+
+	mu     sync.Mutex
+	writes int
+}
+
+func newBlockedSink() *blockedSink {
+	return &blockedSink{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (b *blockedSink) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	b.writes++
+	b.mu.Unlock()
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return len(p), nil
+}
+
+func (b *blockedSink) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.writes
+}
+
+// A blocked Stdout must not keep Run from returning once the session has
+// disconnected the client: the copy is abandoned, parked in its write. And
+// abandoned means abandoned: when that write is finally released, nothing
+// further is written — the bytes the closed channel still holds must not
+// land in a terminal that has since been restored or reused.
+//
+// The door waits until the sink has entered its blocked write before
+// disconnecting, because two channel writes can reach the sink as one.
+func TestClientReturnsWhenDisconnectedEvenIfStdoutIsBlocked(t *testing.T) {
+	lim := terminalLimits{outputDrain: 200 * time.Millisecond}
+
+	sink := newBlockedSink()
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.WriteString(s, "first")
+		<-sink.entered
+		_, _ = io.WriteString(s, "second, buffered behind the blocked write")
+		time.Sleep(100 * time.Millisecond)
+		conn := s.Context().Value(gssh.ContextKeyConn).(*ssh.ServerConn)
+		_ = conn.Close()
+	})
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: sink, limits: lim}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := runAsync(t, ctx, c)
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Disconnected}, res)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return while Stdout was blocked")
+	}
+
+	close(sink.release)
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, 1, sink.count(), "an abandoned copy must not resume writing once its blocked write is released")
+}
+
+// Stdout going away — EPIPE from a pipe whose reader left — is this terminal
+// detaching, and with a quiet command nothing else would ever move.
+func TestClientTreatsAStdoutWriteFailureAsADetach(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.WriteString(s, "output")
+		_, _ = io.Copy(io.Discard, s) // quiet forever; leaves only when the client does
+	})
+	pr, pw := io.Pipe()
+	require.NoError(t, pr.Close()) // the reader is gone: every write fails
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: pw}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Result{Reason: Detached}, res)
+}
+
+// shortSink accepts every write and reports one byte fewer: the failure
+// io.Copy calls ErrShortWrite, which loses output silently if it is not one.
+type shortSink struct{}
+
+func (shortSink) Write(p []byte) (int, error) { return len(p) - 1, nil }
+
+func TestClientTreatsAShortWriteToStdoutAsADetach(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.WriteString(s, "output")
+		_, _ = io.Copy(io.Discard, s)
+	})
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: shortSink{}}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Result{Reason: Detached}, res, "a short write is a failed write")
+}
+
+// blockableConn is a net.Conn whose writes block, once told to, until the
+// connection is closed: a daemon that has stopped reading its socket, as
+// seen from this side. Reads pass through so the session stays alive.
+// entered is closed when the first write parks, so a test can know it did.
+//
+// fail is the other failure mode: a socket that is simply gone, whose writes
+// return at once instead of parking, and from which nothing more is read. A
+// read, even one already waiting, returns only once the connection is
+// closed, so nothing the peer does from then on reaches the client.
+// entered is closed for that one too.
+type blockableConn struct {
+	net.Conn
+	block   chan struct{} // closed to make writes block
+	fail    chan struct{} // closed to make writes fail immediately and reads deliver nothing
+	closed  chan struct{}
+	entered chan struct{}
+	once    sync.Once
+	parked  sync.Once
+}
+
+func newBlockableConn() *blockableConn {
+	return &blockableConn{block: make(chan struct{}), fail: make(chan struct{}), closed: make(chan struct{}), entered: make(chan struct{})}
+}
+
+func (b *blockableConn) Write(p []byte) (int, error) {
+	select {
+	case <-b.fail:
+		b.parked.Do(func() { close(b.entered) })
+		return 0, net.ErrClosed
+	default:
+	}
+	select {
+	case <-b.block:
+		b.parked.Do(func() { close(b.entered) })
+		<-b.closed
+		return 0, net.ErrClosed
+	default:
+		return b.Conn.Write(p)
+	}
+}
+
+func (b *blockableConn) Read(p []byte) (int, error) {
+	n, err := b.Conn.Read(p)
+	select {
+	case <-b.fail:
+		<-b.closed
+		return 0, net.ErrClosed
+	default:
+		return n, err
+	}
+}
+
+// dialThrough is the dial hook that routes the client through b.
+func (b *blockableConn) dialThrough(ctx context.Context, socket string) (net.Conn, error) {
+	raw, err := (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	if err != nil {
+		return nil, err
+	}
+	b.Conn = raw
+	return b, nil
+}
+
+func (b *blockableConn) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return b.Conn.Close()
+}
+
+// failingSink fails its first write and, in the same breath, makes the
+// transport block: from here on nothing the client writes to the socket
+// completes. Doing both in one place is what makes the order deterministic
+// — the window adjust the channel sends when the output was read has
+// already gone, and the very next packet, the interrupt's close, parks.
+type failingSink struct {
+	conn *blockableConn
+	once sync.Once
+}
+
+func (f *failingSink) Write(p []byte) (int, error) {
+	f.once.Do(func() { close(f.conn.block) })
+	return 0, io.ErrClosedPipe
+}
+
+// An internally triggered detach — here, Stdout failing — must not wait on
+// the transport. run.Group runs interrupts one after another, and a channel
+// close is a packet written to the socket: with a daemon that has stopped
+// reading, an interrupt that closed the session before cancelling would
+// park, and the connection close that cancellation triggers would never
+// come. The external-cancellation tests cannot catch this: there the context
+// is already done when the interrupts run.
+func TestClientInternalDetachDoesNotWaitOnABlockedTransport(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.WriteString(s, "output")
+		_, _ = io.Copy(io.Discard, s)
+	})
+	conn := newBlockableConn()
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: &failingSink{conn: conn}, dial: conn.dialThrough}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(5 * time.Second):
+		t.Fatal("an internal detach waited on a transport the daemon had stopped reading")
+	}
+}
+
+// blockingHandler is a slog.Handler whose Handle never returns until
+// released: a log file on a wedged filesystem, or a console that stopped.
+// entered is closed the first time Handle is called, so a test can assert
+// the line was attempted and not merely that nothing waited for it, and
+// calls counts them, for a line that must be logged once however often the
+// thing it describes happens.
+type blockingHandler struct {
+	release chan struct{}
+	entered chan struct{}
+	once    *sync.Once
+	calls   *atomic.Int64
+}
+
+func newBlockingHandler(release chan struct{}) blockingHandler {
+	return blockingHandler{release: release, entered: make(chan struct{}), once: &sync.Once{}, calls: &atomic.Int64{}}
+}
+
+func (h blockingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h blockingHandler) Handle(context.Context, slog.Record) error {
+	h.calls.Add(1)
+	h.once.Do(func() { close(h.entered) })
+	<-h.release
+	return nil
+}
+
+func (h blockingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h blockingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h blockingHandler) count() int64 { return h.calls.Load() }
+
+// sshWindow is x/crypto's channelWindowSize — 64 packets of 32 KiB — which
+// is what a peer that never reads its input lets the client write before
+// every further write parks in remoteWin.reserve, with no socket involved.
+const sshWindow = 2 << 20
+
+// A detected detach must not wait on an input write. Feed can return both
+// the bytes before the escape and the detach itself — "\r~." in one read —
+// and EOF can leave a held escape byte to flush; either write, on an
+// exhausted window, never returns, and a detach that waited for it would
+// never reach the cancellation that releases it.
+func TestClientDetachIsNotHeldByAnInputWriteOnAnExhaustedWindow(t *testing.T) {
+	lim := terminalLimits{inputFlush: 200 * time.Millisecond}
+
+	for _, tc := range []struct {
+		name       string
+		filler     int    // written first, all of it accepted
+		tail       string // then this, whose delivery must not be waited on
+		closeStdin bool
+	}{
+		// The window exactly full, then Enter and the escape in one read:
+		// the Enter is the write that parks.
+		{name: "escape after a newline", filler: sshWindow, tail: "\r~."},
+		// One byte short of full, then Enter (the last byte the window
+		// takes) and a lone escape byte held back; EOF flushes it into a
+		// full window.
+		{name: "EOF with a held escape byte", filler: sshWindow - 1, tail: "\r~", closeStdin: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			door := serveDoor(t, func(s gssh.Session) { <-s.Context().Done() }) // never reads its input
+			pr, pw := io.Pipe()
+			t.Cleanup(func() { _ = pw.Close() })
+			c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdin: pr, Stdout: io.Discard, Escape: '~',
+				limits: lim}
+			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+			defer cancel()
+			done := runAsync(t, ctx, c)
+
+			_, err := pw.Write(bytes.Repeat([]byte("k"), tc.filler))
+			require.NoError(t, err)
+			_, err = pw.Write([]byte(tc.tail))
+			require.NoError(t, err)
+			if tc.closeStdin {
+				require.NoError(t, pw.Close())
+			}
+
+			select {
+			case res := <-done:
+				require.Equal(t, Result{Reason: Detached}, res)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the detach waited on an input write the session will never take")
+			}
+		})
+	}
+}
+
+// The same detach, typed the ordinary way: Enter, and then ~. as the next
+// keystrokes. The test above hands the filter "\r~." in one read, so one Feed
+// sees the whole sequence; here the Enter is delivered first and parks on the
+// exhausted window, and a client that read and wrote on one goroutine would
+// never read the ~. that follows it.
+//
+// The keystrokes are typed from a goroutine because the pipe write is itself
+// what parks: with the reader held inside an input write, nothing takes the
+// Enter off the pipe, and a test that typed it inline would hang here instead
+// of failing at the bound below.
+func TestClientEscapeDetachesWhileAnInputWriteIsParked(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) { <-s.Context().Done() }) // never reads its input
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdin: pr, Stdout: io.Discard, Escape: '~'}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	_, err := pw.Write(bytes.Repeat([]byte("k"), sshWindow))
+	require.NoError(t, err)
+	go func() {
+		if _, err := pw.Write([]byte("\r")); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+		_, _ = pw.Write([]byte("~."))
+	}()
+
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(5 * time.Second):
+		t.Fatal("~. typed after an Enter the session never took did not detach")
+	}
+}
+
+// Escape recognition lives in what has been read, so reading must go on while
+// delivery is parked. Past the window every keystroke is queued rather than
+// written, and the terminal is read at the speed it is typed at.
+func TestClientKeepsReadingWhileDeliveryIsParked(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) { <-s.Context().Done() }) // never reads its input
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdin: pr, Stdout: io.Discard, Escape: '~'}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	_, err := pw.Write(bytes.Repeat([]byte("k"), sshWindow))
+	require.NoError(t, err)
+
+	// 16 KiB past the window, a kilobyte at a time. Every one of these has to
+	// complete, and a pipe write completes only when something reads it.
+	const pieces = 16
+	typed := make(chan struct{}, pieces)
+	go func() {
+		for range pieces {
+			if _, err := pw.Write(bytes.Repeat([]byte("k"), 1<<10)); err != nil {
+				return
+			}
+			typed <- struct{}{}
+		}
+	}()
+	deadline := time.After(5 * time.Second)
+	for i := range pieces {
+		select {
+		case <-typed:
+		case <-deadline:
+			t.Fatalf("the client stopped reading its terminal %d KiB past the window", i)
+		}
+	}
+
+	go func() {
+		if _, err := pw.Write([]byte("\r")); err != nil {
+			return
+		}
+		_, _ = pw.Write([]byte("~."))
+	}()
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(5 * time.Second):
+		t.Fatal("~. did not detach behind a parked delivery")
+	}
+}
+
+// recordingDoor collects everything its session reads, so a test can say what
+// the session was actually given, and says when its handler started.
+type recordingDoor struct {
+	started chan struct{}
+
+	mu  sync.Mutex
+	got []byte
+}
+
+func newRecordingDoor() *recordingDoor {
+	return &recordingDoor{started: make(chan struct{})}
+}
+
+func (d *recordingDoor) handle(s gssh.Session) {
+	close(d.started)
+	buf := make([]byte, 64)
+	for {
+		n, err := s.Read(buf)
+		if n > 0 {
+			d.mu.Lock()
+			d.got = append(d.got, buf[:n]...)
+			d.mu.Unlock()
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (d *recordingDoor) taken() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return string(d.got)
+}
+
+// slowConn holds each write for delay once armed: a socket whose buffer is
+// full for the moment, which is the ordinary reason a delivery is still in
+// flight. Nothing is refused and nothing is lost — unless the connection is
+// closed under it, which is what makes it the right stand-in here.
+type slowConn struct {
+	net.Conn
+	armed atomic.Bool
+	delay time.Duration
+}
+
+func (s *slowConn) Write(p []byte) (int, error) {
+	if s.armed.Load() {
+		time.Sleep(s.delay)
+	}
+	return s.Conn.Write(p)
+}
+
+func (s *slowConn) dialThrough(ctx context.Context, socket string) (net.Conn, error) {
+	raw, err := (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	if err != nil {
+		return nil, err
+	}
+	s.Conn = raw
+	return s, nil
+}
+
+// A detach owes the session what was typed before the escape — the Enter that
+// ends the line ~. is typed on — and delivery is the writer's now, not the
+// reader's. The wait on the way out is what hands it over: without it the
+// reader returns, the cancellation behind it closes the connection, and the
+// last thing the terminal typed is lost.
+//
+// The socket is slowed from the moment the shell is up, so that the Enter is
+// provably still in flight when the escape is recognised. At full speed the
+// writer delivers it in the gap between two keystrokes and the wait covers
+// nothing — which is exactly the state a real session is not in when this
+// matters.
+func TestClientDetachDeliversTheBytesItOwes(t *testing.T) {
+	door := newRecordingDoor()
+	d := serveDoor(t, door.handle)
+	conn := &slowConn{delay: 200 * time.Millisecond}
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: d.socket, HostKeys: d.pin(), Stdin: pr, Stdout: io.Discard, Escape: '~',
+		dial: conn.dialThrough}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	select {
+	case <-door.started:
+	case <-time.After(testTimeout):
+		t.Fatal("the shell never started")
+	}
+	conn.armed.Store(true)
+
+	_, err := pw.Write([]byte("x\r"))
+	require.NoError(t, err)
+	_, err = pw.Write([]byte("~."))
+	require.NoError(t, err)
+
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(5 * time.Second):
+		t.Fatal("~. did not detach")
+	}
+
+	// Handed over before Run returned; the door still has to read it off the
+	// channel, which is all this window is for.
+	deadline := time.Now().Add(2 * time.Second)
+	for door.taken() != "x\r" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, "x\r", door.taken(), "the detach left behind what the session was owed")
+}
+
+// Reading without bound would be its own defect. Past the backlog limit the
+// session is not taking input and the keystrokes are dropped — with one
+// bounded warning, however many reads are dropped — while the escape is still
+// recognised, which is the whole point of reading on.
+func TestClientDropsInputBeyondTheBacklogAndStillDetaches(t *testing.T) {
+	const limit = 64 << 10
+
+	release := make(chan struct{})
+	defer close(release)
+	handler := newBlockingHandler(release)
+
+	door := serveDoor(t, func(s gssh.Session) { <-s.Context().Done() }) // never reads its input
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdin: pr, Stdout: io.Discard, Escape: '~',
+		Logger: slog.New(handler), limits: terminalLimits{inputBacklog: limit}}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	_, err := pw.Write(bytes.Repeat([]byte("k"), sshWindow))
+	require.NoError(t, err)
+	go func() {
+		if _, err := pw.Write(bytes.Repeat([]byte("k"), 2*limit)); err != nil {
+			return
+		}
+		if _, err := pw.Write([]byte("\r")); err != nil {
+			return
+		}
+		_, _ = pw.Write([]byte("~."))
+	}()
+
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(5 * time.Second):
+		t.Fatal("~. did not detach after the backlog filled")
+	}
+	select {
+	case <-handler.entered:
+	case <-time.After(time.Second):
+		t.Fatal("dropping input was never logged")
+	}
+	require.Equal(t, int64(1), handler.count(), "one warning for the whole attachment, not one per dropped read")
+}
+
+// A resize that fails because the connection has gone must not park the
+// unwind in a blocked debug handler: the actor would never return and the
+// terminal would never be restored.
+//
+// It takes two resizes to get one failure out of x/crypto. A write that fails
+// is recorded in the transport's writeError and reported as success to its
+// caller; only the next writePacket returns it (handshake.go:591-593 and
+// 634-639). So the first window-change arms the error and the second one
+// receives it, and it is the second that the actor logs.
+//
+// Barriers, not sleeps: the door's output on the terminal signals that the
+// shell is up before the transport is broken, the connection signals that a
+// write has failed before the second resize is sent, and the handler signals
+// that it was entered — so the test cannot pass by cancelling before anything
+// it is about happened.
+//
+// The broken socket delivers nothing either: anything the client read from
+// then on could end the session before the cancel does, and Run would report
+// a disconnect, not the detach this test is about. That is safe because the
+// output is the last thing the door sends, so once it is on the terminal the
+// client has read all of it.
+func TestClientResizeFailureWithABlockedLoggerDoesNotHoldRun(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	handler := newBlockingHandler(release)
+
+	door := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.WriteString(s, "up")
+		_, _ = io.Copy(io.Discard, s)
+	})
+	conn := newBlockableConn()
+	resizes := make(chan termsize.Size, 1)
+	out := &syncSink{}
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: out,
+		Logger:  slog.New(handler),
+		Pty:     &Pty{Term: "xterm", Size: termsize.Default},
+		Resizes: resizes,
+		dial:    conn.dialThrough,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	waitFor(t, func() bool { return out.String() == "up" }, "the shell never started")
+	close(conn.fail)                              // the socket is gone: writes fail, nothing more is read
+	resizes <- termsize.Size{Cols: 100, Rows: 30} // arms the transport's writeError
+	select {
+	case <-conn.entered:
+	case <-time.After(testTimeout):
+		t.Fatal("the window-change never reached the transport")
+	}
+	resizes <- termsize.Size{Cols: 101, Rows: 31} // receives it, and the actor logs
+	select {
+	case <-handler.entered:
+	case <-time.After(testTimeout):
+		t.Fatal("the failed resize was never logged, so the blocked handler was never on the path")
+	}
+	cancel()
+
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a failed resize parked the unwind in a blocked logger")
+	}
+}
+
+// Cancellation must reach the handshake itself. A peer that accepts the
+// connection and then says nothing — no version string, no key exchange —
+// leaves the client waiting, and until the handshake completes there is no
+// ssh connection to close: the socket is the only thing cancellation can end,
+// and without that the wait lasts until dialTimeout. The mute-peer test below
+// covers the phase after the handshake; this one covers the phase before it.
+func TestClientHandshakeIsBoundedByCancellation(t *testing.T) {
+	// Never verified: the peer never sends a version string, so the
+	// handshake this test bounds never reaches host key checking. Only
+	// HostKeys' emptiness check, ahead of the dial, has to be satisfied.
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	pinnedSigner, err := ssh.NewSignerFromKey(key)
+	require.NoError(t, err)
+
+	socket := filepath.Join(shortTempDir(t), "mute-hs.sock")
+	ln, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	// The accepted connection is held open until the test ends: a peer that
+	// closed it would end the handshake without any help from cancellation.
+	accepted := make(chan net.Conn, 1)
+	t.Cleanup(func() {
+		select {
+		case conn := <-accepted:
+			_ = conn.Close()
+		default:
+		}
+	})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- conn
+	}()
+
+	c := &Client{Socket: socket, HostKeys: []ssh.PublicKey{pinnedSigner.PublicKey()}, Stdout: io.Discard}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(300 * time.Millisecond); cancel() }()
+	start := time.Now()
+	_, err = c.Run(ctx)
+	require.Error(t, err, "a handshake the peer never begins must fail, not hang")
+	require.Less(t, time.Since(start), 5*time.Second,
+		"cancellation must close the socket during the handshake rather than wait out dialTimeout")
+}
+
+// Cancellation must not depend on the peer. A daemon that completed the
+// handshake and then stopped answering — SIGSTOPped, say — never replies to
+// the session request, and a Run that waited for it would wait forever.
+func TestClientSetupIsBoundedByCancellationAgainstAnUnresponsivePeer(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := ssh.NewSignerFromKey(key)
+	require.NoError(t, err)
+	socket := filepath.Join(shortTempDir(t), "mute.sock")
+	ln, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	release := make(chan struct{})
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(release)
+		_ = ln.Close()
+		select {
+		case <-done:
+		case <-time.After(testTimeout):
+			t.Error("unresponsive peer did not stop")
+		}
+	})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		cfg := &ssh.ServerConfig{PublicKeyCallback: func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) { return nil, nil }}
+		cfg.AddHostKey(signer)
+		// Handshake, then silence: channels are never accepted, requests
+		// never answered.
+		_, _, _, _ = ssh.NewServerConn(conn, cfg)
+		<-release
+	}()
+
+	c := &Client{Socket: socket, HostKeys: []ssh.PublicKey{signer.PublicKey()}, Stdout: io.Discard}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(300 * time.Millisecond); cancel() }()
+	start := time.Now()
+	_, err = c.Run(ctx)
+	require.Error(t, err, "a session request the peer never answers must fail, not hang")
+	require.Less(t, time.Since(start), 5*time.Second)
+}
+
+// The same, once attached: an input write parked on an exhausted window is
+// released only by closing the connection, and cancellation has to do that.
+//
+// Run returning is not that proof on its own — the parked write is on a
+// goroutine Run does not wait for — so the door says when the connection went
+// away, which is the event that fails the write. It says so from the session's
+// context rather than from a read on the session: reading credits the window
+// back, which would release the very write this test is about.
+func TestClientCancellationReleasesABlockedInputWrite(t *testing.T) {
+	sessionEnded := make(chan struct{})
+	door := serveDoor(t, func(s gssh.Session) {
+		defer close(sessionEnded)
+		// Reads nothing: the client's writes fill the window and park.
+		<-s.Context().Done()
+	})
+	// More than the 2 MiB channel window, written as fast as the pipe allows.
+	pr, pw := io.Pipe()
+	writerDone := make(chan struct{})
+	t.Cleanup(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+		select {
+		case <-writerDone:
+		case <-time.After(testTimeout):
+			t.Error("input fixture writer did not stop")
+		}
+	})
+	go func() {
+		defer close(writerDone)
+		_, _ = pw.Write(bytes.Repeat([]byte("k"), 4<<20))
+	}()
+	// A logger of its own: past the backlog this drops input and says so, and
+	// the default logger would put that on the test's stderr.
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdin: pr, Stdout: io.Discard,
+		Logger: slog.New(slog.DiscardHandler)}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { time.Sleep(500 * time.Millisecond); cancel() }()
+	done := runAsync(t, ctx, c)
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation did not end Run")
+	}
+	select {
+	case <-sessionEnded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection outlived cancellation, so nothing released the parked input write")
+	}
+}
+
+// Only a client that both displays on a terminal and forwards its keystrokes
+// can answer the queries a primary is sent; only that client says so.
+func TestClientDeclaresInteractivityOnlyWithPtyAndStdin(t *testing.T) {
+	envs := make(chan []string, 3)
+	door := serveDoor(t, func(s gssh.Session) {
+		envs <- s.Environ()
+		_ = s.Exit(0)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	held, keyboard := io.Pipe()
+	t.Cleanup(func() { _ = keyboard.Close() })
+
+	for _, tc := range []struct {
+		name        string
+		client      *Client
+		interactive bool
+	}{
+		{"pty and stdin", &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: io.Discard, Stdin: held, Pty: &Pty{Term: "xterm", Size: termsize.Default}}, true},
+		{"pty only", &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: io.Discard, Pty: &Pty{Term: "xterm", Size: termsize.Default}}, false},
+		{"stdin only", &Client{Socket: door.socket, HostKeys: door.pin(), Stdout: io.Discard, Stdin: held}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.client.Run(ctx)
+			require.NoError(t, err)
+			env := <-envs
+			declared := slices.Contains(env, upterm.AttachInteractiveEnvVar+"=1")
+			require.Equal(t, tc.interactive, declared, "env: %v", env)
+		})
+	}
+}
+
+// A client with a notice asks the door to show it once attached; one without
+// asks nothing.
+func TestClientAsksTheDoorToShowItsNotice(t *testing.T) {
+	envs := make(chan []string, 2)
+	door := serveDoor(t, func(s gssh.Session) {
+		envs <- s.Environ()
+		_ = s.Exit(0)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	for _, notice := range []string{"upterm: this is home's door; 'exit' closes it for every guest.", ""} {
+		_, err := (&Client{Socket: door.socket, HostKeys: door.pin(), Stdout: io.Discard, Notice: notice}).Run(ctx)
+		require.NoError(t, err)
+		env := <-envs
+		asked := slices.IndexFunc(env, func(kv string) bool { return strings.HasPrefix(kv, upterm.AttachNoticeEnvVar+"=") })
+		if notice == "" {
+			require.Equal(t, -1, asked, "env: %v", env)
+			continue
+		}
+		require.GreaterOrEqual(t, asked, 0, "env: %v", env)
+		require.Equal(t, upterm.AttachNoticeEnvVar+"="+notice, env[asked])
+	}
+}
+
+func TestClientCannotAttachToANonexistentSocket(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	pinnedSigner, err := ssh.NewSignerFromKey(key)
+	require.NoError(t, err)
+
+	c := &Client{Socket: filepath.Join(shortTempDir(t), "none.sock"),
+		HostKeys: []ssh.PublicKey{pinnedSigner.PublicKey()}, Stdout: io.Discard}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	_, err = c.Run(ctx)
+	require.Error(t, err)
+}
+
+// TestClientRequiresAHostKey pins that the empty-HostKeys check runs before
+// the dial: Socket names a path that does not exist, so a Run that reached
+// the dial first would fail there instead, for a different reason than the
+// one this test is about.
+func TestClientRequiresAHostKey(t *testing.T) {
+	c := &Client{Socket: filepath.Join(shortTempDir(t), "none.sock"), Stdout: io.Discard}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	_, err := c.Run(ctx)
+	require.ErrorContains(t, err, "HostKeys is required")
+}
+
+// TestClientRefusesADoorPresentingAnotherKey pins the whole point of pinning:
+// a door whose key is not among HostKeys must be refused, and refused before
+// Shell() — a client that reached the shell would have handed its terminal to
+// whatever answered the socket.
+func TestClientRefusesADoorPresentingAnotherKey(t *testing.T) {
+	reachedShell := make(chan struct{}, 1)
+	door := serveDoor(t, func(s gssh.Session) {
+		reachedShell <- struct{}{}
+		_ = s.Exit(0)
+	})
+
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	notTheDoorsSigner, err := ssh.NewSignerFromKey(key)
+	require.NoError(t, err)
+
+	c := &Client{Socket: door.socket, HostKeys: []ssh.PublicKey{notTheDoorsSigner.PublicKey()}, Stdout: io.Discard}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	_, err = c.Run(ctx)
+	require.Error(t, err)
+
+	select {
+	case <-reachedShell:
+		t.Fatal("Run must not reach Shell() when the door's key is not among HostKeys")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestClientAttachesToADaemonWithSeveralSignersWhenAllAreParsedAndPinned is
+// the round trip: a daemon with two signers of different types marshals both
+// to authorized_keys form (what host.go publishes) and back (what attach.go
+// parses), the door presents both, and a client holding both attaches
+// successfully whichever one negotiation selects.
+func TestClientAttachesToADaemonWithSeveralSignersWhenAllAreParsedAndPinned(t *testing.T) {
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	edSigner, err := ssh.NewSignerFromKey(edKey)
+	require.NoError(t, err)
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	rsaSigner, err := ssh.NewSignerFromKey(rsaKey)
+	require.NoError(t, err)
+
+	var published []string
+	for _, s := range []ssh.Signer{edSigner, rsaSigner} {
+		published = append(published, strings.TrimSuffix(string(ssh.MarshalAuthorizedKey(s.PublicKey())), "\n"))
+	}
+	var pinned []ssh.PublicKey
+	for _, line := range published {
+		key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+		require.NoError(t, err)
+		pinned = append(pinned, key)
+	}
+
+	door := serveDoorWithSigners(t, "multi.sock", []gssh.Signer{edSigner, rsaSigner},
+		func(s gssh.Session) { _ = s.Exit(0) })
+	socket := door.socket
+
+	c := &Client{Socket: socket, HostKeys: pinned, Stdout: io.Discard}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := c.Run(ctx)
+	require.NoError(t, err)
+	require.Equal(t, Result{Reason: Exited, Status: 0}, res)
+}
+
+// The completed request proves this connection reached the post-auth request
+// loop. It remains live until the door itself stops.
+func TestDoorStopClosesHeldAuthenticatedConnection(t *testing.T) {
+	testDoorStopClosesHeldConnection(t, true)
+}
+
+// A peer that sends no handshake bytes is absent from charm's connWg.
+func TestDoorStopClosesHeldPreAuthConnection(t *testing.T) {
+	testDoorStopClosesHeldConnection(t, false)
+}
+
+func testDoorStopClosesHeldConnection(t *testing.T, authenticated bool) {
+	t.Helper()
+	door := serveDoor(t, nil)
+	peer, err := net.Dial("unix", door.socket)
+	require.NoError(t, err)
+	var clientConn ssh.Conn
+	var peerDone chan struct{}
+	var stopDone chan error
+	t.Cleanup(func() {
+		door.fallbackClose(t, peer)
+		if clientConn != nil {
+			_ = clientConn.Close()
+		}
+		if peerDone != nil {
+			select {
+			case <-peerDone:
+			case <-time.After(testTimeout):
+				t.Error("fallback did not join peer waiter")
+			}
+		}
+		if stopDone != nil {
+			select {
+			case err := <-stopDone:
+				if err != nil {
+					t.Errorf("fallback stop: %v", err)
+				}
+			case <-time.After(testTimeout):
+				t.Error("fallback did not join stop caller")
+			}
+		}
+	})
+
+	var original *doorConn
+	select {
+	case original = <-door.accepted:
+	case <-time.After(testTimeout):
+		t.Fatal("door did not register the original accepted connection")
+	}
+	select {
+	case <-original.entered:
+	case <-time.After(testTimeout):
+		t.Fatal("original did not enter HandleConn")
+	}
+
+	if authenticated {
+		_, key, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		signer, err := ssh.NewSignerFromKey(key)
+		require.NoError(t, err)
+		config := &ssh.ClientConfig{User: "fixture", Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
+			HostKeyCallback: ssh.FixedHostKey(door.key)}
+		conn, _, _, err := ssh.NewClientConn(peer, door.socket, config)
+		require.NoError(t, err)
+		clientConn = conn
+		ok, _, err := conn.SendRequest("door-ownership-probe", true, nil)
+		require.NoError(t, err)
+		require.False(t, ok)
+		peerDone = make(chan struct{})
+		go func() { _ = conn.Wait(); close(peerDone) }()
+	} else {
+		// Reading the server's banner sends no handshake bytes back to it.
+		peerDone = make(chan struct{})
+		go func() { _, _ = io.Copy(io.Discard, peer); close(peerDone) }()
+	}
+
+	stopDone = make(chan error, 1)
+	go func() { stopDone <- door.stop() }()
+	var stopErr error
+	select {
+	case stopErr = <-stopDone:
+		stopDone = nil
+	case <-time.After(testTimeout):
+		t.Error("door stop exceeded the emergency guard")
+	}
+	if stopErr != nil {
+		t.Errorf("door stop did not complete: %v", stopErr)
+	}
+	select {
+	case <-peerDone:
+	case <-time.After(time.Second):
+		t.Error("original accepted connection remained open after door stop")
+	}
+	select {
+	case <-original.done:
+	default:
+		t.Error("original HandleConn did not return before door stop")
+	}
+}
+
+func TestClientContextCancellationDetaches(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) { _, _ = io.Copy(io.Discard, s) })
+	pr, pw := io.Pipe() // never written while the client runs
+	t.Cleanup(func() { _ = pw.Close() })
+	c := &Client{Socket: door.socket, HostKeys: door.pin(), Stdin: pr, Stdout: io.Discard}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runAsync(t, ctx, c)
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case res := <-done:
+		require.Equal(t, Result{Reason: Detached}, res)
+	case <-time.After(testTimeout):
+		t.Fatal("cancellation did not end Run")
+	}
+}
+
+// serverConnOf is the SSH connection under a door session: the one the daemon
+// sends its global requests on.
+func serverConnOf(s gssh.Session) *ssh.ServerConn {
+	c, _ := s.Context().Value(gssh.ContextKeyConn).(*ssh.ServerConn)
+	return c
+}
+
+// sendSessionEnd sends the session-end request on s's connection and waits
+// for the client's reply, as the daemon does, and reports a client that did
+// not take it.
+func sendSessionEnd(t *testing.T, s gssh.Session, end upterm.SessionEnd) {
+	t.Helper()
+	ok, _, err := serverConnOf(s).SendRequest(upterm.SessionEndRequestType, true, ssh.Marshal(&end))
+	if err != nil {
+		t.Errorf("session-end request: %v", err)
+	} else if !ok {
+		t.Errorf("the client refused the session-end request")
+	}
+}
+
+// sendSessionEndNoWait sends it and goes on without the reply: the daemon
+// after upterm.SessionEndReplyBound.
+func sendSessionEndNoWait(t *testing.T, s gssh.Session, end upterm.SessionEnd) {
+	t.Helper()
+	conn := serverConnOf(s)
+	payload := ssh.Marshal(&end)
+	go func() { _, _, _ = conn.SendRequest(upterm.SessionEndRequestType, true, payload) }()
+}
+
+// runClient attaches a viewer to door and returns how it ended. Safe to call
+// from a goroutine: a failure to attach is reported with Errorf.
+func runClient(t *testing.T, door *fakeDoor) Result {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	res, err := (&Client{Socket: door.socket, HostKeys: door.pin(), Stdout: io.Discard}).Run(ctx)
+	if err != nil {
+		t.Errorf("Run: %v", err)
+	}
+	return res
+}
+
+func TestResultCarriesTheDaemonsCause(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		sendSessionEnd(t, s, upterm.SessionEnd{Cause: upterm.CauseSignaled, Signal: "TERM"})
+		_ = s.Exit(1)
+	})
+	res := runClient(t, door)
+	require.Equal(t, Exited, res.Reason)
+	require.Equal(t, 1, res.Status)
+	require.Equal(t, Cause{Kind: CauseSignaled, Signal: "TERM"}, res.Cause)
+}
+
+// Status 0 is a nil error from Wait and carries nothing, so the cause cannot
+// ride on the exit-status: a join timeout is the case that ends with 0.
+func TestAJoinTimeoutCauseSurvivesStatusZero(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		sendSessionEnd(t, s, upterm.SessionEnd{Cause: upterm.CauseJoinTimeout})
+		_ = s.Exit(0)
+	})
+	res := runClient(t, door)
+	require.Equal(t, Exited, res.Reason)
+	require.Equal(t, 0, res.Status)
+	require.Equal(t, CauseJoinTimeout, res.Cause.Kind)
+}
+
+func TestEveryCauseTheDaemonNamesIsReadAsItsKind(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  upterm.SessionEnd
+		want Cause
+	}{
+		{"exited", upterm.SessionEnd{Cause: upterm.CauseExited}, Cause{Kind: CauseExited}},
+		{"stopped", upterm.SessionEnd{Cause: upterm.CauseStopped}, Cause{Kind: CauseStopped}},
+		{"signaled", upterm.SessionEnd{Cause: upterm.CauseSignaled, Signal: "KILL"}, Cause{Kind: CauseSignaled, Signal: "KILL"}},
+		{"canceled", upterm.SessionEnd{Cause: upterm.CauseCanceled}, Cause{Kind: CauseCanceled}},
+		{"join timeout", upterm.SessionEnd{Cause: upterm.CauseJoinTimeout}, Cause{Kind: CauseJoinTimeout}},
+		// A newer daemon's cause is not one this client knows; guessing
+		// would put words in the daemon's mouth. It is still a cause, which
+		// the status alone doesn't explain.
+		{"a cause from a newer daemon", upterm.SessionEnd{Cause: "evicted", Signal: "TERM"}, Cause{Kind: CauseUnknown}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			door := serveDoor(t, func(s gssh.Session) {
+				sendSessionEnd(t, s, tc.end)
+				_ = s.Exit(1)
+			})
+			res := runClient(t, door)
+			require.Equal(t, Exited, res.Reason)
+			require.Equal(t, tc.want, res.Cause)
+		})
+	}
+}
+
+// sendRawSessionEnd sends the session-end request with payload as it is, and
+// returns the client's reply.
+func sendRawSessionEnd(t *testing.T, s gssh.Session, payload []byte) bool {
+	t.Helper()
+	ok, _, err := serverConnOf(s).SendRequest(upterm.SessionEndRequestType, true, payload)
+	if err != nil {
+		t.Errorf("session-end request: %v", err)
+	}
+	return ok
+}
+
+// A payload this client cannot decode is still the daemon saying why the
+// session ended, in words this client can't read: a cause it doesn't know, and
+// the client says in its reply that it couldn't read it.
+func TestAnUndecodableCauseIsACauseThisClientDoesNotKnow(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"shorter than a length", []byte{0xff, 0xff}},
+		{"a cause with its signal missing", ssh.Marshal(&struct{ Cause string }{upterm.CauseStopped})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			replies := make(chan bool, 1)
+			door := serveDoor(t, func(s gssh.Session) {
+				replies <- sendRawSessionEnd(t, s, tc.payload)
+				_ = s.Exit(1)
+			})
+			res := runClient(t, door)
+			require.Equal(t, Exited, res.Reason)
+			require.Equal(t, 1, res.Status)
+			require.Equal(t, Cause{Kind: CauseUnknown}, res.Cause)
+			require.False(t, <-replies, "the client took a payload it could not read")
+		})
+	}
+}
+
+// A later daemon may append fields to the payload. This client reads the ones
+// it knows and takes the cause all the same: were it to refuse the payload,
+// every stop a later daemon reported would read here as a plain status of 1.
+func TestACauseWithFieldsAppendedIsStillRead(t *testing.T) {
+	replies := make(chan bool, 1)
+	door := serveDoor(t, func(s gssh.Session) {
+		replies <- sendRawSessionEnd(t, s, ssh.Marshal(&struct {
+			Cause, Signal, Added string
+		}{upterm.CauseSignaled, "TERM", "a field from a later daemon"}))
+		_ = s.Exit(1)
+	})
+	res := runClient(t, door)
+	require.Equal(t, Exited, res.Reason)
+	require.Equal(t, Cause{Kind: CauseSignaled, Signal: "TERM"}, res.Cause)
+	require.True(t, <-replies, "the client refused a payload it could read")
+}
+
+// The cause explains a status; without a status there is nothing for it to
+// explain, and none is invented.
+func TestACauseWithoutAStatusIsADisconnect(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) {
+		sendSessionEnd(t, s, upterm.SessionEnd{Cause: upterm.CauseStopped})
+		_ = serverConnOf(s).Close() // gone before the exit-status
+	})
+	res := runClient(t, door)
+	require.Equal(t, Disconnected, res.Reason)
+	require.Equal(t, Cause{}, res.Cause)
+}
+
+func TestAnOlderDaemonGivesNoCause(t *testing.T) {
+	door := serveDoor(t, func(s gssh.Session) { _ = s.Exit(1) })
+	res := runClient(t, door)
+	require.Equal(t, Cause{}, res.Cause)
+}
+
+// Any other global request is refused, as x/crypto's own handler refuses it,
+// and the client goes on.
+func TestOtherGlobalRequestsAreRefused(t *testing.T) {
+	replies := make(chan bool, 1)
+	door := serveDoor(t, func(s gssh.Session) {
+		ok, _, err := serverConnOf(s).SendRequest("keepalive@openssh.com", true, nil)
+		if err != nil {
+			t.Errorf("keepalive: %v", err)
+		}
+		replies <- ok
+		_ = s.Exit(1)
+	})
+	res := runClient(t, door)
+	require.Equal(t, Result{Reason: Exited, Status: 1}, res)
+	require.False(t, <-replies)
+}
+
+// heldRequestLoop is the hold holdRequestLoop puts on the next Run: released
+// lets the request loop go on, and delivered closes when Run has the session's
+// end in hand.
+type heldRequestLoop struct {
+	released  chan struct{}
+	once      sync.Once
+	delivered chan struct{}
+}
+
+// holdRequestLoop parks the client's request loop before it handles anything,
+// which is a client that is suspended, or merely slow, when the daemon's reply
+// bound passes. The hold is lifted when the test ends if it has not been.
+func holdRequestLoop(t *testing.T) *heldRequestLoop {
+	t.Helper()
+	h := &heldRequestLoop{released: make(chan struct{}), delivered: make(chan struct{})}
+	requestLoopHold = func() { <-h.released }
+	sessionEndedHook = func() { close(h.delivered) }
+	t.Cleanup(func() {
+		requestLoopHold, sessionEndedHook = nil, nil
+		h.release() // never leave the loop parked
+	})
+	return h
+}
+
+// awaitStatusDelivered returns once Run has the session's end in hand: Wait
+// has returned inside it.
+func (h *heldRequestLoop) awaitStatusDelivered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-h.delivered:
+	case <-time.After(testTimeout):
+		t.Fatal("the status never reached the client")
+	}
+}
+
+func (h *heldRequestLoop) release() { h.once.Do(func() { close(h.released) }) }
+
+// The daemon waits for the reply only up to upterm.SessionEndReplyBound and
+// then sends the status regardless, so a client whose loop has not got to the
+// request yet can learn the session has ended first. The request was sent
+// first, and is in the queue by the time the status has been read, so it is
+// handled before the cause is taken.
+func TestACauseQueuedBehindASlowConsumerIsStillRead(t *testing.T) {
+	hold := holdRequestLoop(t) // the client's request loop blocks before handling anything
+	door := serveDoor(t, func(s gssh.Session) {
+		sendSessionEndNoWait(t, s, upterm.SessionEnd{Cause: upterm.CauseStopped}) // no reply will come in time
+		time.Sleep(upterm.SessionEndReplyBound + 100*time.Millisecond)            // the daemon's timeout passes
+		_ = s.Exit(1)                                                             // the status goes out anyway
+	})
+	done := make(chan Result, 1)
+	go func() { done <- runClient(t, door) }()
+	hold.awaitStatusDelivered(t) // Wait has returned inside Run
+	hold.release()
+	res := <-done
+	require.Equal(t, Exited, res.Reason)
+	require.Equal(t, Cause{Kind: CauseStopped}, res.Cause)
+}
+
+// ~? is the Terminal's, with the Client's Status hook: the lines reach this
+// terminal, and nothing of the two keys reaches the session.
+func TestClientShowsItsStatusInThisTerminalOnly(t *testing.T) {
+	door := newRecordingDoor()
+	d := serveDoor(t, func(s gssh.Session) {
+		_, _ = io.WriteString(s, "ready")
+		door.handle(s)
+	})
+	var out syncSink
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	c := &Client{Socket: d.socket, HostKeys: d.pin(), Stdin: pr, Stdout: &out, Escape: '~',
+		Pty:    &Pty{Term: "xterm", Size: termsize.Default},
+		Status: func(context.Context) []string { return []string{"upterm: STATUS"} }}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(t, ctx, c)
+
+	waitFor(t, func() bool { return out.String() == "ready" }, "the session's output never reached the terminal")
+	_, err := pw.Write([]byte("\r~?x"))
+	require.NoError(t, err)
+	waitFor(t, func() bool { return out.String() == "ready\r\nupterm: STATUS\x1b[K\r\n" }, "the status never reached the terminal")
+	waitFor(t, func() bool { return door.taken() == "\rx" }, "the session never got the keys around ~?")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+func TestApprovalRegistrationAndSessionEnd(t *testing.T) {
+	for _, mode := range []string{"interactive", "disabled", "no-pty", "no-stdin", "not-enabled", "refused"} {
+		t.Run(mode, func(t *testing.T) {
+			registered := atomic.Bool{}
+			ready := make(chan struct{})
+			finish := make(chan struct{})
+			replies := make(chan bool, 4)
+			door := serveDoor(t, func(s gssh.Session) {
+				offered := mode == "interactive" || mode == "refused"
+				if registered.Load() != offered {
+					t.Errorf("registration before shell: got %v, want %v", registered.Load(), offered)
+				}
+				conn := serverConnOf(s)
+				if mode == "interactive" {
+					payload, err := upterm.EncodeApprovalState(approvalTestState("first"))
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					for _, kind := range []string{"approval-state-v2@upterm", upterm.ApprovalStateRequest} {
+						ok, _, err := conn.SendRequest(kind, true, payload)
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						replies <- ok
+					}
+				}
+				_, _ = io.WriteString(s, "READY")
+				close(ready)
+				select {
+				case <-finish:
+				case <-s.Context().Done():
+					return
+				}
+				sendSessionEnd(t, s, upterm.SessionEnd{Cause: upterm.CauseStopped})
+				_ = s.Exit(0)
+			})
+			door.server.RequestHandlers[upterm.ApprovalRegisterRequest] = func(_ gssh.Context, _ *gssh.Server, req *ssh.Request) (bool, []byte) {
+				registered.Store(true)
+				if len(req.Payload) != 0 {
+					t.Error("registration payload")
+				}
+				return mode != "refused", nil
+			}
+			sink := &syncSink{}
+			pr, pw := io.Pipe()
+			defer func() { _ = pw.Close() }()
+			client := &Client{Socket: door.socket, HostKeys: door.pin(), Stdin: pr, Stdout: sink, Pty: &Pty{Term: "xterm"}, Escape: '~', Approvals: true, Logger: slog.New(slog.DiscardHandler)}
+			switch mode {
+			case "disabled":
+				client.Escape = 0
+			case "no-pty":
+				client.Pty = nil
+			case "no-stdin":
+				client.Stdin = nil
+			case "not-enabled":
+				client.Approvals = false
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+			defer cancel()
+			done := runAsync(t, ctx, client)
+			awaitClosed(t, ready, "shell never started")
+			if mode == "interactive" {
+				require.False(t, <-replies)
+				require.True(t, <-replies)
+				waitFor(t, func() bool { return strings.Contains(sink.String(), "pending") }, "notification missing")
+				_, err := pw.Write([]byte("~a"))
+				require.NoError(t, err)
+				waitFor(t, func() bool { return strings.Contains(sink.String(), approvalTestReviewShown) }, "review missing")
+			}
+			close(finish)
+			res := awaitResult(t, done)
+			require.Equal(t, Exited, res.Reason)
+			require.Equal(t, CauseStopped, res.Cause.Kind)
+		})
+	}
+}

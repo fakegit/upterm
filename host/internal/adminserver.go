@@ -2,60 +2,408 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/owenthereal/upterm/host/api"
+	"github.com/owenthereal/upterm/host/consent"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
+
+// SessionRoute is where guests reach the session now: the latest
+// registration's node and SSH user. The session ID never changes, so it isn't
+// here. It is safe for concurrent use; the zero value is an empty route.
+type SessionRoute struct {
+	mu       sync.Mutex
+	nodeAddr string
+	sshUser  string
+}
+
+// Set records a registration's node and SSH user.
+func (r *SessionRoute) Set(nodeAddr, sshUser string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nodeAddr, r.sshUser = nodeAddr, sshUser
+}
+
+// Get returns the node and SSH user Set last recorded.
+func (r *SessionRoute) Get() (nodeAddr, sshUser string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nodeAddr, r.sshUser
+}
+
+// SessionState is what the supervisor knows, for the admin API.
+type SessionState struct {
+	Status, Reconnect, TunnelReason string
+	LostAt, NextAttemptAt           time.Time // zero when not reconnecting
+}
+
+// DescribeSession sets the fields of r that name the session and say how it
+// is doing. A session with no name has none to report, and with no state to
+// ask the supervisor for, the state is unknown: those fields stay unset. With
+// state, the strings are always set, empty when there is nothing to say, such
+// as the reason while the tunnel is up. A time that is zero is not a moment,
+// an outage that has not begun or an attempt that is not scheduled, so it is
+// unset, not the epoch.
+func DescribeSession(r *api.GetSessionResponse, name string, state func() SessionState) {
+	if name != "" {
+		r.Name = proto.String(name)
+	}
+	if state == nil {
+		return
+	}
+	st := state()
+	r.Status = proto.String(st.Status)
+	r.Reconnect = proto.String(st.Reconnect)
+	r.TunnelReason = proto.String(st.TunnelReason)
+	r.TunnelLostAtUnixNano = unixNano(st.LostAt)
+	r.NextAttemptAtUnixNano = unixNano(st.NextAttemptAt)
+}
+
+// unixNano is t as UTC nanoseconds since the epoch, or none for a zero t.
+func unixNano(t time.Time) *int64 {
+	if t.IsZero() {
+		return nil
+	}
+	return proto.Int64(t.UnixNano())
+}
+
+// The values of GetSessionResponse.file_transfer.
+const (
+	FileTransferOff       = "off"
+	FileTransferDownloads = "downloads"
+	FileTransferAll       = "all"
+)
+
+// Permissions is how the host started the session, as far as it decides what
+// guests may do.
+type Permissions struct {
+	// AutoAccept says nobody answered the start prompt (--accept).
+	AutoAccept                 bool
+	ReadOnly                   bool
+	SFTPDisabled               bool
+	AllowLocalTCPForwarding    bool
+	AllowLoopbackTCPForwarding bool
+	ForwardingDisabled         bool
+	AcceptExec                 bool
+	ExecDisabled               bool
+	TerminalConsent            bool
+	PermissionChecker          consent.PermissionChecker
+	// FileTransferApprovalRequired says each guest file transfer waits for
+	// approval in the primary host terminal. It means nothing when SFTP is disabled.
+	FileTransferApprovalRequired bool
+}
+
+// Report sets the permission fields of r. It is the one derivation of them:
+// the response the host builds at startup carries them, and GetSession copies
+// them from it, because they cannot change while the session runs. Approval
+// describes configured policy even when its method is unavailable; no cached
+// consent grants or current terminal/prompt state are consulted.
+func (p Permissions) Report(r *api.GetSessionResponse) {
+	transfer := FileTransferAll
+	switch {
+	case p.SFTPDisabled:
+		transfer = FileTransferOff
+	case p.ReadOnly:
+		transfer = FileTransferDownloads
+	}
+	r.StartConfirmed = proto.Bool(!p.AutoAccept)
+	r.ReadOnly = proto.Bool(p.ReadOnly)
+	shell := "shared"
+	if len(r.LoginCommand) > 0 {
+		shell = "login"
+	}
+	if len(r.ForceCommand) > 0 {
+		shell = "forced"
+	}
+	execution := "approval"
+	switch {
+	case p.ReadOnly || p.ExecDisabled:
+		execution = "off"
+	case len(r.ForceCommand) > 0:
+		execution = "forced"
+	case p.AcceptExec:
+		execution = "granted"
+	}
+	forwarding := "loopback-approval"
+	switch {
+	case p.ReadOnly || p.ForwardingDisabled:
+		forwarding = "off"
+	case p.AllowLocalTCPForwarding:
+		forwarding = "all"
+	case p.AllowLoopbackTCPForwarding:
+		forwarding = "loopback"
+	}
+	method := "unavailable"
+	if p.TerminalConsent {
+		method = "terminal"
+	} else if p.PermissionChecker != nil {
+		method = "custom"
+	}
+	r.GuestShell = proto.String(shell)
+	r.Execution = proto.String(execution)
+	r.TcpForwarding = proto.String(forwarding)
+	r.ApprovalMethod = proto.String(method)
+	r.LocalForwarding = proto.Bool(forwarding == "all")
+	r.FileTransfer = proto.String(transfer)
+	// With no transfer there is nothing to wait for.
+	r.FileTransferApprovalRequired = proto.Bool(transfer != FileTransferOff && p.FileTransferApprovalRequired)
+}
 
 type AdminServer struct {
 	Session    *api.GetSessionResponse
 	ClientRepo *ClientRepo
-	srv        *grpc.Server
+	// Forwards, when set, is where GetSession finds each jump's
+	// destinations; the session's Server records them there.
+	Forwards *Forwards
+
+	// Route, when set, is where GetSession says guests reach the session,
+	// in place of Session's NodeAddr and SshUser: a reconnect can register
+	// the session on another node. Session's SessionId is reported either
+	// way, since it never changes.
+	Route *SessionRoute
+
+	// LaunchID is the launch this server speaks for, from the record the
+	// session claimed. StopSession refuses a request that names any other
+	// launch, so that a client whose session ended between reading the
+	// record and dialling the socket does not stop the session that took
+	// the name over. Empty means no name was claimed -- a caller that
+	// supplied its own admin socket -- and then no stop can be bound to a
+	// launch, so none is accepted.
+	LaunchID string
+
+	// OnListening, if set, is called once the socket is bound. It is the other
+	// half of readiness: a caller told "ready" must be able to connect, which
+	// registering the actor does not establish and binding does.
+	OnListening func()
+
+	// OnStop is called when a client asks the session to end. The daemon
+	// wires it to an explicit stop cause; the RPC returns at
+	// once and the teardown follows.
+	OnStop func()
+
+	// OnSetJoinTimeout sets the session's join timeout and reports what it
+	// found. Nil answers Unimplemented, as a daemon without the call would.
+	OnSetJoinTimeout func(time.Duration) *api.SetJoinTimeoutResponse
+
+	// JoinState reports the join timeout as the daemon holds it, for
+	// GetSession. Nil reports none.
+	JoinState func() *api.JoinState
+
+	// Name is the session's name, for GetSession. Empty reports none.
+	Name string
+
+	// State reports what the supervisor knows now, for GetSession. Nil
+	// reports none, which a reader sees as unknown.
+	State func() SessionState
+
+	srv *grpc.Server
+	ln  net.Listener
 	sync.Mutex
 }
 
-func (s *AdminServer) Serve(ctx context.Context, sock string) error {
+// Listen binds the admin socket. It is separate from Serve so the caller can
+// bind synchronously, before any concurrent actor exists.
+//
+// Binding inside the serving goroutine made a bind failure race the command's
+// start: whichever lost the race decided how the run was classified, so the
+// same broken socket path was reported as startup_failed on one run and
+// signaled on the next. Bound up front, the failure is the caller's to return
+// and there is nothing to race.
+func (s *AdminServer) Listen(sock string) error {
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		return err
 	}
 
 	s.Lock()
-	s.srv = grpc.NewServer()
-	api.RegisterAdminServiceServer(s.srv, &adminServiceServer{
-		Session:    s.Session,
-		ClientRepo: s.ClientRepo,
-	})
+	s.ln = ln
 	s.Unlock()
 
-	return s.srv.Serve(ln)
-}
-
-func (s *AdminServer) Shutdown(ctx context.Context) error {
-	s.Lock()
-	defer s.Unlock()
-
-	if s.srv != nil {
-		s.srv.GracefulStop()
+	// Bound, so a caller that is told "ready" can connect.
+	if s.OnListening != nil {
+		s.OnListening()
 	}
 
 	return nil
 }
 
+// Serve serves the listener Listen bound. Listen must have succeeded first:
+// this deliberately refuses to bind on the caller's behalf, because doing so
+// is exactly the race Listen exists to remove.
+func (s *AdminServer) Serve(ctx context.Context) error {
+	s.Lock()
+	ln := s.ln
+	if ln == nil {
+		s.Unlock()
+		return errors.New("admin server: Serve called before Listen")
+	}
+	s.srv = grpc.NewServer()
+	api.RegisterAdminServiceServer(s.srv, &adminServiceServer{
+		Session:          s.Session,
+		Route:            s.Route,
+		ClientRepo:       s.ClientRepo,
+		Forwards:         s.Forwards,
+		LaunchID:         s.LaunchID,
+		OnStop:           s.OnStop,
+		OnSetJoinTimeout: s.OnSetJoinTimeout,
+		JoinState:        s.JoinState,
+		Name:             s.Name,
+		State:            s.State,
+	})
+	srv := s.srv
+	s.Unlock()
+
+	return srv.Serve(ln)
+}
+
+// Shutdown drains RPCs until ctx expires, then initiates forced transport closure.
+// It cannot terminate a callback that ignores cancellation: gRPC Serve and its
+// shutdown goroutines may still wait for that callback to return.
+func (s *AdminServer) Shutdown(ctx context.Context) error {
+	s.Lock()
+	srv, ln := s.srv, s.ln
+	// A serving actor that has not started must not resurrect a closed listener.
+	s.ln = nil
+	s.Unlock()
+
+	if srv != nil {
+		drained := make(chan struct{})
+		go func() { srv.GracefulStop(); close(drained) }()
+		select {
+		case <-drained:
+		case <-ctx.Done():
+			// Stop closes active transports, including incomplete request bodies.
+			// It can itself block behind GracefulStop's handler-wait mutex, so
+			// neither shutdown call may be awaited after the caller's deadline.
+			go srv.Stop()
+		}
+		return nil
+	}
+	if ln != nil {
+		return ln.Close()
+	}
+	return nil
+}
+
 type adminServiceServer struct {
-	Session    *api.GetSessionResponse
-	ClientRepo *ClientRepo
+	Session          *api.GetSessionResponse
+	Route            *SessionRoute
+	ClientRepo       *ClientRepo
+	Forwards         *Forwards
+	LaunchID         string
+	OnStop           func()
+	OnSetJoinTimeout func(time.Duration) *api.SetJoinTimeoutResponse
+	JoinState        func() *api.JoinState
+	Name             string
+	State            func() SessionState
 }
 
 func (s *adminServiceServer) GetSession(ctx context.Context, in *api.GetSessionRequest) (*api.GetSessionResponse, error) {
-	return &api.GetSessionResponse{
+	nodeAddr, sshUser := s.Session.NodeAddr, s.Session.SshUser
+	if s.Route != nil {
+		nodeAddr, sshUser = s.Route.Get()
+	}
+	resp := &api.GetSessionResponse{
 		SessionId:        s.Session.SessionId,
 		Host:             s.Session.Host,
-		NodeAddr:         s.Session.NodeAddr,
+		NodeAddr:         nodeAddr,
+		SshUser:          sshUser,
 		Command:          s.Session.Command,
 		ForceCommand:     s.Session.ForceCommand,
-		ConnectedClients: s.ClientRepo.Clients(),
-	}, nil
+		LoginCommand:     s.Session.LoginCommand,
+		AuthorizedKeys:   s.Session.AuthorizedKeys,
+		ConnectedClients: s.Forwards.describe(s.ClientRepo.Clients()),
+		SftpDisabled:     s.Session.SftpDisabled,
+		Open:             s.Session.Open,
+		JoinState:        s.joinState(),
+		LaunchId:         s.LaunchID,
+
+		// What the host decided at startup, which the session cannot change.
+		StartConfirmed:               s.Session.StartConfirmed,
+		ReadOnly:                     s.Session.ReadOnly,
+		LocalForwarding:              s.Session.LocalForwarding,
+		GuestShell:                   s.Session.GuestShell,
+		Execution:                    s.Session.Execution,
+		TcpForwarding:                s.Session.TcpForwarding,
+		ApprovalMethod:               s.Session.ApprovalMethod,
+		FileTransfer:                 s.Session.FileTransfer,
+		FileTransferApprovalRequired: s.Session.FileTransferApprovalRequired,
+
+		// The relay key the first connection trusted: redials are pinned to
+		// it, so it is the session's for its life.
+		RelayKnownHosts: s.Session.RelayKnownHosts,
+		RelayKeyTrust:   s.Session.RelayKeyTrust,
+
+		// And, for a delegated session, the address guests reach it at.
+		DelegatedAddress: s.Session.DelegatedAddress,
+	}
+	DescribeSession(resp, s.Name, s.State)
+	return resp, nil
+}
+
+// joinState is the live join timeout, or none for a server that has none.
+func (s *adminServiceServer) joinState() *api.JoinState {
+	if s.JoinState == nil {
+		return nil
+	}
+	return s.JoinState()
+}
+
+// StopSession ends the launch the request names, and only that one.
+//
+// The name and the socket path are the session's, not the run's: a session
+// that ends gives both back, and the next `upterm host` to claim the name
+// binds the same path. A client reads a record, finds the socket, dials it,
+// and asks -- and in between, the run it read can have ended and been
+// replaced. Unbound, the replacement would accept the stop and die, and the
+// client's own check (the launch ID changed, so the session it asked about
+// is gone) would report that as success. So the request carries the launch
+// the client inspected and anything else is refused, an empty value
+// included: the RPC is unreleased, so no caller that omits it exists, and a
+// caller that cannot name a launch is one that has not read a record.
+//
+// Plain equality: a launch ID is published in the record for anyone to
+// read, so it is an identifier and not a secret, and nothing here is
+// protected by keeping its comparison time constant.
+func (s *adminServiceServer) StopSession(ctx context.Context, in *api.StopSessionRequest) (*api.StopSessionResponse, error) {
+	if s.LaunchID == "" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"this session has no launch to be stopped by name; the request named %q", in.GetLaunchId())
+	}
+	if in.GetLaunchId() != s.LaunchID {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"this socket holds launch %s; the request named %q", s.LaunchID, in.GetLaunchId())
+	}
+	if s.OnStop != nil {
+		s.OnStop()
+	}
+	return &api.StopSessionResponse{}, nil
+}
+
+// SetJoinTimeout sets the join timeout of the launch the request names, and
+// only that one, for StopSession's reason: a session that ended between the
+// caller's read and this call has handed its name and socket to another.
+func (s *adminServiceServer) SetJoinTimeout(ctx context.Context, in *api.SetJoinTimeoutRequest) (*api.SetJoinTimeoutResponse, error) {
+	if s.LaunchID == "" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"this session has no launch to be changed by name; the request named %q", in.GetLaunchId())
+	}
+	if in.GetLaunchId() != s.LaunchID {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"this socket holds launch %s; the request named %q", s.LaunchID, in.GetLaunchId())
+	}
+	if in.GetTimeoutNanos() < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "a join timeout cannot be negative: %s", time.Duration(in.GetTimeoutNanos()))
+	}
+	if s.OnSetJoinTimeout == nil {
+		return nil, status.Error(codes.Unimplemented, "this session does not take a join timeout")
+	}
+	return s.OnSetJoinTimeout(time.Duration(in.GetTimeoutNanos())), nil
 }

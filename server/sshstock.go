@@ -1,0 +1,531 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/owenthereal/upterm/internal/liveness"
+	"github.com/owenthereal/upterm/upterm"
+	"golang.org/x/crypto/ssh"
+)
+
+// maxSSHRejectTimeout caps delivery of an upstream failure to a peer whose
+// downstream authentication already succeeded. One packet is enough, and a
+// host disconnects as soon as its global request is answered, so the cap only
+// bites when a peer authenticates and then says nothing at all.
+const maxSSHRejectTimeout = 5 * time.Second
+
+// What an authenticated peer may be told about an upstream that would not
+// complete. Each is a fixed string uptermd owns, so no upstream error text is
+// ever relayed: a transport failure reads "read tcp <local>-><node>: i/o
+// timeout" and a dial failure names the session socket path.
+var (
+	errUpstreamUnavailable = errors.New(upterm.UpstreamUnavailable)
+	errUpstreamAuthFailed  = errors.New(upterm.UpstreamAuthFailed)
+	// The next relay node's verdict, which it states in a banner.
+	errUpstreamNoHost       = errors.New(upterm.UpstreamNoHost)
+	errUpstreamLookupFailed = errors.New(upterm.UpstreamLookupFailed)
+	errUpstreamKeyRefused   = errors.New(upterm.UpstreamKeyRefused)
+)
+
+// sshAuthFailure is the message x/crypto composes when no auth method is left
+// (client_auth.go). It carries no addresses, but there is no exported error to
+// match on, so match the text: if it ever drifts the peer is simply told the
+// upstream is unavailable, which is the safe direction to fail in.
+const sshAuthFailure = "unable to authenticate"
+
+// dialError marks an upstream that couldn't be reached at all. Its text can
+// echo the address dialed, which an embedded-mode guest names in its own user,
+// so none of it is ever matched to decide what the peer is told.
+type dialError struct{ err error }
+
+func (e *dialError) Error() string { return e.err.Error() }
+func (e *dialError) Unwrap() error { return e.err }
+
+// upstreamAuthError is an upstream that refused every key offered it, with the
+// banner it sent as it did, if any.
+type upstreamAuthError struct {
+	banner string
+	err    error
+}
+
+func (e *upstreamAuthError) Error() string { return e.err.Error() }
+func (e *upstreamAuthError) Unwrap() error { return e.err }
+
+// verdict is what the peer is told of e: the next relay node's verdict, when
+// its banner states one. Otherwise it is only that authentication failed, which
+// may mean either that the key was refused or that there is no session there.
+func (e *upstreamAuthError) verdict() error {
+	switch {
+	case strings.HasPrefix(e.banner, upterm.BannerNoHostPrefix):
+		return errUpstreamNoHost
+	case e.banner == upterm.BannerLookupFailed:
+		return errUpstreamLookupFailed
+	case e.banner == upterm.HopBannerKeyRefused:
+		return errUpstreamKeyRefused
+	default:
+		return errUpstreamAuthFailed
+	}
+}
+
+// upstreamFailureReason maps an upstream failure onto what the peer is told.
+// It is an allowlist: only outcomes recognized here are named, and everything
+// else — most importantly any transport error, which carries the address of an
+// internal node or socket — becomes the generic reason. A dial failure is
+// generic whatever its text. The detail stays in the connection log either way.
+func upstreamFailureReason(err error) error {
+	var (
+		dial *dialError
+		auth *upstreamAuthError
+	)
+	switch {
+	case errors.As(err, &dial):
+		return errUpstreamUnavailable
+	case errors.Is(err, errUpstreamHostKeyMismatch):
+		return errUpstreamHostKeyMismatch
+	case errors.Is(err, errUpstreamNoHost):
+		return errUpstreamNoHost
+	case errors.As(err, &auth):
+		return auth.verdict()
+	case err != nil && strings.Contains(err.Error(), sshAuthFailure):
+		return errUpstreamAuthFailed
+	default:
+		return errUpstreamUnavailable
+	}
+}
+
+// abortScopeFor decides how far a stalled channel on this connection may
+// escalate, from the same client version the metrics below count. A host's
+// transport carries the reverse tunnel every guest's traffic rides, so a
+// stalled channel on it must never take it down; a guest's transport is that
+// guest's alone. Getting this backwards costs a host's whole session the first
+// time any one guest stops reading, so it is a function with a test rather than
+// a condition inline at the call.
+func abortScopeFor(clientVersion string) sshAbortScope {
+	if clientVersion == upterm.HostSSHClientVersion {
+		return abortChannel
+	}
+	return abortConnection
+}
+
+// isRecoverableAcceptError reports whether Accept is worth retrying. A timeout
+// comes from a deadline set on a wrapped listener; the rest are resource
+// exhaustion, which clears as open connections drain and which taking the
+// daemon down would only make worse. Go reports these as Temporary, but that
+// method is deprecated and ill-defined, so match the errno values directly.
+// Anything else means the listener itself is gone and Serve must return.
+func isRecoverableAcceptError(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ENOBUFS) ||
+		errors.Is(err, syscall.ENOMEM)
+}
+
+func (p *SSHRouting) serveStock(ln net.Listener) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	p.mux.Lock()
+	p.listener, p.cancel = ln, cancel
+	select {
+	case <-p.getDoneChanLocked():
+		cancel()
+	default:
+	}
+	p.mux.Unlock()
+	if ctx.Err() != nil {
+		_ = ln.Close()
+		return ErrListnerClosed
+	}
+	inst := p.instruments
+	if inst == nil {
+		inst = newSSHRoutingInstruments(p.MetricsProvider)
+	}
+	defer p.joinWorkers()
+	defer cancel()
+	var retryDelay time.Duration // how long to sleep on accept failure
+	for {
+		raw, err := ln.Accept()
+		if err != nil {
+			// Shutdown cancels before it closes, so the context check is the
+			// normal way this loop learns it is stopping. The ErrClosed check
+			// covers the rest: a listener closed without going through Shutdown,
+			// by the caller that owned it before Serve did. Accept reports
+			// ErrClosed only for a listener this process has closed, so it is
+			// never a network failure, and letting it fall through would log an
+			// error and charge the error counter for an orderly close.
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return ErrListnerClosed
+			}
+			// A recoverable accept error must not take the whole listener down:
+			// returning here fails the run.Group actor and terminates uptermd.
+			if isRecoverableAcceptError(err) {
+				if retryDelay == 0 {
+					retryDelay = 5 * time.Millisecond
+				} else {
+					retryDelay *= 2
+				}
+				retryDelay = min(retryDelay, maxAcceptRetryDelay)
+				p.logger().Error("tcp: Accept error; retrying", "error", err, "retry_delay", retryDelay)
+				select {
+				case <-time.After(retryDelay):
+				case <-ctx.Done():
+					return ErrListnerClosed
+				}
+				continue
+			}
+			p.logger().Error("failed to accept connection", "error", err)
+			inst.errors.Add(1)
+			return err
+		}
+		retryDelay = 0
+		p.mux.Lock()
+		if ctx.Err() != nil {
+			p.mux.Unlock()
+			_ = raw.Close()
+			return ErrListnerClosed
+		}
+		p.workers.Add(1)
+		p.mux.Unlock()
+		go func() {
+			defer p.workers.Done()
+			start := time.Now()
+			inst.connections.Add(1)
+			inst.activeConnections.Add(1)
+			defer inst.activeConnections.Add(-1)
+			defer func() { inst.connectionDuration.Observe(time.Since(start).Seconds()) }()
+			if err := p.stockConnection(ctx, raw, inst); err != nil {
+				p.logger().Debug("SSH connection ended", "addr", raw.RemoteAddr(), "error", err)
+				var ne net.Error
+				if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+					inst.connectionTimeouts.Add(1)
+				} else {
+					inst.errors.Add(1)
+				}
+			}
+		}()
+	}
+}
+
+func (p *SSHRouting) stockConnection(ctx context.Context, accepted net.Conn, inst *routingInstruments) error {
+	// raw records its reads from the first byte, the handshake's included, for
+	// the node's sshd to judge a host's silence by. See hostActivity.
+	raw := liveness.NewConn(accepted)
+	// guest is the connection's admission, should it be a guest of a relay
+	// with an authority composed. Its end comes last, once all else has let
+	// go.
+	var guest *guestConn
+	if p.Auth.authority != nil {
+		guest = newGuestConn(ctx, raw)
+		defer guest.end()
+	}
+	defer func() { _ = raw.Close() }()
+	stop := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	defer stop()
+	var (
+		// gateAuth and gateKey are a gate hop's, which the gate serves.
+		gateAuth *AuthRequest
+		gateKey  ssh.PublicKey
+		first    *preparedRoute
+		verified ssh.PublicKey
+		// bannerSent is set once a refusal has carried a banner. x/crypto sends
+		// the banner of every refusal that has one, and a guest offers each of
+		// its keys in turn, so without it the same message would arrive once per
+		// key.
+		bannerSent bool
+	)
+	// refuse is err, the refusal of meta's connection, carrying the banner it
+	// earns unless one has already been sent. Both key callbacks refuse through
+	// it: x/crypto sends the banner of either's refusal, and the session can
+	// go, or the store fail, between the key being offered and its signature
+	// being verified.
+	refuse := func(meta ssh.ConnMetadata, err error) error {
+		if bannerSent {
+			return err
+		}
+		sessionID, _, _ := p.Auth.SessionManager.GetEncodeDecoder().Decode(meta.User())
+		if msg := bannerFor(meta, sessionID, err); msg != "" {
+			bannerSent = true
+			return &ssh.BannerError{Err: err, Message: msg}
+		}
+		return err
+	}
+	// A listener that advertises the gate serves a gate hop through it. It
+	// neither resolves nor dials while authenticating one: the gate looks up
+	// this node's own registrations once the hop has named one. With an
+	// authority composed, a guest's admission is the composed path's: a hop
+	// another node starts is told apart first, on any listener.
+	advertises := p.Auth.advertises()
+	composed := p.Auth.authority != nil
+	stage := p.handshakeTimeout() / 2
+	stageDeadline := time.Now().Add(stage)
+	cfg := &ssh.ServerConfig{
+		ServerVersion: serverVersion(advertises),
+		// Authorization only. x/crypto invokes this for unsigned public-key
+		// queries too, and a successful query takes `continue userAuthLoop`
+		// without incrementing authFailures, so MaxAuthTries does not bound it.
+		// Anything expensive here is reachable before any signature is verified.
+		PublicKeyCallback: func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			hop := false
+			if (advertises || composed) && isRelayCertificate(key) {
+				auth, _, isHop, err := p.Auth.authenticate(meta, key)
+				if err != nil {
+					return nil, refuse(meta, err)
+				}
+				if isHop && auth.GateProtocol == 1 && advertises {
+					return &ssh.Permissions{}, nil
+				}
+				hop = isHop
+			}
+			// A guest with an authority composed is the composed path's, and
+			// is asked nothing until it has signed: this only classifies its
+			// user, which may ask the authority whether it claims it.
+			if !hop && p.Auth.composedGuest(meta) {
+				if _, _, err := p.Auth.guestKey(meta, key); err != nil {
+					return nil, err
+				}
+				return &ssh.Permissions{}, nil
+			}
+			if _, _, _, err := p.Auth.authorize(meta, key); err != nil {
+				return nil, refuse(meta, err)
+			}
+			return &ssh.Permissions{}, nil
+		},
+		// Minting upstream credentials costs a certificate signature per
+		// configured signer, so it waits until the client has proven it holds
+		// the key. Running once, after verification, also removes any need to
+		// match credentials back to an offered key after the handshake. The
+		// permissions returned here are the ones the connection keeps.
+		VerifiedPublicKeyCallback: func(meta ssh.ConnMetadata, key ssh.PublicKey, _ *ssh.Permissions, _ string) (*ssh.Permissions, error) {
+			hop := false
+			if (advertises || composed) && isRelayCertificate(key) {
+				auth, original, isHop, err := p.Auth.authenticate(meta, key)
+				if err != nil {
+					return nil, refuse(meta, err)
+				}
+				if isHop && auth.GateProtocol == 1 && advertises {
+					gateAuth, gateKey = auth, original
+					return &ssh.Permissions{Extensions: map[string]string{permHop: ""}}, nil
+				}
+				hop = isHop
+			}
+			// Refused without a banner: a guest the authority did not admit
+			// learns only that its key was refused.
+			if !hop && p.Auth.composedGuest(meta) {
+				if err := p.admitGuest(guest, meta, key, stageDeadline, stage); err != nil {
+					return nil, err
+				}
+				return &ssh.Permissions{}, nil
+			}
+			planned, permissions, err := p.Auth.prepare(meta, key)
+			if err != nil {
+				return nil, refuse(meta, err)
+			}
+			first, verified = planned, key
+			return permissions, nil
+		},
+	}
+	for _, key := range p.HostSigners {
+		cfg.AddHostKey(key)
+	}
+	if err := raw.SetDeadline(stageDeadline); err != nil {
+		return err
+	}
+	// A direct client's source, refused before the banner, with nothing
+	// written. Behind a PROXY listener, RemoteAddr reads the header first, under
+	// the deadline just set, and is its source. The internal listener's peer is
+	// another node, and the bridge's is this one: neither is checked here.
+	if l := p.Auth.listener; l != listenerInternal && l != listenerBridge && p.Auth.deny.any() && p.Auth.deny.denied(raw.RemoteAddr().String()) {
+		return errSourceDenied
+	}
+	downstream, channels, requests, err := ssh.NewServerConn(raw, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = downstream.Close() }()
+	if err := raw.SetDeadline(time.Time{}); err != nil {
+		return err
+	}
+	if gateAuth != nil {
+		return p.serveHopGate(ctx, sshPeer{downstream, channels, requests}, gateAuth, gateKey, stage, inst)
+	}
+	if guest != nil && guest.guest != nil {
+		guest.mu.Lock()
+		guest.authenticated = true
+		guest.mu.Unlock()
+		if guest.admission.Verdict == VerdictAllow && guest.admission.Target.Registration.Authority == AuthorityLocal {
+			defer guest.upstream.Close()
+			// Counted as the stock path counts it: its upstream is up.
+			inst.authenticatedClient.Add(1)
+			return forwardSSH(guest.ctx, sshPeer{downstream, channels, requests}, guest.upstream.sshPeer, abortConnection, inst.stalledChannelAborts, nil)
+		}
+		return p.serveDelegatedGuest(ctx, guest, sshPeer{downstream, channels, requests}, stage, inst)
+	}
+	if first == nil {
+		return fmt.Errorf("missing authenticated upstream credentials")
+	}
+	clientVersion := string(downstream.ClientVersion())
+	// Tracked before the upstream attempt, so that the sshd finds the entry from
+	// the host's first request on. Only a host's silence is ever judged, so a
+	// guest's connection is not recorded.
+	if clientVersion == upterm.HostSSHClientVersion {
+		defer p.hostActivity.track(downstream.SessionID(), raw)()
+	}
+	// How this node words the rejections it sends the client, its own or the
+	// next node's: a sentence for plain ssh, the wire text for join, a host and
+	// relay hops.
+	_, hop := downstream.Permissions.Extensions[permHop]
+	sessionID, _, _ := p.Auth.SessionManager.GetEncodeDecoder().Decode(downstream.User())
+	rewrite := rejectionRewriteFor(clientVersion, hop, sessionID)
+	peer := sshPeer{downstream, channels, requests}
+	upstreamCtx, cancel := context.WithTimeout(ctx, stage)
+	defer cancel()
+	// A guest whose route the store decides was routed from a cache the watch
+	// keeps, which can trail a host's reconnect to another node, so a failed
+	// attempt may be retried once on a refreshed route. Only a route with a
+	// generation above zero can move: a legacy host can't redial, and its lease
+	// keeper rebuilds it on the same node at the same generation. Everyone else
+	// gets one attempt and the whole stage.
+	//
+	// A refreshable route's first attempt gets half the stage, keeping the rest
+	// for the retry, only when it is a hop to another relay node: that
+	// handshake is quick, and a stale route most often points at another node.
+	// A target on this node gets the whole stage. One that stalls is far more
+	// likely a slow host than a stale route, and a stale slot here is closed
+	// within the watch's latency of its supersession, so an attempt on it fails
+	// soon enough to leave the refresh the rest of the stage.
+	refreshable := p.Auth.canRefresh(downstream) && first.route.Generation > 0
+	firstCtx := upstreamCtx
+	if refreshable && first.route.NodeAddr != p.Auth.NodeAddr {
+		var cancelFirst context.CancelFunc
+		firstCtx, cancelFirst = context.WithTimeout(upstreamCtx, stage/2)
+		defer cancelFirst()
+	}
+	upstream, err := p.upstreamAttempt(firstCtx, ctx, first)
+	// A host-key mismatch is an upstream failing to prove who it is, not a
+	// stale route, and is never retried elsewhere.
+	if err != nil && refreshable && !errors.Is(err, errUpstreamHostKeyMismatch) && upstreamCtx.Err() == nil {
+		if next, ok := p.Auth.refresh(upstreamCtx, downstream, verified, first); ok {
+			first = next
+			upstream, err = p.upstreamAttempt(upstreamCtx, ctx, next)
+		}
+	}
+	if err == nil {
+		defer upstream.Close()
+		cancel()
+		if clientVersion == upterm.HostSSHClientVersion {
+			inst.authenticatedHost.Add(1)
+		} else {
+			inst.authenticatedClient.Add(1)
+		}
+		if first.home != nil && !p.Auth.stillHeld(first.home) {
+			return errGateRefused
+		}
+		return forwardSSH(ctx, peer, upstream.sshPeer, abortScopeFor(clientVersion), inst.stalledChannelAborts, rewrite)
+	}
+	// Report the failure on a fresh budget rather than upstreamCtx's: on a dial
+	// or handshake timeout — the most common way to get here — that budget is
+	// already spent, and the peer would be dropped without ever being told why.
+	// Deriving it from stage keeps a short configured timeout short overall.
+	// The helper also answers global requests, including hosts' first request.
+	// The peer learns why the last attempt failed only as far as
+	// upstreamFailureReason recognizes it; a dial failure is always generic,
+	// whatever its text.
+	rejectCtx, rejectCancel := context.WithTimeout(ctx, min(stage, maxSSHRejectTimeout))
+	defer rejectCancel()
+	_ = rejectSSHChannels(rejectCtx, peer, upstreamFailureReason(err), rewrite)
+	return err
+}
+
+// upstreamConn is an upstream whose handshake completed. Close releases it,
+// and stops the watcher that would otherwise close it on shutdown.
+type upstreamConn struct {
+	// gateBusy admits one gate exchange at a time; now, when set, is the
+	// clock the gate's deadlines read; homeNode is the node a gate answer
+	// must name as its home, and home the registration it named.
+	gateBusy atomic.Bool
+	now      func() time.Time
+	homeNode string
+	home     Home
+	sshPeer
+	raw  net.Conn
+	stop func() bool
+}
+
+func (u *upstreamConn) Close() {
+	_ = u.conn.Close()
+	if u.stop != nil {
+		u.stop()
+	}
+	if u.raw != nil {
+		_ = u.raw.Close()
+	}
+}
+
+// upstreamAttempt dials pr's target, and nothing else, and completes the
+// handshake with pr's credentials and host-key policy, all within ctx. A
+// shutdown, which cancels parent, closes the transport at any point, as it
+// does the downstream's. A failed attempt leaves nothing open. An
+// authentication failure carries the banner the target sent with it.
+func (p *SSHRouting) upstreamAttempt(ctx, parent context.Context, pr *preparedRoute) (*upstreamConn, error) {
+	raw, err := p.Auth.ConnDialer.DialContext(ctx, pr.id)
+	if err != nil {
+		return nil, &dialError{err}
+	}
+	stop := context.AfterFunc(parent, func() { _ = raw.Close() })
+	fail := func(err error) (*upstreamConn, error) {
+		stop()
+		_ = raw.Close()
+		return nil, err
+	}
+	deadline, _ := ctx.Deadline()
+	if err := raw.SetDeadline(deadline); err != nil {
+		return fail(err)
+	}
+	conn, channels, requests, err := ssh.NewClientConn(raw, raw.RemoteAddr().String(), pr.config)
+	if err != nil {
+		if strings.Contains(err.Error(), sshAuthFailure) {
+			err = &upstreamAuthError{pr.banner, err}
+		}
+		return fail(err)
+	}
+	if err := raw.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return fail(err)
+	}
+	upstream := &upstreamConn{sshPeer: sshPeer{conn, channels, requests}, raw: raw, stop: stop, homeNode: pr.id.NodeAddr}
+	// A gate hop asks the home which registration it holds, and goes on only
+	// with the local one it names, unless the attempt is a delegated guest's,
+	// whose admission asserts the authority's allow before using the hop. A
+	// home without the token is refused only by a node that refuses legacy
+	// hops. The ingress spoke first, as x/crypto's client always does, so
+	// nothing here waits on the home's banner.
+	if pr.remote && pr.creds.gate {
+		if hasGateCapability(conn.ServerVersion()) {
+			home, err := negotiateHome(ctx, upstream, freshModeRequest(pr.id.Id))
+			if err != nil {
+				return nil, err
+			}
+			if home.Ref().Authority != AuthorityLocal && !pr.delegatedGate {
+				upstream.Close()
+				return nil, errGateRefused
+			}
+		} else if p.Auth.RefuseLegacyHops || p.Auth.AuthorityEnabled {
+			upstream.Close()
+			return nil, errGateRefused
+		}
+	}
+	if pr.home != nil && !p.Auth.stillHeld(pr.home) {
+		upstream.Close()
+		return nil, errGateRefused
+	}
+	return upstream, nil
+}

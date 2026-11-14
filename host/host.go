@@ -1,326 +1,1799 @@
 package host
 
 import (
-	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
+
+	"log/slog"
 
 	"github.com/oklog/run"
 	"github.com/olebedev/emitter"
 	"github.com/owenthereal/upterm/host/api"
+	"github.com/owenthereal/upterm/host/consent"
 	"github.com/owenthereal/upterm/host/internal"
+	"github.com/owenthereal/upterm/host/sessiondir"
+	"github.com/owenthereal/upterm/internal/liveness"
+	"github.com/owenthereal/upterm/internal/registration"
+	"github.com/owenthereal/upterm/internal/termsize"
+	"github.com/owenthereal/upterm/internal/version"
+	"github.com/owenthereal/upterm/server"
 	"github.com/owenthereal/upterm/upterm"
 	"github.com/owenthereal/upterm/utils"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/knownhosts"
+	"google.golang.org/protobuf/proto"
 )
 
-func NewPromptingHostKeyCallback(stdin io.Reader, stdout io.Writer, knownHostsFilename string) (ssh.HostKeyCallback, error) {
-	if err := createFileIfNotExist(knownHostsFilename); err != nil {
-		return nil, err
-	}
-
-	cb, err := knownhosts.New(knownHostsFilename)
+// NewPromptingHostKeyCallback creates a host key callback that asks before
+// accepting an unknown host key.
+//
+// Set proxied when the transport passes through an HTTP proxy. x/crypto hands
+// the callback the socket's peer, which is then the proxy rather than the
+// server, and presenting it as the server's address is misleading — OpenSSH
+// prints a placeholder in the same situation. It is display-only: knownhosts
+// matches on the hostname argument and KnownHosts.Record stores only that, so
+// verification is unaffected either way.
+//
+// It is NewPromptingRelayKeyCheck's check, for a caller that doesn't ask what
+// it trusted.
+func NewPromptingHostKeyCallback(stdin io.Reader, stdout io.Writer, knownHostsFilename string, proxied bool) (ssh.HostKeyCallback, error) {
+	check, err := NewPromptingRelayKeyCheck(stdin, stdout, knownHostsFilename, proxied)
 	if err != nil {
 		return nil, err
 	}
-
-	hkcb := hostKeyCallback{
-		stdin:           stdin,
-		stdout:          stdout,
-		file:            knownHostsFilename,
-		HostKeyCallback: cb,
-	}
-
-	return hkcb.checkHostKey, nil
+	return check.HostKeyCallback, nil
 }
+
+// NewAutoAcceptingHostKeyCallback creates a host key callback that automatically
+// accepts unknown host keys and adds them to the known_hosts file without prompting.
+// This is similar to SSH's StrictHostKeyChecking=accept-new behavior:
+// - Unknown host keys are automatically accepted and added to known_hosts
+// - Known host keys are still validated (preventing MITM attacks on subsequent connections)
+//
+// It takes no proxied flag: its message names the hostname and the key type,
+// never the peer address.
+//
+// It is NewAutoAcceptingRelayKeyCheck's check, for a caller that doesn't ask
+// what it trusted.
+func NewAutoAcceptingHostKeyCallback(stdout io.Writer, knownHostsFilename string) (ssh.HostKeyCallback, error) {
+	check, err := NewAutoAcceptingRelayKeyCheck(stdout, knownHostsFilename)
+	if err != nil {
+		return nil, err
+	}
+	return check.HostKeyCallback, nil
+}
+
+// RelayWarningKind is what a RelayWarning is about.
+type RelayWarningKind int
 
 const (
-	markerCert = "@cert-authority"
-
-	errKeyMismatch = `
-@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
-@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
-Someone could be eavesdropping on you right now (man-in-the-middle attack)!
-It is also possible that a host key has just been changed.
-The fingerprint for the %s key sent by the remote host is
-%s.
-Please contact your system administrator.
-Add correct host key in %s to get rid of this message.
-Offending %s key in %s:%d`
-	errNoAuthoritiesHostname = "ssh: no authorities for hostname"
+	// NoReconnect is a relay that can't take a session back: one that
+	// registers sessions under IDs of its own. If the tunnel drops, guests
+	// can't reach the session again until it is restarted.
+	NoReconnect RelayWarningKind = iota
+	// CertNotValidForServer is a relay whose certificate isn't valid for the
+	// host the session dialled, so a redial, which is pinned to it, would be
+	// refused.
+	CertNotValidForServer
 )
 
-type hostKeyCallback struct {
-	stdin  io.Reader
-	stdout io.Writer
-	file   string
-	ssh.HostKeyCallback
-}
-
-func (cb hostKeyCallback) checkHostKey(hostname string, remote net.Addr, key ssh.PublicKey) error {
-	if err := cb.HostKeyCallback(hostname, remote, key); err != nil {
-		kerr, ok := err.(*knownhosts.KeyError)
-		// Return err if it's neither key error or no authrorities hostname error
-		if !ok && !strings.HasPrefix(err.Error(), errNoAuthoritiesHostname) {
-			return err
-		}
-
-		// If keer.Want is non-empty, there was a mismatch, which can signify a MITM attack
-		if kerr != nil && len(kerr.Want) != 0 {
-			kk := kerr.Want[0] // TODO: take care of multiple key mismatches
-			fp := utils.FingerprintSHA256(kk.Key)
-			kt := keyType(kk.Key.Type())
-			return fmt.Errorf(errKeyMismatch, kt, fp, kk.Filename, kt, kk.Filename, kk.Line)
-		}
-
-		return cb.promptForConfirmation(hostname, remote, key)
-	}
-
-	return nil
-}
-
-func (cb hostKeyCallback) promptForConfirmation(hostname string, remote net.Addr, key ssh.PublicKey) error {
-	cert, isCert := key.(*ssh.Certificate)
-	if isCert {
-		key = cert.SignatureKey
-	}
-
-	fp := utils.FingerprintSHA256(key)
-	fmt.Fprintf(cb.stdout, "The authenticity of host '%s (%s)' can't be established.\n", knownhosts.Normalize(hostname), knownhosts.Normalize(remote.String()))
-	fmt.Fprintf(cb.stdout, "%s key fingerprint is %s.\n", keyType(key.Type()), fp)
-	fmt.Fprintf(cb.stdout, "Are you sure you want to continue connecting (yes/no/[fingerprint])? ")
-
-	reader := bufio.NewReader(cb.stdin)
-	for {
-		confirm, err := reader.ReadString('\n')
-		if err != nil {
-			return err
-		}
-
-		confirm = strings.TrimSpace(confirm)
-
-		if confirm == "yes" || confirm == fp {
-			return cb.appendHostLine(isCert, hostname, remote.String(), key)
-		}
-
-		if confirm == "no" {
-			return fmt.Errorf("Host key verification failed.")
-		}
-
-		fmt.Fprintf(cb.stdout, "Please type 'yes', 'no' or the fingerprint: ")
-	}
-}
-
-func (cb hostKeyCallback) appendHostLine(isCert bool, hostname, remote string, key ssh.PublicKey) error {
-	f, err := os.OpenFile(cb.file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// hostname and remote can be both IPs
-	addr := []string{hostname}
-	if hostname != remote {
-		addr = append(addr, remote)
-	}
-
-	line := knownhosts.Line(addr, key)
-
-	if isCert {
-		line = fmt.Sprintf("%s %s", markerCert, line)
-	}
-
-	if _, err := f.WriteString(line + "\n"); err != nil {
-		return err
-	}
-
-	return nil
+// RelayWarning is what RelayWarningCallback is told.
+type RelayWarning struct {
+	Kind RelayWarningKind
+	// Host is the hostname the certificate isn't valid for, for
+	// CertNotValidForServer; empty otherwise.
+	Host string
 }
 
 type Host struct {
-	Host                   string
-	KeepAliveDuration      time.Duration
-	Command                []string
-	ForceCommand           []string
-	Signers                []ssh.Signer
-	HostKeyCallback        ssh.HostKeyCallback
-	AuthorizedKeys         []ssh.PublicKey
-	AdminSocketFile        string
-	SessionCreatedCallback func(*api.GetSessionResponse) error
-	ClientJoinedCallback   func(*api.Client)
-	ClientLeftCallback     func(*api.Client)
-	Logger                 log.FieldLogger
-	Stdin                  *os.File
-	Stdout                 *os.File
-	ReadOnly               bool
+	Host string
+	// KeepAliveDuration paces the guest sshd's keepalive to each guest. The
+	// tunnel's own liveness is Reconnect's.
+	KeepAliveDuration time.Duration
+	Command           []string
+	ForceCommand      []string
+	LoginCommand      []string
+	// CommandDir fixes guest working directories for this run. Empty captures cwd at Run entry.
+	CommandDir   string
+	AcceptExec   bool
+	ExecDisabled bool
+	Signers      []ssh.Signer
+	// IdentitiesOnly says Signers is the whole identity set, as --private-key
+	// makes it: a redial never offers the session key ahead of it.
+	IdentitiesOnly bool
+	// Reconnect paces the tunnel's liveness and its redials. A field left zero
+	// takes its default.
+	Reconnect ReconnectTiming
+	// HostKey is the key the embedded sshd presents on both its doors and
+	// the key the relay is told to expect from this host. A session's key,
+	// not the operator's: Signers authenticate the tunnel and are used for
+	// nothing else. Left nil, Run generates one for that run and does not
+	// keep it, so a Host run twice presents two keys; a caller that needs
+	// the public half before Run — the CLI, to pin its own attach — sets it
+	// and it is used as given.
+	HostKey         ssh.Signer
+	HostKeyCallback ssh.HostKeyCallback
+	// RelayKeyTrusted, when set, says which relay key HostKeyCallback
+	// trusted, and how: a RelayKeyCheck's Trusted, with its HostKeyCallback
+	// as HostKeyCallback. Run asks it once the first connection is up, and
+	// the session reports the answer (relay_known_hosts, relay_key_trust),
+	// for guests who pin the relay as this host did. Nil reports nothing: a
+	// Host can't tell how a callback it was handed decided.
+	RelayKeyTrusted            func() (TrustedRelayKey, bool)
+	AuthorizedKeys             []*AuthorizedKey
+	AdminSocketFile            string
+	SessionCreatedCallback     func(context.Context, *api.GetSessionResponse) error
+	ClientJoinedCallback       func(*api.Client)
+	ClientLeftCallback         func(*api.Client)
+	Logger                     *slog.Logger
+	ReadOnly                   bool
+	AllowLocalTCPForwarding    bool
+	AllowLoopbackTCPForwarding bool
+	ForwardingDisabled         bool
+	// TunnelCallback is told when the tunnel to the relay is lost, and when
+	// it is back. It is called on a goroutine of the host's own, one event at
+	// a time and in the order they happened, so a callback that takes a while
+	// delays only the events behind it, not the redial. Of the events that
+	// happen while it is still busy with one, only the latest is kept: it says
+	// where things stand.
+	TunnelCallback func(TunnelEvent)
+	// HideClientIP keeps a guest's address out of its forced command's
+	// SSH_CONNECTION and SSH_CLIENT.
+	HideClientIP bool
+	// LogPath is where Logger's records are written, which a guest whose
+	// command couldn't start is told to have the host look in. Empty names
+	// none.
+	LogPath string
+	// AutoAccept says the session was started without anyone confirming it
+	// (--accept). With no AuthorizedKeys as well, it is open: anyone with
+	// the session ID can join, and nobody was asked. GetSessionResponse.open
+	// reports that; it changes nothing about who may join. It grants what
+	// SFTPAutoAccept does, too.
+	AutoAccept bool
+	// SFTPAutoAccept lets guests' file transfers run without approval
+	// (--allow-sftp), once the hard policy has passed them: SFTPDisabled
+	// still turns them off, and ReadOnly still refuses all but downloads.
+	SFTPAutoAccept bool
+	// FileTransferApprovalRequired says each guest file transfer waits for
+	// the primary host terminal (no --allow-sftp, which --accept and
+	// --full-access include). The daemon sets it alongside TerminalConsent.
+	// It is reported to readers of the session and changes nothing about
+	// what is allowed.
+	FileTransferApprovalRequired bool
+	// ProxyURL, when non-nil, routes the connection to the upterm server
+	// through an HTTP proxy.
+	ProxyURL   *url.URL
+	PtySize    termsize.Size
+	PinPtySize bool
+	Term       string
+
+	// AttachSocketFile is where the local attach door is bound. Like
+	// AdminSocketFile, supplying it means the caller manages the path and
+	// no name is claimed; left empty with AdminSocketFile set, no attach
+	// door is served, which is how an embedder that will never attach a
+	// terminal says so. Claimed with the name otherwise.
+	AttachSocketFile string
+	// AttachListeningCallback is called once the attach socket is bound,
+	// before the command starts, with the path a client should dial. With
+	// AwaitInitialClient set, this is the moment to attach.
+	//
+	// Called on Run's own goroutine, before the run.Group exists, so it must
+	// not block: everything after it — the command, the guest door, the
+	// readiness record — waits behind it.
+	AttachListeningCallback func(attachSocket string)
+	// CommandStartedCallback is called once the hosted command is running,
+	// which with AwaitInitialClient is also the news that a client got
+	// through the door. A caller whose own attach failed asks this whether
+	// there is a session to leave alone.
+	//
+	// Called on the server's own goroutine, in front of everything the
+	// command's start releases, so it must not block.
+	CommandStartedCallback func()
+	// SessionReadyCallback is called once the session's record has been
+	// published: the admin socket is bound, the command is running, and the
+	// record a reader would consult already carries the session ID and the
+	// status handed to this callback. A caller that tells anyone else the
+	// session is up says it here, not from CommandStartedCallback — the
+	// command starting is one of the two facts readiness is made of, and the
+	// record is written after both. A script that runs `upterm session info`
+	// the instant it is told "ready" would otherwise be told "starting" by
+	// the record.
+	//
+	// The status is the one the record was written with, which is ready
+	// unless the tunnel is down by then: reconnecting while the host redials
+	// it, or disconnected on a relay that cannot take the session back. The
+	// caller is told what the record says rather than assuming ready, because
+	// the two agreeing is the whole point of the callback.
+	//
+	// Not called when the record could not be published: the run fails
+	// instead, so that nobody is told about a record that was never written.
+	// With no session directory — an embedder that supplied its own admin
+	// socket — there is no record, and the status is the one the session's
+	// facts give.
+	//
+	// Called once, on the readiness actor's own goroutine, after the write;
+	// it must not block.
+	SessionReadyCallback func(status string)
+	// SessionClaimedCallback is called once the session's name is claimed,
+	// with the directory that holds it, before the tunnel is dialled: the
+	// first thing a caller can know about a session is its name and its
+	// paths, and a caller that relays prompts wants them before any prompt.
+	// Not called when AdminSocketFile was supplied, since nothing is claimed.
+	//
+	// Called on Run's own goroutine; it must not block.
+	SessionClaimedCallback func(*sessiondir.Dir)
+	// VersionWarningCallback is called when the server's version is
+	// incompatible with this host's. Nil logs the mismatch and nothing more:
+	// the daemon has no terminal to print to.
+	VersionWarningCallback func(*version.CompatibilityResult)
+	// RelayWarningCallback is called with what the first connection showed
+	// about the relay that will matter if the tunnel drops: that it can't
+	// take the session back, or that its certificate doesn't name the host a
+	// redial would dial. Nil logs it and nothing more, as for
+	// VersionWarningCallback.
+	//
+	// Called at most once, on Run's own goroutine, after
+	// VersionWarningCallback and before SessionCreatedCallback, so whoever
+	// prints it prints it ahead of the session; it must not block.
+	RelayWarningCallback func(RelayWarning)
+
+	// AwaitInitialClient defers starting the command until the first host
+	// client's output subscription is installed, and defers serving guests
+	// until the command has started. Foreground use sets it: a command that
+	// exits at once — `upterm host -- false` — would otherwise race the local
+	// terminal's attach, and lose. Headless use leaves it off.
+	AwaitInitialClient bool
+	// InitialClientTimeout bounds that wait; zero means
+	// internal.DefaultInitialClientTimeout.
+	InitialClientTimeout time.Duration
+
+	// StopGrace bounds each step of the command's teardown; zero means
+	// internal.DefaultStopGrace.
+	StopGrace time.Duration
+
+	// JoinTimeout bounds the wait for the first guest, starting at readiness.
+	// Zero waits forever. A running session's timeout can be replaced or
+	// disabled over the admin socket (`upterm session set`); each replacement
+	// counts from when it is made. The session enforces it independently of its
+	// launcher; a guest joining disarms it permanently, even after that guest
+	// leaves.
+	JoinTimeout time.Duration
+
+	// joinClock is the clock each Run's join state reads and arms its
+	// timeout on. A per-Host test hook, so a test can fire the timeout
+	// itself; zero is the real clock.
+	joinClock joinClock
+	// onJoinDeadlineFired is a per-Host test barrier for a late losing deadline.
+	onJoinDeadlineFired func(stop <-chan struct{})
+	// onStatus, if set, is called after each of a run's status-bearing
+	// transitions -- setting the phase, or the tunnel up, reconnecting or
+	// lost -- once the state's lock is released. A transition may leave
+	// Status as it was. A wakeup, not a history: concurrent writers can call
+	// it in either order, and a later transition can come before an earlier
+	// call. A per-Host test hook, set before Run and called on the writer's
+	// goroutine; it must not block.
+	onStatus func()
+	// onRecord, if set, is called once one of the run's status writes has
+	// succeeded -- the ready write, the supervisor's tunnel writes (lost,
+	// reconnecting, back up), the ending write, or the final record -- with
+	// the status that write carried. The claim's starting write, the join
+	// timeout's writes, the first guest join's write and the host-keys write
+	// are not among them. A wakeup, as onStatus is: by the time it runs, a
+	// later write may have replaced that status. A per-Host test hook, set
+	// before Run and called on the writer's goroutine, teardown's included;
+	// it must not block. A host with no record never calls it.
+	onRecord func(status string)
+	// onJoinPublish is a per-Host test barrier run before each join-timeout
+	// record write: blocking in it holds the write, and an error skips it as
+	// a failed write.
+	onJoinPublish func() error
+	// onReadyPublish is a per-Host test barrier run before the ready record
+	// write: an error skips it as a failed write.
+	onReadyPublish func() error
+	// beforeReadyPublish is a per-Host test barrier run before the ready
+	// record write, with the run's state: a test that needs the tunnel down
+	// by the time of that write takes it down here.
+	beforeReadyPublish func(*sessionState)
+	// afterEndingPublish is a per-Host test barrier run once teardown has
+	// begun and the record has been told so: blocking in it holds Run open
+	// with that write behind it.
+	afterEndingPublish func()
+	// wrapAttachListener, if set, wraps the attach socket's listener once it
+	// is bound. A per-Host test hook: a test that plays the daemon's exit
+	// closes every connection the listener accepted.
+	wrapAttachListener func(net.Listener) net.Listener
+	// joins is the running session's join state, for JoinState. Set by Run
+	// before any actor starts and cleared on its way out, so a callback Run
+	// makes reads it without a lock of its own.
+	joins *joinState
+	// state is the running session's facts, for Status. Set by Run before
+	// any actor starts and cleared on its way out. Atomic, unlike joins,
+	// because Status is asked from any goroutine, not only from Run's
+	// callbacks.
+	state atomic.Pointer[sessionState]
+
+	// SFTP configuration
+	SFTPDisabled bool // Disable SFTP subsystem entirely (--no-sftp)
+	// PermissionChecker supplies custom consent policy. Nil denies ungranted operations.
+	PermissionChecker consent.PermissionChecker
+	// TerminalConsent selects consent on the primary local terminal; mutually exclusive with PermissionChecker.
+	TerminalConsent bool
+
+	// Name is the session's local name. It determines the socket paths, so
+	// they are known before the server is ever contacted. It is unrelated to
+	// the server-assigned session ID in the connect string.
+	//
+	// Ignored when AdminSocketFile is set: supplying a socket is how a caller
+	// says it is managing the paths itself, so Run claims no name and there is
+	// nothing for this to name. SessionDir stays nil in that case, and no
+	// record is published.
+	Name string
+
+	// ClaimTimeout bounds how long Run waits for the session registry when it
+	// claims its name. Zero uses the package's ClaimTimeout; any other value is
+	// used as it is, so zero or less than zero in the package's, or less than
+	// zero here, gives the claim no time to wait for a held registry lock.
+	ClaimTimeout time.Duration
+
+	// SessionDir is claimed by Run and readable for as long as Run is
+	// running. Run clears it on the way out: the directory is released by
+	// then, a released Dir may not be touched again, and leaving it here
+	// would be leaving a handle to a name that now belongs to whoever claimed
+	// it next. Nil when AdminSocketFile was supplied, which is how tests
+	// drive Host without taking a name.
+	SessionDir *sessiondir.Dir
+
+	// NameGenerated says the caller drew Name rather than being given it,
+	// which the Broker is told.
+	NameGenerated bool
+
+	// Broker, when set, makes the run a delegated session: one whose
+	// registration, and whose guests, an external authority decides. Run
+	// calls its Place once, after the name is claimed and before anything is
+	// dialled, and the run registers only with the relay the placement names,
+	// trusting only the relay keys it lists, on the first connection and on
+	// every redial alike: Host, HostKeyCallback and ProxyURL are not
+	// consulted, and nothing prompts or reads known_hosts. An error from
+	// Place ends the run with that error before any command is launched.
+	// The authority decides who joins, so a delegated run takes no
+	// AuthorizedKeys: Run refuses the two together before it does anything.
+	//
+	// The relay then decides the registration, and Run follows what the
+	// authority decided: a session stopped or withdrawn before its command
+	// started launches nothing; one stopped later is stopped as `session
+	// stop` stops it; one withdrawn later goes on running locally, with its
+	// admin and attach sockets, and guests can't reach it through the relay
+	// any more. Run tells the relay once the session is ready, and the
+	// command's exit when it has one to tell. Called on Run's own goroutine.
+	Broker Broker
+	// DecisionCallback, if set, is told once when the authority stops or
+	// withdraws a delegated session whose command has been let start, once the
+	// session has acted on it and the record says so. Called on a goroutine
+	// of the host's own; it must not block, since the session's end waits
+	// for it.
+	DecisionCallback func(Decision)
+	// onStopRequested is a per-Host test hook run when the session's stop is
+	// requested, whoever requests it, before the request is acted on.
+	onStopRequested func()
+	// atLaunch is a per-Host test barrier run immediately before a delegated
+	// run's command starts, once it has been let start: blocking in it holds
+	// the command back with that settled.
+	atLaunch func()
 }
 
-func (c *Host) Run(ctx context.Context) error {
-	rand.Seed(time.Now().UTC().UnixNano())
+// ErrSessionAbandoned marks a session given up before its command started, as
+// opposed to one that failed to start. A SessionCreatedCallback error that
+// wraps it is recorded as startup_abandoned rather than startup_failed.
+//
+// Declining the interactive confirmation is the case it exists for: the
+// operator was shown the session and said no, nothing went wrong, and a
+// record saying otherwise sends whoever reads it looking for a fault that
+// never happened.
+var ErrSessionAbandoned = errors.New("session abandoned before the command started")
 
-	u, err := url.Parse(c.Host)
+// ErrNoInitialClient is what a host told to await its initial client returns
+// when nobody attached in time. Nothing ran, so it is recorded as
+// startup_abandoned rather than a failure.
+var ErrNoInitialClient = internal.ErrNoInitialClient
+
+// errJoinTimeout requests group teardown; Run maps this winning outcome to success.
+var errJoinTimeout = internal.ErrJoinTimeout
+
+// errSessionStopped retains the cancellation contract for Host.Run callers.
+var errSessionStopped = internal.ErrSessionStopped
+
+// errReadyUnpublished marks a run ended because its readiness could not be
+// published. The command is running by then, so it is teardown that stops
+// it, and what that does to the command is not the command's own ending: the
+// session never became ready, and is recorded as startup_failed.
+var errReadyUnpublished = errors.New("failed to publish the session as ready")
+
+type hostSignalError struct{ signal syscall.Signal }
+
+func (e hostSignalError) Error() string { return fmt.Sprintf("received signal %s", e.signal) }
+
+// ShutdownSignal is the signal, for the session's clients to be told.
+func (e hostSignalError) ShutdownSignal() syscall.Signal { return e.signal }
+
+// abandonedBy reports whether ctx was cancelled because the process that
+// started the session went away: a cancellation whose cause is
+// ErrSessionAbandoned. Nothing failed and nothing was asked to stop; the
+// record must say so.
+func abandonedBy(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), ErrSessionAbandoned)
+}
+
+// readinessEstablished waits for the two facts readiness is made of — the
+// admin socket bound and the command started — and reports whether both were
+// established. A teardown that beats them to it is a "no"; a teardown that
+// merely coincides with them is not.
+//
+// That distinction is the whole of this function. Go picks between two ready
+// cases at random, and both are ready whenever a command starts and ends
+// before this actor is scheduled again — `upterm host --detach -- true` is
+// the whole of that window. Left to the coin, half of those runs published
+// the record and told the parent "started", and half returned here, so the
+// parent saw the channel close instead and reported "the session daemon
+// exited before reporting whether it started" — for a session whose command
+// had run to completion. --detach's contract is that it exits 0 once the
+// command is running, and a command that started and exited did run; what
+// became of it is the record's to say, and the status carried in Started is
+// what the parent prints. A script cannot branch on a coin, so an
+// established fact wins and the scheduler decides nothing.
+//
+// The non-blocking re-check on each teardown branch is what makes that so
+// rather than merely likely: whichever case the select picks, a fact that is
+// established is still established.
+//
+// A fact that is genuinely not established is still a "no", and that is why
+// this waits on the pair rather than assuming them: a command that could not
+// start never closes cmdReady — exec reports that failure to Start, so
+// OnCommandStarted is never reached — and nothing is published for it.
+func readinessEstablished(adminReady, cmdReady, ready <-chan struct{}) bool {
+	select {
+	case <-adminReady:
+	case <-ready:
+		if !closed(adminReady) {
+			return false
+		}
+	}
+	select {
+	case <-cmdReady:
+	case <-ready:
+		if !closed(cmdReady) {
+			return false
+		}
+	}
+	return true
+}
+
+// closed reports whether a done-style channel has been closed, without waiting.
+func closed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// commandSafeRe is what the relay's session ID, and its SSH user when it
+// sends one, must be for upterm to put them in a command: a letter or digit
+// first, so that ssh, scp and sftp can't read the word as an option, then
+// letters, digits and "._+=:-" and nothing else. So no whitespace, quote
+// mark, '$', '`', ';', '%' or anything outside ASCII, and no '~': in an
+// unquoted argument such as x=~:y@host, as the ssh, scp and sftp lines would
+// write that user, bash, and zsh with MAGIC_EQUAL_SUBST, expand it to a home
+// directory after the '=' and after the ':'. What real relays answer fits:
+// their session IDs, and an embedded relay's ID:base64url(node) with its '='
+// padding.
+var commandSafeRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+=:-]*$`)
+
+// commandSafe reports whether upterm will put the relay's answer into the
+// commands people paste into a shell: the banner's ssh, scp, sftp and upterm
+// join lines, and the JSON that carries the ssh and join lines. They are
+// built from the session ID and the SSH user, and the relay chooses both. An
+// empty user is how an older relay answers; the CLI then builds
+// ID:base64url(node), which stays inside the same characters.
+func commandSafe(resp *server.CreateSessionResponse) bool {
+	return commandSafeRe.MatchString(resp.SessionID) &&
+		(resp.SshUser == "" || commandSafeRe.MatchString(resp.SshUser))
+}
+
+// guestJoinLatch publishes the first guest join into the record. A
+// successful publication is attempted once; a failed publication is retried
+// on a later guest, carrying the first join's time, which disarm returns.
+//
+// disarm is the join state's join, and runs before the record write, not
+// after: the in-memory state is what enforces the timeout, and making it wait
+// on a filesystem write would let a slow disk expire a timeout a guest had
+// already answered. A late join -- one registered after the timeout
+// committed -- is not published: the session is ending for want of a guest,
+// and a record claiming one beside join_timeout would say both.
+//
+// A publication failure is logged by the caller, never swallowed silently:
+// a reader that asks "has anyone ever joined?" and is told "no" for a
+// session somebody is sitting in will stop it. The in-memory state still
+// holds, so this process's own deadline is safe either way -- it is the
+// external reader that loses.
+type guestJoinLatch struct {
+	update    func(func(*sessiondir.Record)) error
+	disarm    func() (joinedAt time.Time, late bool)
+	published bool
+}
+
+// Emit is asynchronous, so a short session's left may reach the consumer
+// before its joined. This state reconciles both topics in one actor.
+type clientLifecycle struct {
+	repo *internal.ClientRepo
+	// pendingLeft holds the departures that arrived before their joins, each
+	// with the final snapshot its left carried, if any.
+	pendingLeft map[string]*api.Client
+	onGuestJoin func(*api.Client) error
+	onJoined    func(*api.Client)
+	onLeft      func(*api.Client)
+	logger      *slog.Logger
+	recordPath  string
+}
+
+func (l *clientLifecycle) joined(client *api.Client, qualifiesAsGuestJoin bool) {
+	_ = l.repo.Add(client)
+	if l.logger != nil {
+		l.logger.Info("Client joined", "client", client.Addr)
+	}
+	if qualifiesAsGuestJoin && l.onGuestJoin != nil {
+		if err := l.onGuestJoin(client); err != nil && l.logger != nil {
+			l.logger.Error("failed to publish the first guest join; readers may stop this session as unjoined",
+				"record", l.recordPath, "error", err)
+		}
+	}
+	if l.onJoined != nil {
+		l.onJoined(client)
+	}
+	if final, left := l.pendingLeft[client.Id]; left {
+		delete(l.pendingLeft, client.Id)
+		l.left(client.Id, final)
+	}
+}
+
+// left removes the client and reports it gone. final, when not nil, is the
+// client as it was when it left, which the callback is handed in place of the
+// join's snapshot: a jump's destinations grow after it joins.
+func (l *clientLifecycle) left(id string, final *api.Client) {
+	client := l.repo.Get(id)
+	if client == nil {
+		l.pendingLeft[id] = final
+		return
+	}
+	if final != nil {
+		client = final
+	}
+	if l.logger != nil {
+		l.logger.Info("Client left", "client", client.Addr)
+	}
+	l.repo.Delete(id)
+	if l.onLeft != nil {
+		l.onLeft(client)
+	}
+}
+
+func (l *guestJoinLatch) note(client *api.Client) error {
+	if client.GetKind() != api.Client_GUEST {
+		return nil
+	}
+	joinedAt, late := l.disarm()
+	if late || l.published {
+		return nil
+	}
+	err := l.update(func(r *sessiondir.Record) {
+		if r.FirstGuestJoinedAt.IsZero() {
+			r.FirstGuestJoinedAt = joinedAt
+		}
+		// Joining claims the session for good, so no join timeout applies
+		// any more, and the record must not keep advertising one beside it.
+		r.JoinTimeout = 0
+		r.JoinDeadline = time.Time{}
+	})
+	if err == nil {
+		l.published = true
+	}
+	return err
+}
+
+// ClaimTimeout bounds how long Run waits for the session registry when it
+// takes a name, for a Host whose own ClaimTimeout is zero.
+//
+// Claim waits on two lock files, either of which can be held by a process that
+// is stopped rather than slow — a wait no amount of patience resolves. The
+// caller's context is not a bound in practice: the CLI runs Run on
+// context.Background(), so without this a stuck registry hangs `upterm host`
+// at startup forever while every read path already gives up after
+// sessionQueryTimeout. Ten seconds matches those read paths, since they wait
+// on the same locks.
+//
+// A var, not a const, so that an embedder on a slower filesystem can set it
+// as startup configuration.
+//
+// Deprecated: set Host.ClaimTimeout. As a default it is startup
+// configuration: set it before running any host.
+var ClaimTimeout = 10 * time.Second
+
+// claimTimeout is the bound for this Run: the field, or else the package's.
+func (c *Host) claimTimeout() time.Duration {
+	if c.ClaimTimeout != 0 {
+		return c.ClaimTimeout
+	}
+	return ClaimTimeout
+}
+
+// Run hosts one session and returns when it ends.
+//
+// It may be called again afterwards: everything Run claims, it gives back
+// before returning, including the two fields it fills in on the Host itself.
+// A caller that supplied AdminSocketFile keeps it across runs, since managing
+// the path is what supplying it means.
+func (c *Host) Run(ctx context.Context) (runErr error) {
+	// An empty command is no command, as the guest door reads one.
+	if len(c.LoginCommand) > 0 && len(c.ForceCommand) > 0 {
+		return errors.New("LoginCommand and ForceCommand are mutually exclusive")
+	}
+	for _, argv := range [][]string{c.LoginCommand, c.ForceCommand} {
+		if len(argv) > 0 && strings.TrimSpace(argv[0]) == "" {
+			return errors.New("guest command must name an executable")
+		}
+	}
+	commandDir, err := filepath.Abs(c.CommandDir)
 	if err != nil {
-		return fmt.Errorf("error parsing host url: %s", err)
+		return fmt.Errorf("guest command directory: %w", err)
+	}
+	if c.TerminalConsent && c.PermissionChecker != nil {
+		return errors.New("TerminalConsent and PermissionChecker are mutually exclusive")
+	}
+	// Refused here, before a name is claimed or the run is placed, rather
+	// than by the registration once both have happened.
+	if c.Broker != nil && len(c.AuthorizedKeys) > 0 {
+		return errors.New("a delegated run takes no authorized keys: its authority decides who joins")
+	}
+	// First, before anything here can write a byte. Whatever a
+	// SessionCreatedCallback prints, and whatever a VersionWarningCallback or
+	// a RelayWarningCallback prints, goes out well before the signal actor is
+	// assembled, and for an embedder whose reader has gone away a single one
+	// of those writes is fatal. See InstallSignalPolicy; calling it again from
+	// setupSignalHandler is free.
+	InstallSignalPolicy()
+
+	// Admin stop has its own cause; external parent cancellation remains distinct.
+	ctx, cancelRun := context.WithCancelCause(ctx)
+	defer cancelRun(nil)
+	requestStop := func() {
+		if c.onStopRequested != nil {
+			c.onStopRequested()
+		}
+		cancelRun(errSessionStopped)
 	}
 
-	if c.Stdin == nil {
-		c.Stdin = os.Stdin
-	}
-	if c.Stdout == nil {
-		c.Stdout = os.Stdout
+	// The session's two facts, and every status the record carries is derived
+	// from them. On the Host for Status from Run's entry, so that a caller
+	// polling for "" to learn Run has ended doesn't mistake the name claim for
+	// the end. Registered ahead of the final record write, which reads it, so
+	// it is cleared after that write.
+	state := &sessionState{onChange: c.onStatus}
+	c.state.Store(state)
+	defer c.state.Store(nil)
+
+	// A delegated run dials the relay its placement names, and never this one.
+	u := &url.URL{}
+	if c.Broker == nil {
+		if u, err = url.Parse(c.Host); err != nil {
+			return fmt.Errorf("error parsing host url: %s", err)
+		}
+		// A ws:// or wss:// URL without a port gets its scheme's, as `upterm
+		// host` gives it. Whatever checks the relay's key is handed host:port
+		// -- the host key callback, and the check a redial is pinned with,
+		// which refuses a bare hostname -- and so is the session's Host. ws
+		// drops a default port from the URL it dials, so nothing on the wire
+		// changes.
+		if u.Port() == "" {
+			switch u.Scheme {
+			case "ws":
+				u.Host += ":80"
+			case "wss":
+				u.Host += ":443"
+			}
+		}
 	}
 
-	logger := c.Logger.WithField("server", u)
-
-	logger.Info("Etablishing reverse tunnel")
-	rt := internal.ReverseTunnel{
-		Host:              u,
-		Signers:           c.Signers,
-		HostKeyCallback:   c.HostKeyCallback,
-		AuthorizedKeys:    c.AuthorizedKeys,
-		KeepAliveDuration: c.KeepAliveDuration,
-		Logger:            c.Logger.WithField("com", "reverse-tunnel"),
+	// This run's key. Never written back: a Host is reusable, and a key
+	// that survived into a second run would make "per run" false.
+	hostKey := c.HostKey
+	if hostKey == nil {
+		key, err := NewHostKey()
+		if err != nil {
+			return fmt.Errorf("error generating host key: %w", err)
+		}
+		hostKey = key
 	}
-	sessResp, err := rt.Establish(ctx)
+	// This run's secret, which with the key proves to the relay that a redial
+	// is this session's. Like the key, it lives in memory only, and only for
+	// this run.
+	secret, err := registration.NewSecret()
 	if err != nil {
-		return err
+		return fmt.Errorf("error generating the session secret: %w", err)
 	}
-	defer rt.Close()
+
+	var aks []ssh.PublicKey
+	for _, ak := range c.AuthorizedKeys {
+		aks = append(aks, ak.PublicKeys...)
+	}
+
+	// Whether this run took the name, as opposed to being handed a socket to
+	// use. Only the run that claimed it may give it back.
+	var claimedDir bool
 
 	if c.AdminSocketFile == "" {
-		dir, err := utils.CreateUptermDir()
+		runtimeDir, err := utils.CreateUptermRuntimeDir()
 		if err != nil {
 			return err
 		}
 
-		c.AdminSocketFile = filepath.Join(dir, AdminSocketFile(sessResp.SessionID))
+		// Bounded by the claim timeout rather than by ctx, which for the CLI
+		// never ends. Cancelled as soon as Claim returns: the claim it produces
+		// outlives this call and must not be tied to a context that is about
+		// to expire.
+		claimCtx, cancelClaim := context.WithTimeout(ctx, c.claimTimeout())
+		dir, err := sessiondir.Claim(claimCtx, sessiondir.ClaimOptions{
+			RuntimeRoot:  runtimeDir,
+			StateRoot:    utils.UptermStateDir(),
+			Name:         c.Name,
+			Command:      c.Command,
+			ForceCommand: c.ForceCommand,
+			LoginCommand: c.LoginCommand,
+		})
+		cancelClaim()
+		if err != nil {
+			return err
+		}
+		c.SessionDir = dir
+		c.AdminSocketFile = dir.AdminSocket()
+		c.AttachSocketFile = dir.AttachSocket()
+		claimedDir = true
 
-		defer os.Remove(c.AdminSocketFile)
+		if c.SessionClaimedCallback != nil {
+			c.SessionClaimedCallback(dir)
+		}
 	}
 
-	logger = logger.WithField("session", sessResp.SessionID)
+	var (
+		sessionID       string
+		runReason       = sessiondir.ReasonStartupFailed
+		runExitCode     *int
+		runSignal       string
+		runSignalNumber *int
+	)
+
+	joins := newJoinState(c.JoinTimeout, c.joinClock)
+	// On the Host for JoinState, before anything that could ask runs. Cleared
+	// on the way out for SessionDir's reason: a Host between runs has no
+	// session to answer for.
+	c.joins = joins
+	defer func() { c.joins = nil }()
+
+	if c.SessionDir != nil {
+		dir := c.SessionDir
+		// c.Logger, not the enriched logger built below: this is registered
+		// before that one exists, deliberately, so that it also covers the
+		// early returns between here and there.
+		logger := c.Logger
+		// Registered here so it runs however Run exits, including the early
+		// returns below. It closes over the variables rather than their values,
+		// which is why they are declared above rather than beside it.
+		defer func() {
+			releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancelRelease()
+
+			// Neither failure can be returned — Run's error belongs to the
+			// session, not to its bookkeeping — and neither may be silent.
+			// A record that was not published means `session info` reports the
+			// wrong outcome for this run, and a directory that was not released
+			// means the name stays taken until something reaps it. Both are
+			// invisible from outside the process without a line here.
+			//
+			// Early returns have no group winner. Only a returned cancellation
+			// may change startup_failed; a coincident cancellation cannot hide
+			// a genuine startup error.
+			if runReason == sessiondir.ReasonStartupFailed && ctx.Err() != nil && errors.Is(runErr, ctx.Err()) {
+				runReason = sessiondir.ReasonCanceled
+				if abandonedBy(ctx) {
+					runReason = sessiondir.ReasonStartupAbandoned
+				}
+			}
+
+			state.setPhase(phaseEnding)
+			if err := c.updateRecord(dir, func(r *sessiondir.Record) {
+				r.SessionID = sessionID
+				r.FinishedAt = time.Now().UTC()
+				state.apply(r)
+				r.Reason = runReason
+				r.ExitCode = runExitCode
+				r.Signal = runSignal
+				r.SignalNumber = runSignalNumber
+			}); err != nil {
+				logger.Warn("failed to publish final session record", "error", err)
+			}
+			if err := dir.Release(releaseCtx); err != nil {
+				logger.Warn("failed to release session directory", "error", err)
+			}
+
+			// Run's own bookkeeping, undone. Left in place, a second Run on
+			// this Host would skip the claim above and spend the whole session
+			// updating and finally releasing a Dir that is already released —
+			// and the name is free the instant Release returns, so those
+			// writes would land on a successor's record and that release would
+			// delete a live successor's runtime directory. The socket path is
+			// only cleared if this run was the one that derived it; a caller
+			// that supplied its own keeps it.
+			c.SessionDir = nil
+			if claimedDir {
+				c.AdminSocketFile = ""
+				c.AttachSocketFile = ""
+			}
+		}()
+	}
+
+	// What guests may do, as the session reports it, and as a delegated run
+	// tells its broker what guests may ask the relay for.
+	permissions := internal.Permissions{
+		AutoAccept:                   c.AutoAccept,
+		ReadOnly:                     c.ReadOnly,
+		SFTPDisabled:                 c.SFTPDisabled,
+		AllowLocalTCPForwarding:      c.AllowLocalTCPForwarding,
+		FileTransferApprovalRequired: c.FileTransferApprovalRequired,
+		AllowLoopbackTCPForwarding:   c.AllowLoopbackTCPForwarding,
+		ForwardingDisabled:           c.ForwardingDisabled,
+		AcceptExec:                   c.AcceptExec,
+		ExecDisabled:                 c.ExecDisabled,
+		TerminalConsent:              c.TerminalConsent,
+		PermissionChecker:            c.PermissionChecker,
+	}
+
+	// A delegated run is placed now, once the name is claimed and before
+	// anything is dialled, for this run's key and routing ID; the relay it
+	// registers with is the one the placement names. Recording the delegation
+	// follows the placement directly, so nothing can see the one without the
+	// other.
+	var delegated *delegatedMode
+	if c.Broker != nil {
+		if delegated, err = c.startDelegated(ctx, hostKey, secret, permissions); err != nil {
+			return err
+		}
+		u = delegated.relay
+	}
+
+	logger := c.Logger.With("server", u.String())
+	logger.Info("Establishing reverse tunnel")
+	// The relay this host verifies is the only authority for the guest
+	// certificates it will be shown. Recorded by the callback that does the
+	// verifying, read by the guest door below.
+	relayAuthority := &internal.RelayAuthority{}
+	// The relay is probed after PingInterval with no bytes from it, and given
+	// up on after PingBound more: any bytes count, so a reply queued behind
+	// guest output never counts against it. The same on every tunnel.
+	timing := c.Reconnect.orDefault()
+	keepAlive := liveness.Timing{Interval: timing.PingInterval, Bound: timing.PingBound}
+	// The first connection. It runs on Run's own context with no deadline of
+	// its own: it fails fast, and it may be waiting on the operator, at the
+	// host key prompt or an agent's approval.
+	rt := &internal.ReverseTunnel{
+		Host:            u,
+		Signers:         c.Signers,
+		HostKey:         hostKey,
+		HostKeyCallback: relayAuthority.Wrap(c.HostKeyCallback),
+		AuthorizedKeys:  aks,
+		SessionSecret:   secret,
+		Generation:      1,
+		KeepAlive:       keepAlive,
+		ProxyURL:        c.ProxyURL,
+		Logger:          logger.With("component", "reverse-tunnel"),
+	}
+	// A delegated run's first connection trusts only the keys its placement
+	// listed, as every redial does, and registers the delegated session.
+	delegated.tunnel(rt, relayAuthority)
+	// The tunnel Run closes on its way out. Until the supervisor exists that
+	// is the first one, and Close is nil-safe on a tunnel that never
+	// established: Establish closes whatever a failed attempt opened. Once
+	// the supervisor has started, it closes every tunnel it replaces, and the
+	// one it ended on is Run's to close, after g.Run has returned and the
+	// guest door served on it has drained, so that a stopped session's guests
+	// still get the command's last output and their exit status.
+	var sup *supervisor
+	defer func() {
+		var live tunnel = rt
+		if sup != nil {
+			if cur := sup.current(); cur != nil {
+				live = cur
+			}
+		}
+		live.Close()
+	}()
+	sessResp, err := rt.Establish(ctx)
+	if err != nil {
+		// Log the error before returning to ensure it's captured in logs
+		// This is especially important when running in detached/background mode
+		logger.Error("Failed to establish reverse tunnel", "error", err)
+		return err
+	}
+	// Before any of the answer is logged, routed, stored or reported. The
+	// error never repeats what the relay sent: the relay chose it.
+	if !commandSafe(sessResp) {
+		err := errors.New("the relay's answer has an SSH user or session ID upterm won't put in a command; not starting the session")
+		logger.Error("Refused the relay's answer", "error", err)
+		return err
+	}
+	state.setReconnect(rt.ReconnectSupported())
+	// A delegated session the relay's answer stopped or withdrew has no
+	// route, and nothing is launched for it.
+	if d := delegated.final(); d != server.DelegatedDisposition_DELEGATED_UNSPECIFIED {
+		err := delegated.beforeLaunch(d)
+		logger.Error(delegated.authority+" decided against the session before its command started", "error", err)
+		return err
+	}
+
+	// Check server version compatibility after establishing connection
+	serverVersion := string(rt.ServerVersion())
+	logger.Debug("detected server version", "server_version", serverVersion)
+
+	// Check for version compatibility. The log is where it always goes: a
+	// daemon has no terminal of its own, and whoever does — the CLI — says so
+	// with a callback.
+	if result := version.CheckCompatibility(serverVersion); !result.Compatible {
+		logger.Warn("server version mismatch", "message", result.Message,
+			"host_version", result.HostVersion, "server_version", result.ServerVersion)
+		if c.VersionWarningCallback != nil {
+			c.VersionWarningCallback(result)
+		}
+	}
+
+	logger = logger.With("session", sessResp.SessionID)
 	logger.Info("Established reverse tunnel")
 
-	session := &api.GetSessionResponse{
-		SessionId:    sessResp.SessionID,
-		Host:         u.String(),
-		NodeAddr:     sessResp.NodeAddr,
-		Command:      c.Command,
-		ForceCommand: c.ForceCommand,
+	// Said now, once, rather than at the first drop, where all there would
+	// be to say is that a redial failed. Told to the caller as well as
+	// logged, and before the session is created, so the operator reads it
+	// before the session starts rather than above it later.
+	if !rt.ReconnectSupported() {
+		logger.Warn("this relay doesn't support reconnecting; if the tunnel drops, guests can't reach this session again until it is restarted")
+		if c.RelayWarningCallback != nil {
+			c.RelayWarningCallback(RelayWarning{Kind: NoReconnect})
+		}
+	} else if delegated == nil {
+		// A delegated run's redials trust its pins, not what this connection
+		// was shown, so only a local run has this to say.
+		if err := relayAuthority.CheckRedial(u.Host); err != nil {
+			logger.Warn(fmt.Sprintf("the relay's certificate isn't valid for %s, so a reconnect would be refused; use the relay's own hostname in --server", u.Hostname()),
+				"error", err)
+			if c.RelayWarningCallback != nil {
+				c.RelayWarningCallback(RelayWarning{Kind: CertNotValidForServer, Host: u.Hostname()})
+			}
+		}
 	}
 
+	// A delegated session's guests reach it at its guest address, whatever
+	// the relay registered.
+	sshUser := delegated.address(sessResp.SshUser)
+	// Where guests reach the session now. A redial may register it on
+	// another node, and GetSession reads this rather than the first answer.
+	route := &internal.SessionRoute{}
+	route.Set(sessResp.NodeAddr, sshUser)
+
+	// The ID, but not readiness: the session is registered and nothing more.
+	// Nothing has accepted it, the admin socket is unbound and the command
+	// does not exist yet.
+	sessionID = sessResp.SessionID
+
+	session := &api.GetSessionResponse{
+		SessionId:      sessResp.SessionID,
+		Host:           u.String(),
+		NodeAddr:       sessResp.NodeAddr,
+		SshUser:        sshUser,
+		Command:        c.Command,
+		ForceCommand:   c.ForceCommand,
+		LoginCommand:   c.LoginCommand,
+		AuthorizedKeys: toApiAuthorizedKeys(c.AuthorizedKeys),
+		SftpDisabled:   c.SFTPDisabled,
+		// The same emptiness the guest door admits anyone on. The authority
+		// decides who reaches a delegated session, so none is open.
+		Open: c.AutoAccept && len(aks) == 0 && c.Broker == nil,
+	}
+	// The relay key the first connection trusted, and how. Redials never
+	// ask the callback that decided it: they are pinned to the key it
+	// accepted, so this stays true for the session's life.
+	if c.RelayKeyTrusted != nil {
+		if trusted, ok := c.RelayKeyTrusted(); ok {
+			session.RelayKnownHosts = proto.String(trusted.KnownHostsLine)
+			session.RelayKeyTrust = proto.String(trusted.Trust)
+		}
+	}
+	permissions.Report(session)
+	// A delegated session says it is one, at the address its record holds,
+	// so that a reader of both can tell they describe the same session.
+	if delegated != nil {
+		session.DelegatedAddress = proto.String(sshUser)
+	}
+	// The name the session holds, which is not c.Name when Run was handed a
+	// socket (the name is then ignored) or generated one (c.Name is empty).
+	var sessionName string
+	if c.SessionDir != nil {
+		sessionName = c.SessionDir.Name()
+	}
+	// The status, reconnect and tunnel fields set here are a snapshot, taken
+	// as the session starts, for SessionCreatedCallback: they go stale as
+	// soon as the tunnel moves, and the admin server's GetSession computes
+	// them again for every answer rather than copying them from session.
+	internal.DescribeSession(session, sessionName, state.snapshot)
+
 	if c.SessionCreatedCallback != nil {
-		if err := c.SessionCreatedCallback(session); err != nil {
+		if err := c.SessionCreatedCallback(ctx, session); err != nil {
+			// runReason is startup_failed at this point, which is right for a
+			// callback that broke and wrong for one that declined on the
+			// operator's behalf. Nothing failed in that case, and the record
+			// is all a later reader has to tell the two apart by.
+			if errors.Is(err, ErrSessionAbandoned) {
+				runReason = sessiondir.ReasonStartupAbandoned
+			}
 			return err
 		}
 	}
 
 	clientRepo := internal.NewClientRepo()
+	forwards := &internal.Forwards{}
 	eventEmitter := emitter.New(1)
 
-	logger = logger.WithFields(log.Fields{"cmd": c.Command, "force-cmd": c.ForceCommand})
+	logger = logger.With("cmd", c.Command, "force_cmd", c.ForceCommand)
+
+	// Readiness is a claim about facts, so it waits for the facts to report
+	// themselves: the admin socket bound and the command started. Registering
+	// the actors that do those things establishes neither.
+	adminReady := make(chan struct{})
+	cmdReady := make(chan struct{})
+	sessionReady := make(chan struct{})
+	// Closed once the ready actor has published readiness, failed to, or
+	// given up on it. Unlike sessionReady it always closes, since teardown
+	// waits on it before it publishes ending.
+	readySettled := make(chan struct{})
+	// sync.Once on each, since a callback that fires twice must not panic on a
+	// double close.
+	var adminOnce, cmdOnce sync.Once
+
+	// The launch this run is, for the stop RPC to be bound to: the name and
+	// the socket are the session's and are handed on to whoever claims the
+	// name next, so they cannot say which run a caller meant. Empty when no
+	// name was claimed, which the server reads as a session no stop can name.
+	var launchID string
+	if c.SessionDir != nil {
+		launchID = c.SessionDir.LaunchID()
+	}
+
+	// publishJoin writes the join timeout as it stands into the record. The
+	// snapshot is taken inside Update, under the record's own lock, so
+	// whichever write lands last carries the latest state: an arm whose write
+	// is overtaken by a join's cannot put a deadline back. It runs only in the
+	// publisher actor below; everything else calls markJoinDirty.
+	publishJoin := func() {
+		if c.SessionDir == nil {
+			return
+		}
+		if c.onJoinPublish != nil {
+			if err := c.onJoinPublish(); err != nil {
+				logger.Warn("failed to publish the join timeout; the session enforces it regardless", "error", err)
+				return
+			}
+		}
+		if err := c.SessionDir.Update(func(r *sessiondir.Record) {
+			s := joins.snapshot()
+			r.JoinTimeout = s.Timeout
+			r.JoinDeadline = s.Deadline
+		}); err != nil {
+			logger.Warn("failed to publish the join timeout; the session enforces it regardless", "error", err)
+		}
+	}
+	// markJoinDirty asks the publisher for a write and never blocks: one
+	// pending request covers any number of changes, since each write takes a
+	// fresh snapshot.
+	joinDirty := make(chan struct{}, 1)
+	markJoinDirty := func() {
+		select {
+		case joinDirty <- struct{}{}:
+		default:
+		}
+	}
+
+	// Bound here, not inside the group. A bind failure is a startup failure and
+	// has to be reported as one: inside the group it raced the command's start,
+	// and whichever actor lost the race decided the classification — the same
+	// unusable socket path was published as startup_failed on one run and
+	// signaled on the next. Returning the error here also hands the deferred
+	// writer above the reason it already assumes at this point.
+	//
+	// adminReady therefore closes before the group exists. The ready actor
+	// still waits on both channels: which of the two facts is established
+	// first is not something readiness should depend on.
+	adminServer := internal.AdminServer{
+		Session:     session,
+		Route:       route,
+		ClientRepo:  clientRepo,
+		Forwards:    forwards,
+		LaunchID:    launchID,
+		OnListening: func() { adminOnce.Do(func() { close(adminReady) }) },
+		OnStop:      requestStop,
+		OnSetJoinTimeout: func(timeout time.Duration) *api.SetJoinTimeoutResponse {
+			res := joins.set(timeout)
+			switch res.Outcome {
+			case joinCounting, joinPending, joinDisabled:
+				markJoinDirty()
+			}
+			return setJoinTimeoutResponse(res)
+		},
+		JoinState: func() *api.JoinState { return apiJoinState(joins.snapshot()) },
+		Name:      sessionName,
+		State:     state.snapshot,
+	}
+	if err := adminServer.Listen(c.AdminSocketFile); err != nil {
+		logger.Error("Failed to bind the admin socket", "socket", c.AdminSocketFile, "error", err)
+		return err
+	}
+
+	// The local terminal's door, bound the way the admin socket is: no chmod,
+	// because the 0700 session directory is the boundary. Here rather than
+	// inside the group for the same reason the admin bind is — a bind failure
+	// is a startup failure and must be reported as one, not raced against the
+	// command's start.
+	var attachLn net.Listener
+	if c.AttachSocketFile != "" {
+		attachLn, err = net.Listen("unix", c.AttachSocketFile)
+		if err != nil {
+			logger.Error("Failed to bind the attach socket", "socket", c.AttachSocketFile, "error", err)
+			_ = adminServer.Shutdown(ctx)
+			return err
+		}
+		if c.wrapAttachListener != nil {
+			attachLn = c.wrapAttachListener(attachLn)
+		}
+		// Published as soon as the socket a client could dial exists, so that
+		// every record whose attach socket is dialable also carries the key
+		// `upterm attach` needs to pin it.
+		if c.SessionDir != nil {
+			hostKeys := []string{strings.TrimSuffix(string(ssh.MarshalAuthorizedKey(hostKey.PublicKey())), "\n")}
+			// Not swallowed: a record that never receives the keys names a
+			// socket `upterm attach` will refuse to dial, so a session that
+			// is otherwise fine becomes unattachable for its whole life.
+			// Not fatal either — the session itself is unaffected, and the
+			// guests it exists for are served over the tunnel — so it is
+			// said once, here, rather than ending a working session.
+			if err := c.SessionDir.Update(func(r *sessiondir.Record) {
+				r.HostKeys = hostKeys
+			}); err != nil {
+				logger.Error("Failed to publish the host keys; upterm attach will refuse this session",
+					"record", c.SessionDir.RecordPath(), "error", err)
+			}
+		}
+		if c.AttachListeningCallback != nil {
+			c.AttachListeningCallback(c.AttachSocketFile)
+		}
+	}
+
+	// The guest door's one listener for the whole session: the first
+	// tunnel's until the supervisor swaps in the next. The guest door closes
+	// it, and with it whichever tunnel listener is current.
+	guestDoor := internal.NewTunnelListener(rt.Listener())
+	// What every redial offers is fixed here, at the start: the identities
+	// the first connection was given, and the session key ahead of them only
+	// where the relay lets it alone in and the operator didn't name the whole
+	// set.
+	recorded := c.Signers
+	pinned := relayAuthority.Pinned()
+	recordDir := c.SessionDir
+	sup = &supervisor{
+		timing: timing,
+		attempt: func(ctx context.Context, generation uint64, signers []ssh.Signer) (tunnel, *server.CreateSessionResponse, error) {
+			t := &internal.ReverseTunnel{
+				Host:             u,
+				Signers:          signers,
+				HostKey:          hostKey,
+				HostKeyCallback:  pinned,
+				AuthorizedKeys:   aks,
+				SessionSecret:    secret,
+				Generation:       generation,
+				RequireDerivedID: true,
+				KeepAlive:        keepAlive,
+				ProxyURL:         c.ProxyURL,
+				Logger:           logger.With("component", "reverse-tunnel", "generation", generation),
+			}
+			delegated.tunnel(t, relayAuthority)
+			resp, err := t.Establish(ctx)
+			if err != nil {
+				// No tunnel, not a nil *ReverseTunnel: one in the interface
+				// would not be nil, and the supervisor would close it.
+				return nil, nil, err
+			}
+			return t, resp, nil
+		},
+		identities: func(ctx context.Context, sessionKeyFirst bool) ([]ssh.Signer, func()) {
+			return redialIdentities(ctx, recorded, hostKey, sessionKeyFirst)
+		},
+		listener: guestDoor,
+		route:    route,
+		state:    state,
+		publish: func() {
+			// An embedder with no record learns the tunnel's state from
+			// Status, which reads it from state.
+			if recordDir == nil {
+				return
+			}
+			if err := c.updateRecord(recordDir, state.apply); err != nil {
+				logger.Warn("failed to publish the tunnel's state", "error", err)
+			}
+		},
+		sessionID:       sessResp.SessionID,
+		generation:      1,
+		supported:       rt.ReconnectSupported(),
+		sessionKeyFirst: rt.SessionKeyRedial() && !c.IdentitiesOnly,
+		sshUser:         delegated.address(""),
+		logger:          logger,
+		onTunnel:        c.TunnelCallback,
+	}
+	// current is the tunnel a delegated run reports on: the supervisor's
+	// current one, or the first until the supervisor has started.
+	current := func() tunnel {
+		if t := sup.current(); t != nil {
+			return t
+		}
+		return rt
+	}
+	// Closed once teardown has begun, by the first interrupt.
+	tearingDown := make(chan struct{})
 
 	var g run.Group
+	// Interrupts run in registration order. Deliver the selected cause to
+	// the command before admin draining or lifecycle unsubscription can block.
 	{
-		ctx, cancel := context.WithCancel(ctx)
-		s := internal.AdminServer{
-			Session:    session,
-			ClientRepo: clientRepo,
-		}
+		// First, so its interrupt runs first: from the moment teardown
+		// begins the join timeout takes no more changes, and a
+		// `session set` that reaches the admin socket while it drains is
+		// told the session is ending rather than handed a deadline nothing
+		// will enforce. joins.close() never blocks -- it only stops a timer
+		// under a mutex nothing holds across a wait -- which is why it may
+		// run before the cause reaches the command.
+		//
+		// The actor then tells the record the session is ending, so that a
+		// reader between here and the final write -- which waits for the
+		// tunnel to close and the group to finish -- isn't told ready, with
+		// a connect string, for a session that has ended. Here rather than
+		// in the interrupt: shutting the command down never waits on a
+		// record write. And after the ready write, if there is to be one,
+		// which teardown doesn't prevent: a ready write that came second
+		// would carry ending, and the ready callback would report a session
+		// that started as one that is ending.
 		g.Add(func() error {
-			return s.Serve(ctx, c.AdminSocketFile)
-		}, func(err error) {
-			_ = s.Shutdown(ctx)
-			cancel()
-		})
-	}
-	{
-		g.Add(func() error {
-			for evt := range eventEmitter.On(upterm.EventClientJoined) {
-				args := evt.Args
-				if len(args) == 0 {
-					continue
-				}
-
-				client, ok := args[0].(*api.Client)
-				if ok {
-					_ = clientRepo.Add(client)
-					logger.WithField("client", client.Addr).Info("Client joined")
-					if c.ClientJoinedCallback != nil {
-						c.ClientJoinedCallback(client)
-					}
+			<-tearingDown
+			<-readySettled
+			state.setPhase(phaseEnding)
+			if c.SessionDir != nil {
+				if err := c.updateRecord(c.SessionDir, state.apply); err != nil {
+					logger.Warn("failed to publish that the session is ending", "error", err)
 				}
 			}
-
-			return nil
-		}, func(err error) {
-			eventEmitter.Off(upterm.EventClientJoined)
-		})
-	}
-	{
-		g.Add(func() error {
-			for evt := range eventEmitter.On(upterm.EventClientLeft) {
-				args := evt.Args
-				if len(args) == 0 {
-					continue
-				}
-
-				cid, ok := args[0].(string)
-				if ok {
-					client := clientRepo.Get(cid)
-					if client != nil {
-						logger.WithField("client", client.Addr).Info("Client left")
-						clientRepo.Delete(cid)
-						if c.ClientLeftCallback != nil && client != nil {
-							c.ClientLeftCallback(client)
-						}
-					}
-				}
+			if c.afterEndingPublish != nil {
+				c.afterEndingPublish()
 			}
-
 			return nil
-		}, func(err error) {
-			eventEmitter.Off(upterm.EventClientLeft)
+		}, func(error) {
+			joins.close()
+			close(tearingDown)
 		})
 	}
+	// Hoisted out of the block below so the classification after g.Run can ask
+	// it what the command actually did.
+	var sshServer internal.Server
 	{
 		logger.Info("Starting sshd server")
 		defer logger.Info("Finishing sshd server")
 
-		ctx, cancel := context.WithCancel(ctx)
-		sshServer := internal.Server{
-			Command:           c.Command,
-			CommandEnv:        []string{fmt.Sprintf("%s=%s", upterm.HostAdminSocketEnvVar, c.AdminSocketFile)},
-			ForceCommand:      c.ForceCommand,
-			Signers:           c.Signers,
-			AuthorizedKeys:    c.AuthorizedKeys,
-			EventEmitter:      eventEmitter,
-			KeepAliveDuration: c.KeepAliveDuration,
-			Stdin:             c.Stdin,
-			Stdout:            c.Stdout,
-			Logger:            c.Logger.WithField("com", "server"),
-			ReadOnly:          c.ReadOnly,
+		commandEnv := []string{fmt.Sprintf("%s=%s", upterm.HostAdminSocketEnvVar, c.AdminSocketFile)}
+		if c.SessionDir != nil {
+			commandEnv = append(commandEnv, fmt.Sprintf("%s=%s", upterm.HostSessionNameEnvVar, c.SessionDir.Name()))
+		}
+
+		// The group owns this actor's cancellation. Inheriting the parent's
+		// cancellation could mask an already selected deadline winner before
+		// the interrupt carries its cause to attached clients. The signal
+		// actor still observes the parent and initiates ordinary teardown.
+		ctx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+		// A delegated run's command starts only if no final decision came
+		// first, which the decision actor below reads from the same place. A
+		// local run's command starts unasked, as it always has.
+		var mayStart func() bool
+		if delegated != nil {
+			mayStart = func() bool {
+				if !delegated.mayLaunch() {
+					return false
+				}
+				if c.atLaunch != nil {
+					c.atLaunch()
+				}
+				return true
+			}
+		}
+		sshServer = internal.Server{
+			Command:                    c.Command,
+			CommandEnv:                 commandEnv,
+			ForceCommand:               c.ForceCommand,
+			LoginCommand:               c.LoginCommand,
+			CommandDir:                 commandDir,
+			AcceptExec:                 c.AcceptExec,
+			ExecDisabled:               c.ExecDisabled,
+			HideClientIP:               c.HideClientIP,
+			LogPath:                    c.LogPath,
+			HostKey:                    hostKey,
+			AuthorizedKeys:             aks,
+			GuestLabels:                guestLabels(c.AuthorizedKeys),
+			GuestCertAuthority:         relayAuthority.IsUserAuthority,
+			EventEmitter:               eventEmitter,
+			KeepAliveDuration:          c.KeepAliveDuration,
+			Logger:                     logger.With("component", "server"),
+			ReadOnly:                   c.ReadOnly,
+			AllowLocalTCPForwarding:    c.AllowLocalTCPForwarding,
+			AllowLoopbackTCPForwarding: c.AllowLoopbackTCPForwarding,
+			ForwardingDisabled:         c.ForwardingDisabled,
+			Forwards:                   forwards,
+			PtySize:                    c.PtySize,
+			PinPtySize:                 c.PinPtySize,
+			Term:                       c.Term,
+			AwaitInitialClient:         c.AwaitInitialClient,
+			InitialClientTimeout:       c.InitialClientTimeout,
+			StopGrace:                  c.StopGrace,
+			SFTPDisabled:               c.SFTPDisabled,
+			PermissionChecker:          c.PermissionChecker,
+			TerminalConsent:            c.TerminalConsent,
+			SFTPAutoAccept:             c.AutoAccept || c.SFTPAutoAccept,
+			MayStart:                   mayStart,
+			OnCommandStarted: func() {
+				cmdOnce.Do(func() { close(cmdReady) })
+				if c.CommandStartedCallback != nil {
+					c.CommandStartedCallback()
+				}
+			},
+			// The door stops serving only once the tunnel is lost for good,
+			// on a relay that can't take the session back, and the supervisor
+			// has published that already: it is the only writer of the
+			// tunnel's state, so this only says so in the log.
+			OnGuestServerStopped: func(err error) {
+				logger.Warn("reverse tunnel stopped serving guests; command continues", "error", err)
+			},
 		}
 		g.Add(func() error {
-			return sshServer.ServeWithContext(ctx, rt.Listener())
+			return sshServer.ServeWithContext(ctx, guestDoor, attachLn)
 		}, func(err error) {
+			// Only the winning group error reaches attached clients, and it
+			// is published to the session before the cancellation that
+			// starts its teardown, so that every client, and every command's
+			// end, is measured against it. Only a shutdown is published, and
+			// what is one is told by the error, not by whether the server
+			// has returned: a stop can win the group as the command ends on
+			// its own, and the server's return then comes before this runs.
+			// Anything else, the server's own return among them, is left to
+			// the handlers' reading of the cancellation below.
+			if isShutdown(err) {
+				sshServer.PublishShutdown(err)
+			}
+			cancel(err)
+		})
+	}
+	// The tunnel's supervisor's context, and supDone, closed once it has
+	// returned. A withdrawal ends it too, and not the session.
+	supCtx, cancelSup := context.WithCancel(context.WithoutCancel(ctx))
+	supDone := make(chan struct{})
+	{
+		// The tunnel's supervisor, after the guest door it swaps tunnels
+		// behind. Its context is the group's to cancel, as the ssh server's
+		// is: an actor that returned the moment a `session stop` cancelled
+		// ctx could be the group's first, and the run would be recorded as
+		// whatever that return said rather than as stopped. It returns only
+		// after its interrupt, even when a withdrawal ended the supervisor
+		// first.
+		interrupted := make(chan struct{})
+		g.Add(func() error {
+			sup.run(supCtx, rt)
+			close(supDone)
+			<-interrupted
+			return nil
+		}, func(error) {
+			close(interrupted)
+			cancelSup()
+		})
+	}
+	if delegated != nil {
+		// What the authority decides about the session, once it is final.
+		// Before the command has been let start, the run ends there, and
+		// nothing is launched: the command's start asks the same latch, so
+		// exactly one of the two holds. After, a stop is a stop as `session
+		// stop` makes one, with the guest door closed to anyone new at once;
+		// a withdrawal ends the delegated tunnel and its redials, and leaves
+		// the command, the admin socket and the attach socket as they are. A
+		// withdrawal that comes once the session is ending is no news: it is
+		// how the relay answers the exit the session is about to report.
+		stop := make(chan struct{})
+		g.Add(func() error {
+			select {
+			case <-delegated.decisions.Terminal():
+			case <-stop:
+				return nil
+			}
+			d := delegated.final()
+			if !delegated.launched() {
+				err := delegated.beforeLaunch(d)
+				logger.Error(delegated.authority+" decided against the session before its command started", "error", err)
+				return err
+			}
+			switch d {
+			case server.DelegatedDisposition_DELEGATED_STOPPED:
+				// Acted on before anyone is told. The record says first that
+				// it was the authority's stop, so that whoever is told the
+				// session stopped can read whose it was.
+				logger.Warn(delegated.authority + " stopped the session; terminating the command")
+				guestDoor.Fail(delegated.stopped())
+				c.recordDecision(delegated, sessiondir.DecisionStopped, logger)
+				requestStop()
+				if c.DecisionCallback != nil {
+					c.DecisionCallback(DecisionStopped)
+				}
+			case server.DelegatedDisposition_DELEGATED_WITHDRAWN:
+				if closed(tearingDown) {
+					break
+				}
+				logger.Warn(delegated.authority + " withdrew the session's remote access; the command goes on running locally")
+				cancelSup()
+				<-supDone
+				guestDoor.Fail(delegated.withdrawn())
+				current().Close()
+				state.withdrawn(time.Now())
+				sup.publish()
+				c.recordDecision(delegated, sessiondir.DecisionWithdrawn, logger)
+				if c.DecisionCallback != nil {
+					c.DecisionCallback(DecisionWithdrawn)
+				}
+			}
+			<-stop
+			return nil
+		}, func(error) {
+			close(stop)
+		})
+	}
+	if delegated != nil {
+		// The authority is told the session is ready once its record says
+		// so, on whichever tunnel is current, and asked again until it
+		// answers.
+		reportCtx, cancelReports := context.WithCancel(context.WithoutCancel(ctx))
+		g.Add(func() error {
+			select {
+			case <-sessionReady:
+				delegated.reportReady(reportCtx, current, logger)
+			case <-reportCtx.Done():
+			}
+			<-reportCtx.Done()
+			return nil
+		}, func(error) {
+			cancelReports()
+		})
+	}
+	{
+		// Handle OS signals for graceful shutdown
+		// Platform-specific: Unix listens for SIGINT+SIGTERM, Windows only SIGTERM
+		setupSignalHandler(&g, ctx)
+	}
+	{
+		ctx, cancel := context.WithCancel(ctx)
+		g.Add(func() error {
+			return adminServer.Serve(ctx)
+		}, func(err error) {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+			defer shutdownCancel()
+			_ = adminServer.Shutdown(shutdownCtx)
 			cancel()
 		})
 	}
+	// Subscribed here, before any actor runs, rather than inside the actors
+	// that read them. run.Group starts its actors as goroutines in no
+	// particular order, and by this point the attach socket is bound and its
+	// callback has already told the local terminal to connect — so the door's
+	// join event can be emitted before a subscription made inside an actor
+	// exists. The emitter delivers to whoever is listening at the time and
+	// replays nothing, so that client would be missing from the repo for the
+	// life of the session: `session info` short by one, and no callback for
+	// it. Off stays in the interrupts, which run once, after Run.
+	clientJoined := eventEmitter.On(upterm.EventClientJoined)
+	forwardingJoined := eventEmitter.On(upterm.EventForwardingClientJoined)
+	clientLeft := eventEmitter.On(upterm.EventClientLeft)
+	var guestLatch *guestJoinLatch
+	if c.SessionDir != nil {
+		guestLatch = &guestJoinLatch{update: c.SessionDir.Update, disarm: joins.join}
+	}
+	lifecycle := &clientLifecycle{
+		repo: clientRepo, pendingLeft: make(map[string]*api.Client),
+		onJoined: c.ClientJoinedCallback, onLeft: c.ClientLeftCallback,
+		logger: logger,
+	}
+	if guestLatch != nil {
+		lifecycle.onGuestJoin = guestLatch.note
+		lifecycle.recordPath = c.SessionDir.RecordPath()
+	} else {
+		lifecycle.onGuestJoin = func(client *api.Client) error {
+			if client.GetKind() == api.Client_GUEST {
+				joins.join()
+			}
+			return nil
+		}
+	}
+	{
+		g.Add(func() error {
+			for clientJoined != nil || forwardingJoined != nil || clientLeft != nil {
+				select {
+				case evt, ok := <-clientJoined:
+					if !ok {
+						clientJoined = nil
+						continue
+					}
+					if len(evt.Args) > 0 {
+						if client, ok := evt.Args[0].(*api.Client); ok {
+							lifecycle.joined(client, true)
+						}
+					}
+				case evt, ok := <-forwardingJoined:
+					if !ok {
+						forwardingJoined = nil
+						continue
+					}
+					if len(evt.Args) > 0 {
+						if client, ok := evt.Args[0].(*api.Client); ok {
+							lifecycle.joined(client, false)
+						}
+					}
+				case evt, ok := <-clientLeft:
+					if !ok {
+						clientLeft = nil
+						continue
+					}
+					if len(evt.Args) > 0 {
+						if id, ok := evt.Args[0].(string); ok {
+							// A jump's left carries it as it ended.
+							var final *api.Client
+							if len(evt.Args) > 1 {
+								final, _ = evt.Args[1].(*api.Client)
+							}
+							lifecycle.left(id, final)
+						}
+					}
+				}
+			}
+			return nil
+		}, func(err error) {
+			eventEmitter.Off(upterm.EventClientJoined)
+			eventEmitter.Off(upterm.EventForwardingClientJoined)
+			eventEmitter.Off(upterm.EventClientLeft)
+		})
+	}
 
-	return g.Run()
+	{
+		ready := make(chan struct{})
+		g.Add(func() error {
+			settle := sync.OnceFunc(func() { close(readySettled) })
+			defer settle()
+			if !readinessEstablished(adminReady, cmdReady, ready) {
+				return nil
+			}
+
+			// Both acknowledged. Only now is every claim a reader makes off
+			// "ready" true: the session is registered, the user accepted it,
+			// the admin socket is bound, and the command is running.
+			//
+			// publishedStatus is what the record is written with, which is
+			// not always ready: the status is derived from the session's
+			// facts, and a tunnel down by the time of this write gives
+			// reconnecting, or disconnected on a relay that cannot take the
+			// session back. Reported as it is, because a callback that
+			// announced "ready" for a record saying otherwise would be the
+			// disagreement this callback exists to rule out. Captured inside
+			// the closure, which Update runs synchronously under its own
+			// lock, so it is the status of the record that was written; with
+			// no session directory there is no record, and the facts give it.
+			state.setPhase(phaseRunning)
+			publishedStatus := state.status()
+			if c.SessionDir != nil {
+				var err error
+				if c.beforeReadyPublish != nil {
+					c.beforeReadyPublish(state)
+				}
+				if c.onReadyPublish != nil {
+					err = c.onReadyPublish()
+				}
+				if err == nil {
+					err = c.updateRecord(c.SessionDir, func(r *sessiondir.Record) {
+						r.SessionID = sessionID
+						state.apply(r)
+						publishedStatus = r.Status
+					})
+				}
+				if err != nil {
+					// Fatal to the run, where every other record write here
+					// is not, because this one is the word readiness is made
+					// of: the callback below tells a parent the session is
+					// up, and a parent told that goes on to read this record
+					// -- `session info`, `session stop`, `attach`. A session
+					// whose readiness cannot be published is one no reader
+					// can manage, so it fails now, through the reporting the
+					// caller already has, rather than running on unreachable.
+					logger.Error("Failed to publish the session as ready",
+						"record", c.SessionDir.RecordPath(), "error", err)
+					return fmt.Errorf("%w: %w", errReadyUnpublished, err)
+				}
+			}
+			// The join timeout starts counting here, before the callback
+			// rather than after it: the callback is what tells a parent the
+			// session is ready -- it is what makes --detach return -- so the
+			// timeout must already be counting when it runs, or a `session
+			// set` made the moment --detach returns would answer "pending"
+			// for a session the record calls ready.
+			if joins.markReady() {
+				markJoinDirty()
+			}
+			if c.SessionReadyCallback != nil {
+				c.SessionReadyCallback(publishedStatus)
+			}
+
+			// Unlike ready (closed on teardown), this signals successful readiness.
+			close(sessionReady)
+			settle()
+
+			<-ready
+			return nil
+		}, func(err error) {
+			close(ready)
+		})
+	}
+
+	{
+		// The join timeout's record writes, in their own actor, so a write
+		// that blocks can never stand between a committed expiry and
+		// teardown, nor hold up a `session set`. A write still pending when
+		// teardown begins is flushed, so the final record shows what was
+		// current.
+		stop := make(chan struct{})
+		g.Add(func() error {
+			for {
+				select {
+				case <-joinDirty:
+					publishJoin()
+				case <-stop:
+					select {
+					case <-joinDirty:
+						publishJoin()
+					default:
+					}
+					return nil
+				}
+			}
+		}, func(error) {
+			close(stop)
+		})
+	}
+	{
+		// The join timeout's enforcement. Always registered, idle until a
+		// timeout is set, because `session set` can set one at any point in
+		// the session's life. joinState decides everything about it; this
+		// actor turns a committed expiry into the group's winner, and never
+		// writes the record itself.
+		stop := make(chan struct{})
+		g.Add(func() error {
+			if c.JoinTimeout > 0 {
+				// Pending until ready, and published as such, so a reader can
+				// tell "set, not counting yet" from "none".
+				markJoinDirty()
+			}
+			// The ready actor starts the clock, before it reports readiness;
+			// nothing can fire before then.
+			select {
+			case <-sessionReady:
+			case <-stop:
+				return nil
+			case <-ctx.Done():
+				return errors.Join(ctx.Err(), context.Cause(ctx))
+			}
+			select {
+			case <-joins.Fired():
+				// Committed: from here no join can claim the session. The
+				// barrier is after the commit, so a test can establish
+				// another winner and then exercise this genuinely late
+				// losing return.
+				if c.onJoinDeadlineFired != nil {
+					c.onJoinDeadlineFired(stop)
+				}
+				return errJoinTimeout
+			case <-stop:
+				return nil
+			case <-ctx.Done():
+				return errors.Join(ctx.Err(), context.Cause(ctx))
+			}
+		}, func(err error) {
+			close(stop)
+		})
+	}
+
+	err = g.Run()
+
+	out := classifyRun(err, sshServer.CommandResult(), abandonedBy(ctx) && !closed(cmdReady))
+	runReason, runExitCode, runSignal, runSignalNumber = out.reason, out.exitCode, out.signal, out.signalNumber
+	if runReason == sessiondir.ReasonJoinTimeout {
+		// The timeout that fired, which `session set` may have replaced
+		// since launch.
+		logger.Info("no guest joined within the join timeout; session ended", "timeout", joins.snapshot().Timeout)
+	}
+	// The command's own outcome, once it has one, is a delegated session's to
+	// report, on the tunnel that is current, under a budget of its own: the
+	// run's context is cancelled by now, and the report outlives it.
+	if delegated != nil && closed(cmdReady) {
+		delegated.reportExit(current(), sshServer.CommandResult(), logger)
+	}
+
+	if errors.Is(err, errJoinTimeout) {
+		return nil
+	}
+	return err
+}
+
+// JoinState reports the running session's join timeout as its daemon
+// holds it, for a caller reporting readiness; nil when Run is not running.
+func (c *Host) JoinState() *api.JoinState {
+	if c.joins == nil {
+		return nil
+	}
+	return apiJoinState(c.joins.snapshot())
+}
+
+// updateRecord writes dir's record through update and, once the write has
+// succeeded, gives onRecord the status it carried: captured inside the update,
+// under the record's lock, so it is the written record's.
+func (c *Host) updateRecord(dir *sessiondir.Dir, update func(*sessiondir.Record)) error {
+	var status string
+	err := dir.Update(func(r *sessiondir.Record) {
+		update(r)
+		status = r.Status
+	})
+	if err == nil && c.onRecord != nil {
+		c.onRecord(status)
+	}
+	return err
+}
+
+// Status reports the session's status as its record would, from Run's entry
+// until it returns; "" when Run isn't running. It may be called from any
+// goroutine, and is how an embedder with no record learns that the tunnel is
+// down and being redialled.
+func (c *Host) Status() string {
+	s := c.state.Load()
+	if s == nil {
+		return ""
+	}
+	return s.status()
 }
 
 func keyType(t string) string {
@@ -340,8 +1813,27 @@ func createFileIfNotExist(file string) error {
 			return err
 		}
 
-		defer file.Close()
+		defer func() {
+			_ = file.Close()
+		}()
 	}
 
 	return nil
+}
+
+func toApiAuthorizedKeys(aks []*AuthorizedKey) []*api.AuthorizedKey {
+	var apiAks []*api.AuthorizedKey
+	for _, ak := range aks {
+		var fps []string
+		for _, pk := range ak.PublicKeys {
+			fps = append(fps, utils.FingerprintSHA256(pk))
+		}
+
+		apiAks = append(apiAks, &api.AuthorizedKey{
+			PublicKeyFingerprints: fps,
+			Comment:               ak.Comment,
+		})
+	}
+
+	return apiAks
 }

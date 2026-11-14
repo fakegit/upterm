@@ -1,376 +1,738 @@
 package ftests
 
 import (
+	"bytes"
 	"context"
-	"io/ioutil"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
-	"strings"
+	"slices"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/owenthereal/upterm/host"
 	"github.com/owenthereal/upterm/host/api"
-	log "github.com/sirupsen/logrus"
+	"github.com/owenthereal/upterm/routing"
+	"github.com/owenthereal/upterm/upterm"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
 )
 
-func testHostNoAuthorizedKeyAnyClientJoin(t *testing.T, hostURL, nodeAddr string) {
-	adminSockDir, err := newAdminSocketDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(adminSockDir)
+func testHostNoAuthorizedKeyAnyClientJoin(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
 
-	adminSocketFile := filepath.Join(adminSockDir, "upterm.sock")
+	// Setup admin socket
+	adminSocketFile := setupAdminSocket(t)
 
 	h := &Host{
-		Command:         []string{"bash", "-c", "PS1='' BASH_SILENCE_DEPRECATION_WARNING=1 bash --norc"},
+		Command:         getTestShell(),
 		PrivateKeys:     []string{HostPrivateKey},
 		AdminSocketFile: adminSocketFile,
 	}
-	if err := h.Share(hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
 	defer h.Close()
 
-	// verify admin server
-	session := getAndVerifySession(t, adminSocketFile, hostURL, nodeAddr)
+	// Verify admin server - require session exists to continue
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
 
 	c := &Client{
 		PrivateKeys: []string{HostPrivateKey}, // use the wrong key
 	}
 
-	if err := c.Join(session, hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err = c.Join(session, clientJoinURL)
+	require.NoError(err)
+	defer c.Close()
 }
 
-func testClientAuthorizedKeyNotMatching(t *testing.T, hostURL, nodeAddr string) {
-	adminSockDir, err := newAdminSocketDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(adminSockDir)
+func testClientAuthorizedKeyNotMatching(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
+	assert := assert.New(t)
 
-	adminSocketFile := filepath.Join(adminSockDir, "upterm.sock")
+	// Setup admin socket
+	adminSocketFile := setupAdminSocket(t)
 
 	h := &Host{
-		Command:                  []string{"bash", "-c", "PS1='' BASH_SILENCE_DEPRECATION_WARNING=1 bash --norc"},
+		Command:                  getTestShell(),
 		PrivateKeys:              []string{HostPrivateKey},
 		AdminSocketFile:          adminSocketFile,
 		PermittedClientPublicKey: ClientPublicKeyContent,
 	}
-	if err := h.Share(hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
 	defer h.Close()
 
-	// verify admin server
-	session := getAndVerifySession(t, adminSocketFile, hostURL, nodeAddr)
+	// Verify admin server - require session exists to continue
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
 
 	c := &Client{
 		PrivateKeys: []string{HostPrivateKey}, // use the wrong key
 	}
 
-	err = c.Join(session, hostURL)
+	err = c.Join(session, clientJoinURL)
 
-	// Unfortunately there is no explicit error to the client.
-	// SSH handshake should fail with the connection closed.
-	// And there should be error like "public key not allowed" in the log
-	if want, got := "ssh: handshake failed:", err.Error(); !strings.Contains(got, want) {
-		t.Fatalf("Unexpected error, want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
+	// Test authorization failure - use assert for expected error validation.
+	// Over ssh through another node, uptermd reports the outcome in its own
+	// words: the upstream's error text names internal node addresses and is
+	// never relayed to the joiner.
+	require.Error(err, "connection should be rejected with wrong key")
+	assert.ErrorContains(err, keyRefusal(session, hostShareURL, clientJoinURL), "should fail with the session's refusal of the key")
 }
 
-func testClientNonExistingSession(t *testing.T, hostURL, nodeAddr string) {
-	adminSockDir, err := newAdminSocketDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(adminSockDir)
+func testClientNonExistingSession(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
 
-	adminSocketFile := filepath.Join(adminSockDir, "upterm.sock")
+	adminSocketFile := setupAdminSocket(t)
 
 	h := &Host{
-		Command:                  []string{"bash", "-c", "PS1='' BASH_SILENCE_DEPRECATION_WARNING=1 bash --norc"},
+		Command:                  getTestShell(),
 		PrivateKeys:              []string{HostPrivateKey},
 		AdminSocketFile:          adminSocketFile,
 		PermittedClientPublicKey: ClientPublicKeyContent,
 	}
-	if err := h.Share(hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
+
 	defer h.Close()
 
 	// verify admin server
-	session := getAndVerifySession(t, adminSocketFile, hostURL, nodeAddr)
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
 
 	// verify input/output
 	hostInputCh, hostOutputCh := h.InputOutput()
-	hostScanner := scanner(hostOutputCh)
+	hostScanner := scanner(t, hostOutputCh)
 
-	hostInputCh <- "echo hello"
-	if want, got := "echo hello", scan(hostScanner); want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
-	if want, got := "hello", scan(hostScanner); want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
+	hostInputCh <- `echo "hello"`
+	expectLine(t, hostScanner, `echo "hello"`)
+	expectLine(t, hostScanner, "hello")
 
 	c := &Client{
 		PrivateKeys: []string{ClientPrivateKey},
 	}
-	session.SessionId = "not-existance" // set session ID to non-existance
-	err = c.Join(session, hostURL)
+	session.SshUser = "non-existing-user" // set SSH user to non-existing
+	err = c.Join(session, clientJoinURL)
 
 	// Unfortunately there is no explicit error to the client.
 	// But ssh handshake fails with the connection closed
-	if want, got := "ssh: handshake failed:", err.Error(); !strings.Contains(got, want) {
-		t.Fatalf("Unexpected error, want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
+	require.ErrorContains(err, "ssh: handshake failed")
 }
 
-func testClientAttachHostWithSameCommand(t *testing.T, hostURL, nodeAddr string) {
-	adminSockDir, err := newAdminSocketDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(adminSockDir)
+func testClientAttachHostWithSameCommand(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
 
-	adminSocketFile := filepath.Join(adminSockDir, "upterm.sock")
+	// Setup - use require for critical setup steps
+	adminSocketFile := setupAdminSocket(t)
 
 	h := &Host{
-		Command:                  []string{"bash", "-c", "PS1='' BASH_SILENCE_DEPRECATION_WARNING=1 bash --norc"},
+		Command:                  getTestShell(),
 		PrivateKeys:              []string{HostPrivateKey},
 		AdminSocketFile:          adminSocketFile,
 		PermittedClientPublicKey: ClientPublicKeyContent,
 	}
-	if err := h.Share(hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
 	defer h.Close()
 
 	// verify admin server
-	session := getAndVerifySession(t, adminSocketFile, hostURL, nodeAddr)
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
 
 	// verify input/output
 	hostInputCh, hostOutputCh := h.InputOutput()
-	hostScanner := scanner(hostOutputCh)
+	hostScanner := scanner(t, hostOutputCh)
 
 	c := &Client{
 		PrivateKeys: []string{ClientPrivateKey},
 	}
-	if err := c.Join(session, hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err = c.Join(session, clientJoinURL)
+	require.NoError(err)
+	defer c.Close()
+	awaitGuestsAttached(t, adminSocketFile, 1)
 
 	remoteInputCh, remoteOutputCh := c.InputOutput()
-	remoteScanner := scanner(remoteOutputCh)
+	remoteScanner := scanner(t, remoteOutputCh)
 
 	// host input
-	hostInputCh <- "echo hello"
-	if want, got := "echo hello", scan(hostScanner); want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
-	if want, got := "hello", scan(hostScanner); want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
+	hostInputCh <- `echo "hello"`
+	expectLine(t, hostScanner, `echo "hello"`, "host should echo command")
+	expectLine(t, hostScanner, "hello", "host should show command output")
 
 	// client output
-	if want, got := "echo hello", scan(remoteScanner); want != got {
-		t.Fatalf("want=%q got=%q:\n%s", want, got, cmp.Diff(want, got))
-	}
-	if want, got := "hello", scan(remoteScanner); want != got {
-		t.Fatalf("want=%q got=%q:\n%s", want, got, cmp.Diff(want, got))
-	}
+	expectLine(t, remoteScanner, `echo "hello"`, "client should see host command")
+	expectLine(t, remoteScanner, "hello", "client should see host output")
 
 	// client input
-	remoteInputCh <- "echo hello again"
-	if want, got := "echo hello again", scan(remoteScanner); want != got {
-		t.Fatalf("want=%q got=%q:\n%s", want, got, cmp.Diff(want, got))
-	}
-	if want, got := "hello again", scan(remoteScanner); want != got {
-		t.Fatalf("want=%q got=%q:\n%s", want, got, cmp.Diff(want, got))
-	}
+	remoteInputCh <- `echo "hello again"`
+	expectLine(t, remoteScanner, `echo "hello again"`, "client should echo its own command")
+	expectLine(t, remoteScanner, "hello again", "client should see its own output")
 
 	// host output
 	// host should link to remote with the same input/output
-	if want, got := "echo hello again", scan(hostScanner); want != got {
-		t.Fatalf("want=%q got=%q:\n%s", want, got, cmp.Diff(want, got))
-	}
-	if want, got := "hello again", scan(hostScanner); want != got {
-		t.Fatalf("want=%q got=%q:\n%s", want, got, cmp.Diff(want, got))
-	}
+	expectLine(t, hostScanner, `echo "hello again"`, "host should see client command")
+	expectLine(t, hostScanner, "hello again", "host should see client output")
 }
 
-func testClientAttachHostWithDifferentCommand(t *testing.T, hostURL string, nodeAddr string) {
-	adminSockDir, err := newAdminSocketDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(adminSockDir)
+func testClientAttachHostWithDifferentCommand(t *testing.T, hostShareURL string, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
 
-	adminSocketFile := filepath.Join(adminSockDir, "upterm.sock")
+	// Setup - use require for critical setup steps
+	adminSocketFile := setupAdminSocket(t)
 
 	h := &Host{
-		Command:                  []string{"bash", "-c", "PS1='' BASH_SILENCE_DEPRECATION_WARNING=1 bash --norc"},
-		ForceCommand:             []string{"bash", "-c", "PS1='' BASH_SILENCE_DEPRECATION_WARNING=1 bash --norc"},
+		Command:                  getTestShell(),
+		ForceCommand:             getTestShell(),
 		PrivateKeys:              []string{HostPrivateKey},
 		AdminSocketFile:          adminSocketFile,
 		PermittedClientPublicKey: ClientPublicKeyContent,
 	}
-	if err := h.Share(hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
 	defer h.Close()
 
 	// verify admin server
-	session := getAndVerifySession(t, adminSocketFile, hostURL, nodeAddr)
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
 
 	// verify input/output
 	hostInputCh, hostOutputCh := h.InputOutput()
-	hostScanner := scanner(hostOutputCh)
+	hostScanner := scanner(t, hostOutputCh)
 
-	hostInputCh <- "echo hello"
-	if want, got := "echo hello", scan(hostScanner); want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
-	if want, got := "hello", scan(hostScanner); want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
+	hostInputCh <- `echo "hello"`
+
+	expectLine(t, hostScanner, `echo "hello"`, "host should echo initial command")
+
+	expectLine(t, hostScanner, "hello", "host should show initial output")
 
 	c := &Client{
 		PrivateKeys: []string{ClientPrivateKey},
 	}
-	if err := c.Join(session, hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err = c.Join(session, clientJoinURL)
+	require.NoError(err)
+	defer c.Close()
 
 	remoteInputCh, remoteOutputCh := c.InputOutput()
-	remoteScanner := scanner(remoteOutputCh)
-	time.Sleep(1 * time.Second) // HACK: wait for ssh stdin/stdout to fully attach
+	remoteScanner := scanner(t, remoteOutputCh)
 
-	remoteInputCh <- "echo hello again"
-	if want, got := "echo hello again", scan(remoteScanner); want != got {
-		t.Fatalf("want=%q got=%q:\n%s", want, got, cmp.Diff(want, got))
-	}
-	if want, got := "hello again", scan(remoteScanner); want != got {
-		t.Fatalf("want=%q got=%q:\n%s", want, got, cmp.Diff(want, got))
-	}
+	// Wait for ssh stdin/stdout to fully attach - critical for force command isolation
+	time.Sleep(time.Second)
+
+	remoteInputCh <- `echo "hello again"`
+
+	expectLine(t, remoteScanner, `echo "hello again"`, "client should echo its command")
+	expectLine(t, remoteScanner, "hello again", "client should see output")
 
 	// host shouldn't be linked to remote
-	hostInputCh <- "echo hello"
-	if want, got := "echo hello", scan(hostScanner); want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
-	if want, got := "hello", scan(hostScanner); want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
+	hostInputCh <- `echo "hello"`
+
+	expectLine(t, hostScanner, `echo "hello"`, "host should echo second command independently")
+	expectLine(t, hostScanner, "hello", "host should show second output independently")
 }
 
-func testClientAttachReadOnly(t *testing.T, hostURL, nodeAddr string) {
-	adminSockDir, err := newAdminSocketDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(adminSockDir)
+func testClientAttachReadOnly(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
 
-	adminSocketFile := filepath.Join(adminSockDir, "upterm.sock")
+	// Setup - use require for critical setup steps
+	adminSocketFile := setupAdminSocket(t)
 
 	h := &Host{
-		Command:                  []string{"bash", "-c", "PS1='' BASH_SILENCE_DEPRECATION_WARNING=1 bash --norc"},
+		Command:                  getTestShell(),
 		PrivateKeys:              []string{HostPrivateKey},
 		AdminSocketFile:          adminSocketFile,
 		PermittedClientPublicKey: ClientPublicKeyContent,
 		ReadOnly:                 true,
 	}
-	if err := h.Share(hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
 	defer h.Close()
 
 	// verify admin server
-	session := getAndVerifySession(t, adminSocketFile, hostURL, nodeAddr)
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
 
 	// verify input/output
 	hostInputCh, hostOutputCh := h.InputOutput()
-	hostScanner := scanner(hostOutputCh)
+	hostScanner := scanner(t, hostOutputCh)
 
 	c := &Client{
 		PrivateKeys: []string{ClientPrivateKey},
 	}
-	if err := c.Join(session, hostURL); err != nil {
-		t.Fatal(err)
-	}
+	err = c.Join(session, clientJoinURL)
+	require.NoError(err)
+	defer c.Close()
 
 	remoteInputCh, remoteOutputCh := c.InputOutput()
-	remoteScanner := scanner(remoteOutputCh)
+	remoteScanner := scanner(t, remoteOutputCh)
 
-	// client output
-	// client should get "welcome message"
-	// \n
-	// === Attached to read-only session ===
-	// \n
-	if want, got := "=== Attached to read-only session ===", scan(remoteScanner); want != got {
-		t.Fatalf("want=%q got=%q:\n%s", want, got, cmp.Diff(want, got))
-	}
+	// The guest is told the session is read-only.
+	expectLine(t, remoteScanner, "upterm: this session is read-only; what you type isn't sent.", "client should see the read-only notice")
 
 	// host input should still work
-	hostInputCh <- "echo hello"
-	if want, got := "echo hello", scan(hostScanner); want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
-	}
-	if want, got := "hello", scan(hostScanner); want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
+	hostInputCh <- `echo "hello"`
+
+	expectLine(t, hostScanner, `echo "hello"`, "host should echo command in read-only mode")
+	expectLine(t, hostScanner, "hello", "host should show output in read-only mode")
+
+	// Drain any buffered output (e.g., PowerShell prompts) before testing client input blocking
+	// This prevents flaky failures where trailing shell output is mistaken for client input
+	drainTimeout := 100 * time.Millisecond
+	drained := false
+	for !drained {
+		select {
+		case str := <-hostOutputCh:
+			testLogger.Debug("drained buffered host output", "output", str)
+		case <-time.After(drainTimeout):
+			drained = true
+		}
 	}
 
 	// client input should be disabled
-	remoteInputCh <- "echo hello again"
+	remoteInputCh <- `echo "hello again"`
+
 	// client should read what was sent by hostInputCh and not what was sent on remoteInputCh
-	if want, got := "echo hello", scan(remoteScanner); want != got {
-		t.Fatalf("want=%q got=%q:\n%s", want, got, cmp.Diff(want, got))
-	}
+	expectLine(t, remoteScanner, `echo "hello"`, "client should see host output, not its own input")
 
 	select {
 	// host shouldn't receive anything from client and because client input is disabled
 	case str := <-hostOutputCh:
 		t.Fatalf("host shouldn't receive client input: receive=%s", str)
-	case <-time.After(time.Second * 3):
-		log.Info("Timeout hit..")
+	case <-time.After(sshAttachTimeout):
+		testLogger.Debug("Read-only timeout confirmed - client input properly blocked")
 		return
 	}
 
 }
 
-func getAndVerifySession(t *testing.T, adminSocketFile string, wantHostURL, wantNodeURL string) *api.GetSessionResponse {
-	adminClient, err := host.AdminClient(adminSocketFile)
-	if err != nil {
-		t.Fatal(err)
+func testClientLocalPortForward(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
+
+	adminSocketFile := setupAdminSocket(t)
+
+	h := &Host{
+		Command:                  getTestShell(),
+		PrivateKeys:              []string{HostPrivateKey},
+		AdminSocketFile:          adminSocketFile,
+		PermittedClientPublicKey: ClientPublicKeyContent,
+		AllowLocalTCPForwarding:  true,
+	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
+	defer h.Close()
+
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
+
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(err)
+	defer func() {
+		_ = targetLn.Close()
+	}()
+
+	targetErrCh := make(chan error, 1)
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			targetErrCh <- err
+			return
+		}
+		defer func() {
+			_ = conn.Close()
+		}()
+
+		if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			targetErrCh <- err
+			return
+		}
+
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			targetErrCh <- err
+			return
+		}
+
+		if string(buf) != "ping" {
+			targetErrCh <- fmt.Errorf("unexpected forwarded payload: %q", string(buf))
+			return
+		}
+
+		_, err = io.WriteString(conn, "pong")
+		targetErrCh <- err
+	}()
+
+	c := &Client{
+		PrivateKeys: []string{ClientPrivateKey},
+	}
+	err = c.Join(session, clientJoinURL)
+	require.NoError(err)
+	defer c.Close()
+
+	forwardedConn, err := c.sshClient.Dial("tcp", targetLn.Addr().String())
+	require.NoError(err)
+	defer func() {
+		_ = forwardedConn.Close()
+	}()
+
+	forwardErrCh := make(chan error, 1)
+	go func() {
+		if _, err := io.WriteString(forwardedConn, "ping"); err != nil {
+			forwardErrCh <- err
+			return
+		}
+
+		reply := make([]byte, 4)
+		if _, err := io.ReadFull(forwardedConn, reply); err != nil {
+			forwardErrCh <- err
+			return
+		}
+
+		if string(reply) != "pong" {
+			forwardErrCh <- fmt.Errorf("unexpected forwarded reply: %q", string(reply))
+			return
+		}
+
+		forwardErrCh <- nil
+	}()
+
+	select {
+	case err := <-forwardErrCh:
+		require.NoError(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for forwarded TCP round trip")
 	}
 
-	sess, err := adminClient.GetSession(context.Background(), &api.GetSessionRequest{})
-	if err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-targetErrCh:
+		require.NoError(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for forwarded TCP target")
 	}
+
+	// The host lists the forward as a jump, apart from the terminal this
+	// client joined with, and says where it went: the destination the guest
+	// asked for, through the relay unchanged.
+	conn, err := host.AdminConn(adminSocketFile)
+	require.NoError(err)
+	defer func() { _ = conn.Close() }()
+	adminClient := api.NewAdminServiceClient(conn)
+	want := []string{targetLn.Addr().String()}
+	require.Eventually(func() bool {
+		sess, err := adminClient.GetSession(context.Background(), &api.GetSessionRequest{})
+		if err != nil {
+			return false
+		}
+		for _, c := range sess.ConnectedClients {
+			if c.Kind == api.Client_FORWARD {
+				return slices.Equal(want, c.ForwardDestinations)
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond, "the host never listed a jump to %s", want)
+}
+
+func testClientLocalPortForwardDisabled(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	adminSocketFile := setupAdminSocket(t)
+
+	h := &Host{
+		Command:                  getTestShell(),
+		PrivateKeys:              []string{HostPrivateKey},
+		AdminSocketFile:          adminSocketFile,
+		PermittedClientPublicKey: ClientPublicKeyContent,
+	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
+	defer h.Close()
+
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
+
+	c := &Client{
+		PrivateKeys: []string{ClientPrivateKey},
+	}
+	err = c.Join(session, clientJoinURL)
+	require.NoError(err)
+	defer c.Close()
+
+	forwardedConn, err := c.sshClient.Dial("tcp", "127.0.0.1:1")
+	if forwardedConn != nil {
+		_ = forwardedConn.Close()
+	}
+
+	require.Error(err)
+	assert.ErrorContains(err, "upterm: port forwarding denied; nothing on the host can approve it now.")
+}
+
+// testGuestKeepaliveIsAnswered pins what a guest's liveness check relies on: a
+// keepalive it sends on its SSH connection comes back with a reply, whether the
+// relay answers it or passes it on towards the host. The reply may be a
+// refusal; only silence would leave the guest unable to tell a quiet connection
+// from a dead one.
+func testGuestKeepaliveIsAnswered(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
+
+	adminSocketFile := setupAdminSocket(t)
+
+	h := &Host{
+		Command:         getTestShell(),
+		PrivateKeys:     []string{HostPrivateKey},
+		AdminSocketFile: adminSocketFile,
+	}
+	err := h.Share(hostShareURL)
+	require.NoError(err)
+	defer h.Close()
+
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
+
+	c := &Client{
+		PrivateKeys: []string{ClientPrivateKey},
+	}
+	err = c.Join(session, clientJoinURL)
+	require.NoError(err)
+	defer c.Close()
+
+	replied := make(chan error, 1)
+	go func() {
+		_, _, err := c.sshClient.SendRequest(upterm.OpenSSHKeepAliveRequestType, true, nil)
+		replied <- err
+	}()
+
+	select {
+	case err := <-replied:
+		require.NoError(err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("no reply to a guest's keepalive through the relay")
+	}
+}
+
+func getAndVerifySession(t *testing.T, adminSocketFile string, wantHostURL, wantNodeURL string) *api.GetSessionResponse {
+	require := require.New(t)
+
+	conn, err := host.AdminConn(adminSocketFile)
+	require.NoError(err)
+	defer func() { _ = conn.Close() }()
+	adminClient := api.NewAdminServiceClient(conn)
+
+	sess, err := adminClient.GetSession(context.Background(), &api.GetSessionRequest{})
+	require.NoError(err)
 
 	checkSessionPayload(t, sess, wantHostURL, wantNodeURL)
 
 	return sess
 }
 
+// adminClientSessionTimeout bounds one admin query. The socket is local and
+// the server answers off an in-memory repo, so anything slower than this is a
+// host that has stopped answering rather than one that is busy.
+const adminClientSessionTimeout = 10 * time.Second
+
+// adminClientSession asks the admin socket what the session looks like right
+// now. Unlike getAndVerifySession it asserts nothing, so a caller can poll it.
+func adminClientSession(socket string) (*api.GetSessionResponse, error) {
+	conn, err := host.AdminConn(socket)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = conn.Close() }()
+	adminClient := api.NewAdminServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), adminClientSessionTimeout)
+	defer cancel()
+	return adminClient.GetSession(ctx, &api.GetSessionRequest{})
+}
+
+// awaitGuestsAttached waits until the host at socket lists at least n guests,
+// and fails the test if it doesn't within callbackTimeout.
+//
+// A test that has the host produce output, and then expects a guest that has
+// just joined to see it as lines, waits here before producing it. Client.Join
+// returns once the host has accepted the guest's shell, and the host attaches
+// the guest's output only after that. Output produced in between is not lost:
+// it is in the session's ring when the guest attaches. But once the ring holds
+// output, a guest with a terminal is normally sent the screen rebuilt from it
+// rather than the raw bytes, its rows placed by cursor moves instead of ended
+// by newlines, so the lines the test scans for never come. The host lists a
+// guest only once its output is attached.
+//
+// It asks over one connection, closed when it returns, rather than opening
+// a fresh connection for every poll.
+func awaitGuestsAttached(t *testing.T, socket string, n int) {
+	t.Helper()
+	conn, err := host.AdminConn(socket)
+	require.NoError(t, err)
+	defer func() {
+		_ = conn.Close()
+	}()
+	adminClient := api.NewAdminServiceClient(conn)
+
+	require.Eventually(t, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), adminClientSessionTimeout)
+		defer cancel()
+		sess, err := adminClient.GetSession(ctx, &api.GetSessionRequest{})
+		if err != nil {
+			return false
+		}
+		guests := 0
+		for _, c := range sess.ConnectedClients {
+			if c.Kind == api.Client_GUEST {
+				guests++
+			}
+		}
+		return guests >= n
+	}, callbackTimeout, 50*time.Millisecond, "the host never listed %d guests as attached", n)
+}
+
 func checkSessionPayload(t *testing.T, sess *api.GetSessionResponse, wantHostURL, wantNodeURL string) {
-	if sess.SessionId == "" {
-		t.Fatalf("session ID is empty")
+	require := require.New(t)
+	require.NotEmpty(sess.SessionId, "session ID should not be empty")
+	require.Equal(wantHostURL, sess.Host, "host URL mismatch")
+	require.Equal(wantNodeURL, sess.NodeAddr, "node URL mismatch")
+	require.NotEmpty(sess.SshUser, "SSH user should not be empty")
+}
+
+// testOldClientToNewConsulServer tests backward compatibility scenario where
+// an old upterm client (using embedded format) connects to a new uptermd server running in Consul mode
+func testOldClientToNewConsulServer(t *testing.T, hostShareURL, hostNodeAddr, clientJoinURL string) {
+	require := require.New(t)
+
+	// Setup admin socket
+	adminSocketFile := setupAdminSocket(t)
+
+	h := &Host{
+		Command:         getTestShell(),
+		PrivateKeys:     []string{HostPrivateKey},
+		AdminSocketFile: adminSocketFile,
 	}
-	if want, got := wantHostURL, sess.Host; want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
+	err := h.Share(hostShareURL)
+	require.NoError(err)
+	defer h.Close()
+
+	// Get session info from host (this is in the new format for Consul mode)
+	session := getAndVerifySession(t, adminSocketFile, hostShareURL, hostNodeAddr)
+
+	// Create an embedded format SSH user (what old clients would send)
+	embeddedEncoder := routing.NewEncodeDecoder(routing.ModeEmbedded)
+	oldClientSSHUser := embeddedEncoder.Encode(session.SessionId, session.NodeAddr)
+
+	t.Logf("Testing backward compatibility:")
+	t.Logf("  Session ID: %s", session.SessionId)
+	t.Logf("  Node Address: %s", session.NodeAddr)
+	t.Logf("  New client SSH user (Consul format): %s", session.SshUser)
+	t.Logf("  Old client SSH user (embedded format): %s", oldClientSSHUser)
+
+	// Create a regular client but override the SSH username to simulate old client behavior
+	c := &Client{
+		PrivateKeys: []string{ClientPrivateKey},
 	}
-	if want, got := wantNodeURL, sess.NodeAddr; want != got {
-		t.Fatalf("want=%s got=%s:\n%s", want, got, cmp.Diff(want, got))
+
+	// Create a modified session response with the old format SSH user
+	oldFormatSession := &api.GetSessionResponse{
+		SessionId: session.SessionId,
+		NodeAddr:  session.NodeAddr,
+		Host:      session.Host,
+		SshUser:   oldClientSSHUser, // Use old embedded format instead of Consul format
+	}
+
+	// This should work thanks to our backward compatibility fix
+	err = c.Join(oldFormatSession, clientJoinURL)
+	require.NoError(err, "Old client with embedded format should be able to connect to Consul server")
+	defer c.Close()
+
+	t.Log("Backward compatibility test passed: old client successfully connected to new Consul server")
+}
+
+// setupAdminSocket creates a temporary admin socket and returns the socket file path
+func setupAdminSocket(t *testing.T) string {
+	require := require.New(t)
+
+	// Use a shorter temp dir to avoid Unix socket path length limits
+	adminSockDir, err := os.MkdirTemp("", "up")
+	require.NoError(err)
+
+	t.Cleanup(func() {
+		_ = os.RemoveAll(adminSockDir)
+	})
+	return filepath.Join(adminSockDir, "u.sock")
+}
+
+// keyRefusal is what a plain ssh guest joining at clientJoinURL is told when
+// session, shared at hostShareURL, refuses its key. Where the entry node
+// completes the handshake and carries the connection on, the session's node
+// refuses the key and says so, and the guest reads that verdict, in a
+// sentence, when it opens its session. Otherwise the guest's handshake is with
+// the node that holds the authorized keys, and it fails to authenticate.
+func keyRefusal(session *api.GetSessionResponse, hostShareURL, clientJoinURL string) string {
+	if entryNodeCompletesHandshake(hostShareURL, clientJoinURL) {
+		return "upterm: session " + session.SessionId + " refused your key; if another key is authorized, pass it with ssh -i, or ask the host to add yours."
+	}
+	return "unable to authenticate"
+}
+
+// connectRelayGuest uses the production relay transport without opening a shared
+// terminal: Herdr and Remote-SSH issue their own session and forwarding channels.
+func connectRelayGuest(t *testing.T, record *api.GetSessionResponse, joinURL string) *Client {
+	t.Helper()
+	c := &Client{PrivateKeys: []string{ClientPrivateKey}}
+	require.NoError(t, c.Connect(record, joinURL))
+	t.Cleanup(c.Close)
+	return c
+}
+
+func awaitRelayWait(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(reachTimeout):
+		t.Fatal("relay channel did not finish")
+		return nil
 	}
 }
 
-func newAdminSocketDir() (string, error) {
-	return ioutil.TempDir("", "upterm")
+func relayStatus(t *testing.T, err error) int {
+	t.Helper()
+	if err == nil {
+		return 0
+	}
+	var status *ssh.ExitError
+	require.ErrorAs(t, err, &status)
+	return status.ExitStatus()
+}
+
+func relayExec(t *testing.T, c *Client, raw string, stdin io.Reader) ([]byte, []byte, int) {
+	t.Helper()
+	s, err := c.sshClient.NewSession()
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+	var out, stderr bytes.Buffer
+	s.Stdout = &out
+	s.Stderr = &stderr
+	s.Stdin = stdin
+	done := make(chan error, 1)
+	go func() { done <- s.Run(raw) }()
+	status := relayStatus(t, awaitRelayWait(t, done))
+	return out.Bytes(), stderr.Bytes(), status
+}
+
+func requireGuestPresence(t *testing.T, h *Host, want int) {
+	t.Helper()
+	requireRelayPresence(t, h, api.Client_GUEST, want)
+}
+func requireForwardPresence(t *testing.T, h *Host, want int) {
+	t.Helper()
+	requireRelayPresence(t, h, api.Client_FORWARD, want)
+}
+func requireRelayPresence(t *testing.T, h *Host, kind api.Client_Kind, want int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		record, err := adminClientSession(h.AdminSocketFile)
+		if err != nil {
+			return false
+		}
+		n := 0
+		for _, c := range record.ConnectedClients {
+			if c.Kind == kind {
+				n++
+			}
+		}
+		return n == want
+	}, reachTimeout, redialPoll, "visible session clients of kind %s: want %d", kind, want)
 }

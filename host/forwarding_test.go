@@ -1,0 +1,583 @@
+package host
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/owenthereal/upterm/host/api"
+	"github.com/owenthereal/upterm/host/consent"
+	"github.com/owenthereal/upterm/host/internal"
+	"github.com/owenthereal/upterm/host/sessiondir"
+	"github.com/pkg/sftp"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+// A loopback echo target proves that an accepted forward actually transfers data.
+func forwardingTarget(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	var handlers sync.WaitGroup
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			handlers.Add(1)
+			go func() {
+				defer handlers.Done()
+				defer func() { _ = conn.Close() }()
+				_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close(); <-done; handlers.Wait() })
+	return ln.Addr().String()
+}
+
+func transferForward(client *ssh.Client, addr string) (net.Conn, error) {
+	conn, err := client.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = conn.Write([]byte("forwarded bytes")); err == nil {
+		data := make([]byte, len("forwarded bytes"))
+		_, err = io.ReadFull(conn, data)
+		if err == nil && string(data) != "forwarded bytes" {
+			err = fmt.Errorf("unexpected echo: %q", data)
+		}
+	}
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func forwardingAdmin(t *testing.T, f *joinTimeoutHost) api.AdminServiceClient {
+	t.Helper()
+	conn, err := grpc.NewClient("unix://"+f.h.AdminSocketFile, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	return api.NewAdminServiceClient(conn)
+}
+
+func connectedForwardingGuests(t *testing.T, admin api.AdminServiceClient) []*api.Client {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	response, err := admin.GetSession(ctx, &api.GetSessionRequest{})
+	require.NoError(t, err)
+	return response.ConnectedClients
+}
+
+func forwardingCallback(t *testing.T, events <-chan *api.Client) *api.Client {
+	t.Helper()
+	select {
+	case client := <-events:
+		return client
+	case <-time.After(2 * time.Second):
+		t.Fatal("forwarding lifecycle callback missing")
+		return nil
+	}
+}
+
+func TestForwardingPresenceLifetime(t *testing.T) {
+	target := forwardingTarget(t)
+	f := newJoinTimeoutHost(t)
+	f.h.AllowLoopbackTCPForwarding = true
+	joined, left := make(chan *api.Client, 32), make(chan *api.Client, 32)
+	f.h.ClientJoinedCallback = func(c *api.Client) { joined <- c }
+	f.h.ClientLeftCallback = func(c *api.Client) { left <- c }
+	f.start(t)
+	awaitJoinTimeoutSignal(t, f.ready, "readiness")
+	admin := forwardingAdmin(t, f)
+	client := f.guestClient(t)
+	require.Empty(t, connectedForwardingGuests(t, admin), "idle authenticated transport is not present")
+	select {
+	case c := <-joined:
+		t.Fatalf("auth-only callback: %v", c)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Race the first accepted forwards: they must share one transport presence.
+	const count = 8
+	conns := make([]net.Conn, count)
+	errs := make([]error, count)
+	var wg sync.WaitGroup
+	for i := range conns {
+		wg.Add(1)
+		go func() { defer wg.Done(); conns[i], errs[i] = transferForward(client, target) }()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+	guest := forwardingCallback(t, joined)
+	require.Equal(t, api.Client_FORWARD, guest.Kind, "a connection that only forwards is a jump, not a terminal guest")
+	require.Equal(t, []string{target}, guest.ForwardDestinations, "the join names where the jump goes")
+	require.NotEmpty(t, guest.Id)
+	require.NotEmpty(t, guest.PublicKeyFingerprint)
+	require.NotEmpty(t, guest.Addr)
+	require.Len(t, connectedForwardingGuests(t, admin), 1)
+	require.Equal(t, guest.Id, connectedForwardingGuests(t, admin)[0].Id)
+	require.Equal(t, api.Client_FORWARD, connectedForwardingGuests(t, admin)[0].Kind)
+	require.True(t, f.record(t).FirstGuestJoinedAt.IsZero())
+	for _, conn := range conns {
+		require.NoError(t, conn.Close())
+	}
+	select {
+	case c := <-left:
+		t.Fatalf("channel close removed live transport: %v", c)
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.Len(t, connectedForwardingGuests(t, admin), 1)
+	// Reusing the idle transport does not publish a second presence.
+	conn, err := transferForward(client, target)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	require.NoError(t, client.Close())
+	require.Equal(t, guest.Id, forwardingCallback(t, left).Id)
+	require.Empty(t, connectedForwardingGuests(t, admin))
+	select {
+	case c := <-joined:
+		t.Fatalf("duplicate joined: %v", c)
+	case c := <-left:
+		t.Fatalf("duplicate left: %v", c)
+	case <-time.After(50 * time.Millisecond):
+	}
+	f.finish(t, "0")
+	require.NoError(t, f.result(t))
+}
+
+// A jump's destinations are what the host most wants to know about it:
+// localhost:22 is someone reaching this machine's sshd, and anywhere else is
+// someone reaching past it. Each distinct one is listed once, in the order
+// first opened, as the connection opens them; past a bound, further forwards
+// are counted rather than listed, so a guest cannot grow the session's
+// answer without limit.
+func TestForwardingClientListsItsDestinations(t *testing.T) {
+	const listed = 16
+	targets := make([]string, listed+1)
+	for i := range targets {
+		targets[i] = forwardingTarget(t)
+	}
+	f := newJoinTimeoutHost(t)
+	f.h.AllowLocalTCPForwarding = true
+	left := make(chan *api.Client, 1)
+	f.h.ClientLeftCallback = func(c *api.Client) { left <- c }
+	f.start(t)
+	awaitJoinTimeoutSignal(t, f.ready, "readiness")
+	admin := forwardingAdmin(t, f)
+	client := f.guestClient(t)
+
+	forward := func(target string) {
+		t.Helper()
+		conn, err := transferForward(client, target)
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+	}
+	jump := func() *api.Client {
+		t.Helper()
+		clients := connectedForwardingGuests(t, admin)
+		require.Len(t, clients, 1)
+		return clients[0]
+	}
+
+	forward(targets[0])
+	awaitJoinTimeoutSignal(t, f.joined, "forwarding presence")
+	forward(targets[1])
+	forward(targets[0])
+	require.Equal(t, targets[:2], jump().ForwardDestinations, "each destination once, in the order first opened")
+
+	for _, target := range targets[2:listed] {
+		forward(target)
+	}
+	require.Equal(t, targets[:listed], jump().ForwardDestinations)
+	require.Zero(t, jump().UnlistedForwards)
+
+	forward(targets[listed])
+	forward(targets[listed])
+	forward(targets[0])
+	require.Equal(t, targets[:listed], jump().ForwardDestinations, "the list stops growing at its bound")
+	require.Equal(t, uint32(2), jump().UnlistedForwards, "forwards past it are counted")
+
+	// The departure is reported as the jump ended, not as it began: the
+	// leave notification names every destination the join one couldn't.
+	require.NoError(t, client.Close())
+	gone := forwardingCallback(t, left)
+	require.Equal(t, targets[:listed], gone.ForwardDestinations)
+	require.Equal(t, uint32(2), gone.UnlistedForwards)
+	f.finish(t, "0")
+	require.NoError(t, f.result(t))
+}
+
+func TestForwardingPresenceDoesNotDisarmJoinTimeout(t *testing.T) {
+	for _, registry := range []bool{true, false} {
+		t.Run(fmt.Sprintf("session_dir_%t", registry), func(t *testing.T) {
+			target := forwardingTarget(t)
+			f := newJoinTimeoutHost(t)
+			if !registry {
+				f.h.AdminSocketFile = filepath.Join(f.root, "admin.sock")
+			}
+			f.h.AllowLocalTCPForwarding = true
+			clock := newFakeJoinClock()
+			f.h.joinClock = clock.clock()
+			f.h.JoinTimeout = 800 * time.Millisecond
+			f.start(t)
+			awaitJoinTimeoutSignal(t, f.ready, "readiness")
+			client := f.guestClient(t)
+			conn, err := transferForward(client, target)
+			require.NoError(t, err)
+			defer func() { _ = conn.Close() }()
+			awaitJoinTimeoutSignal(t, f.joined, "forwarding presence")
+			require.Len(t, connectedForwardingGuests(t, forwardingAdmin(t, f)), 1)
+			if registry {
+				require.True(t, f.record(t).FirstGuestJoinedAt.IsZero())
+			}
+			// The presence callback runs after the lifecycle has handled the
+			// forward, so presence that counted as a join would already have
+			// stopped the timer.
+			clock.only(t, 800*time.Millisecond).fire()
+			require.NoError(t, f.result(t))
+			if registry {
+				require.Equal(t, sessiondir.ReasonJoinTimeout, f.record(t).Reason)
+				require.True(t, f.record(t).FirstGuestJoinedAt.IsZero())
+			}
+		})
+	}
+}
+
+func TestUnacceptedForwardingDoesNotPublishPresence(t *testing.T) {
+	for _, mode := range []string{"denied", "malformed", "failed_dial"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newJoinTimeoutHost(t)
+			f.h.AllowLocalTCPForwarding = mode != "denied"
+			f.start(t)
+			awaitJoinTimeoutSignal(t, f.ready, "readiness")
+			client := f.guestClient(t)
+			if mode == "malformed" {
+				_, _, err := client.OpenChannel("direct-tcpip", []byte{0})
+				require.Error(t, err)
+			} else {
+				target := forwardingTarget(t)
+				if mode == "failed_dial" {
+					ln, err := net.Listen("tcp", "127.0.0.1:0")
+					require.NoError(t, err)
+					target = ln.Addr().String()
+					require.NoError(t, ln.Close())
+				}
+				_, err := client.Dial("tcp", target)
+				require.Error(t, err)
+			}
+			require.Empty(t, connectedForwardingGuests(t, forwardingAdmin(t, f)))
+			require.NoError(t, client.Close())
+			select {
+			case <-f.joined:
+				t.Fatal("unaccepted forward joined")
+			case <-f.left:
+				t.Fatal("unaccepted forward left")
+			case <-time.After(100 * time.Millisecond):
+			}
+			f.finish(t, "0")
+			require.NoError(t, f.result(t))
+		})
+	}
+}
+
+func TestJoinTimeoutAcceptedSFTPDisarmsDeadline(t *testing.T) {
+	f := newJoinTimeoutHost(t)
+	clock := newFakeJoinClock()
+	f.h.joinClock = clock.clock()
+	f.h.JoinTimeout = 200 * time.Millisecond
+	f.start(t)
+	awaitJoinTimeoutSignal(t, f.ready, "readiness")
+	joins := f.h.joins
+	armed := clock.only(t, 200*time.Millisecond)
+	client := f.guestClient(t)
+	transfer, err := sftp.NewClient(client)
+	require.NoError(t, err)
+	awaitJoinTimeoutSignal(t, f.joined, "SFTP join")
+	// Checked directly, because expire's own check of the join would keep
+	// even a live timer from ending the session.
+	require.True(t, armed.stopped(), "SFTP stopped the timer")
+	require.True(t, joins.snapshot().Deadline.IsZero(), "SFTP cleared the deadline")
+	require.NoError(t, transfer.Close())
+	awaitJoinTimeoutSignal(t, f.left, "SFTP left")
+	require.Len(t, clock.timers(), 1, "leaving armed nothing new")
+	// A fire already on its way when the join stopped the timer.
+	armed.fire()
+	require.False(t, hasFired(joins), "SFTP did not disarm deadline")
+	require.False(t, f.record(t).FirstGuestJoinedAt.IsZero())
+	f.finish(t, "0")
+	require.NoError(t, f.result(t))
+}
+
+func TestForwardingDisconnectDuringConcurrentOpens(t *testing.T) {
+	target := forwardingTarget(t)
+	f := newJoinTimeoutHost(t)
+	f.h.AllowLocalTCPForwarding = true
+	joined, left := make(chan *api.Client, 32), make(chan *api.Client, 32)
+	f.h.ClientJoinedCallback = func(c *api.Client) { joined <- c }
+	f.h.ClientLeftCallback = func(c *api.Client) { left <- c }
+	f.start(t)
+	awaitJoinTimeoutSignal(t, f.ready, "readiness")
+	admin := forwardingAdmin(t, f)
+	ids := make(map[string]bool)
+	for range 12 {
+		client := f.guestClient(t)
+		// Dial returning means Accept succeeded; disconnect without waiting for the
+		// asynchronous presence callback, while more channel handlers are running.
+		first, err := client.Dial("tcp", target)
+		require.NoError(t, err)
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				conn, err := client.Dial("tcp", target)
+				if err == nil {
+					_ = conn.Close()
+				}
+			}()
+		}
+		require.NoError(t, client.Close())
+		_ = first.Close()
+		wg.Wait()
+		guest := forwardingCallback(t, joined)
+		require.False(t, ids[guest.Id], "each transport needs its own lifecycle ID")
+		ids[guest.Id] = true
+		require.Equal(t, guest.Id, forwardingCallback(t, left).Id)
+		require.Empty(t, connectedForwardingGuests(t, admin))
+	}
+	f.finish(t, "0")
+	require.NoError(t, f.result(t))
+	require.Empty(t, joined)
+	require.Empty(t, left)
+}
+
+func TestForwardingLifecycleReconcilesLeftBeforePresenceWithoutJoining(t *testing.T) {
+	repo := internal.NewClientRepo()
+	var events []string
+	lifecycle := &clientLifecycle{
+		repo: repo, pendingLeft: make(map[string]*api.Client),
+		onGuestJoin: func(*api.Client) error { t.Error("forwarding disarmed first-guest deadline"); return nil },
+		onJoined:    func(*api.Client) { events = append(events, "joined") },
+		onLeft:      func(*api.Client) { events = append(events, "left") },
+	}
+	client := &api.Client{Id: "quick-forward", Kind: api.Client_GUEST}
+	lifecycle.left(client.Id, nil)
+	lifecycle.joined(client, false)
+	require.Empty(t, repo.Clients())
+	require.Empty(t, lifecycle.pendingLeft)
+	require.Equal(t, []string{"joined", "left"}, events)
+}
+
+// Skipping forwarding consent must fail before a listening destination sees a socket.
+type forwardingPermission struct {
+	check func(context.Context, consent.Operation, consent.ClientInfo, ...string) (consent.Decision, error)
+}
+
+func (p forwardingPermission) CheckPermission(ctx context.Context, op consent.Operation, c consent.ClientInfo, subjects ...string) (consent.Decision, error) {
+	return p.check(ctx, op, c, subjects...)
+}
+func (forwardingPermission) ClearConnection(string) {}
+
+func TestForwardingConsentCancellation(t *testing.T) {
+	target := forwardingTarget(t)
+	f := newJoinTimeoutHost(t)
+	called := make(chan struct{}, 1)
+	release := make(chan struct{})
+	f.h.PermissionChecker = forwardingPermission{check: func(ctx context.Context, op consent.Operation, c consent.ClientInfo, subjects ...string) (consent.Decision, error) {
+		require.Equal(t, consent.OpForward, op)
+		require.NotEmpty(t, c.Fingerprint)
+		require.NotEmpty(t, c.ConnectionID)
+		host, port, err := net.SplitHostPort(target)
+		require.NoError(t, err)
+		require.Equal(t, []string{host, port}, subjects)
+		called <- struct{}{}
+		select {
+		case <-release:
+			return consent.AllowConnection, nil
+		case <-ctx.Done():
+			return consent.Deny, ctx.Err()
+		}
+	}}
+	f.start(t)
+	awaitJoinTimeoutSignal(t, f.ready, "readiness")
+	client := f.guestClient(t)
+	result := make(chan error, 1)
+	go func() {
+		c, err := transferForward(client, target)
+		if c != nil {
+			_ = c.Close()
+		}
+		result <- err
+	}()
+	select {
+	case <-called:
+	case err := <-result:
+		t.Fatalf("forwarding permission was not consulted: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("permission not requested")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("forward accepted before permission: %v", err)
+	default:
+	}
+	require.Empty(t, connectedForwardingGuests(t, forwardingAdmin(t, f)))
+	close(release)
+	require.NoError(t, <-result)
+	require.NoError(t, client.Close())
+	f.finish(t, "0")
+	require.NoError(t, f.result(t))
+}
+
+func TestForwardingHalfCloseDrainsTarget(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	targetDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			targetDone <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		data, err := io.ReadAll(conn)
+		if err == nil && string(data) != "request until EOF" {
+			err = fmt.Errorf("wrong request %q", data)
+		}
+		if err == nil {
+			_, err = conn.Write([]byte("response after EOF"))
+		}
+		targetDone <- err
+	}()
+	f := newJoinTimeoutHost(t)
+	f.h.AllowLoopbackTCPForwarding = true
+	f.start(t)
+	awaitJoinTimeoutSignal(t, f.ready, "readiness")
+	client := f.guestClient(t)
+	conn, err := client.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	_, err = conn.Write([]byte("request until EOF"))
+	require.NoError(t, err)
+	half, ok := conn.(interface{ CloseWrite() error })
+	require.True(t, ok)
+	require.NoError(t, half.CloseWrite())
+	reply := make(chan string, 1)
+	go func() {
+		data, err := io.ReadAll(conn)
+		if err != nil {
+			reply <- err.Error()
+		} else {
+			reply <- string(data)
+		}
+	}()
+	select {
+	case data := <-reply:
+		require.Equal(t, "response after EOF", data)
+	case <-time.After(3 * time.Second):
+		t.Fatal("half-closed forwarding did not drain")
+	}
+	require.NoError(t, <-targetDone)
+	require.NoError(t, client.Close())
+	f.finish(t, "0")
+	require.NoError(t, f.result(t))
+}
+
+func TestForwardingActiveTransferStopsWithHost(t *testing.T) {
+	target := forwardingTarget(t)
+	f := newJoinTimeoutHost(t)
+	f.h.AllowLoopbackTCPForwarding = true
+	f.start(t)
+	awaitJoinTimeoutSignal(t, f.ready, "readiness")
+	client := f.guestClient(t)
+	conn, err := transferForward(client, target)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	done := make(chan error, 1)
+	go func() { _, err := conn.Read(make([]byte, 1)); done <- err }()
+	f.finish(t, "0")
+	require.NoError(t, f.result(t))
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("active forward survived host teardown")
+	}
+	_ = client.Close()
+}
+
+func TestForwardingAuditHostBoundary(t *testing.T) {
+	for _, allowed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("loopback_pregrant_%v", allowed), func(t *testing.T) {
+			target := forwardingTarget(t)
+			f := newJoinTimeoutHost(t)
+			var logs lockedBuffer
+			f.h.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			f.h.AllowLoopbackTCPForwarding = allowed
+			f.start(t)
+			awaitJoinTimeoutSignal(t, f.ready, "readiness")
+			client := f.guestClient(t)
+			conn, err := transferForward(client, target)
+			if allowed {
+				require.NoError(t, err)
+				require.NoError(t, conn.Close())
+			} else {
+				require.Error(t, err)
+			}
+			require.NoError(t, client.Close())
+			f.finish(t, "0")
+			require.NoError(t, f.result(t))
+			var records []map[string]any
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				var record map[string]any
+				require.NoError(t, json.Unmarshal([]byte(line), &record))
+				if record["msg"] == "forwarding permission policy" {
+					records = append(records, record)
+				}
+			}
+			require.Len(t, records, 1, "every forwarding permission decision must reach the configured host logger")
+			record := records[0]
+			outcome := "unavailable"
+			if allowed {
+				outcome = "allowed"
+			}
+			require.Equal(t, outcome, record["outcome"])
+			require.Equal(t, "forward", record["capability"])
+			require.Equal(t, "forward", record["operation"])
+			address, port, err := net.SplitHostPort(target)
+			require.NoError(t, err)
+			require.Equal(t, []any{strconv.QuoteToASCII(address), strconv.QuoteToASCII(port)}, record["subjects"])
+			for _, field := range []string{"fingerprint", "connection_id", "request_id"} {
+				value, ok := record[field].(string)
+				require.True(t, ok, field)
+				raw, err := strconv.Unquote(value)
+				require.NoError(t, err)
+				require.NotEmpty(t, raw, field)
+			}
+		})
+	}
+}

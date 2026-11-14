@@ -11,8 +11,6 @@ import (
 )
 
 func Test_ContextReader(t *testing.T) {
-	t.Parallel()
-
 	t.Run("happy path", func(t *testing.T) {
 		t.Parallel()
 
@@ -49,10 +47,17 @@ func Test_ContextReader(t *testing.T) {
 	t.Run("cancel context during copy", func(t *testing.T) {
 		t.Parallel()
 
+		// Cancellation abandons the slow read. Release the fake when the test
+		// ends so the abandoned worker can finish, including on failure. It
+		// must not reach t: that would panic after the subtest has finished.
+		releaseRead := make(chan struct{})
+		t.Cleanup(func() { close(releaseRead) })
 		r := readFunc(func(p []byte) (int, error) {
-			time.Sleep(5 * time.Second) // simulate slow read
-			t.Error("should never get here")
-			return 0, nil
+			select {
+			case <-time.After(5 * time.Second): // simulate slow read
+			case <-releaseRead:
+			}
+			return copy(p, "late"), nil
 		})
 		w := bytes.NewBuffer(nil)
 
@@ -67,15 +72,22 @@ func Test_ContextReader(t *testing.T) {
 		if diff := cmp.Diff(want.Error(), got.Error()); diff != "" {
 			t.Errorf("want=%s got=%s:\n%s", want, got, diff)
 		}
+		if w.Len() != 0 {
+			t.Errorf("abandoned read delivered %q", w.String())
+		}
 	})
 
 	t.Run("cancel context after copy", func(t *testing.T) {
 		t.Parallel()
 
 		ch := make(chan string, 1)
+		t.Cleanup(func() { close(ch) })
 		ch <- "hello2" // feed with one read and then it hangs
 		r := readFunc(func(p []byte) (int, error) {
-			s := <-ch
+			s, ok := <-ch
+			if !ok {
+				return 0, io.EOF
+			}
 			return bytes.NewBufferString(s).Read(p)
 		})
 		w := bytes.NewBuffer(nil)

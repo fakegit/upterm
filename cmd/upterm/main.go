@@ -1,13 +1,11 @@
 package main
 
 import (
+	"os"
+
 	"github.com/owenthereal/upterm/cmd/upterm/command"
-	log "github.com/sirupsen/logrus"
 )
 
 func main() {
-	rootCmd := command.Root()
-	if err := rootCmd.Execute(); err != nil {
-		log.Fatal(err)
-	}
+	os.Exit(command.Main())
 }

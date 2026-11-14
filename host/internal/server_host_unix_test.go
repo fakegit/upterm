@@ -1,0 +1,915 @@
+//go:build !windows
+
+package internal
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	gssh "charm.land/ssh"
+	"github.com/olebedev/emitter"
+	"github.com/owenthereal/upterm/host/api"
+	"github.com/owenthereal/upterm/internal/termsize"
+	uio "github.com/owenthereal/upterm/io"
+	"github.com/owenthereal/upterm/upterm"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
+	"google.golang.org/grpc/test/bufconn"
+)
+
+// With --force-command, the host door reaches the original command; a guest
+// gets the forced one on its own pty with its queries unfiltered.
+func TestHostDoorAttachesToTheOriginalCommandUnderForceCommand(t *testing.T) {
+	h := startHost(t, &Server{
+		Command:      readsALine("ORIGINAL", 0),
+		ForceCommand: []string{"sh", "-c", `stty -echo -opost; printf 'FORCED\033[6n\n'; IFS= read -r line`},
+	})
+
+	in, out, _ := h.connectHost(t, &hostPty{term: "xterm", cols: 80, rows: 24})
+	got := readUntil(t, out, "ORIGINAL")
+	require.NotContains(t, got, "FORCED")
+
+	_, guestOut := h.connectGuest(t)
+	guestGot := readUntil(t, guestOut, "FORCED")
+	require.Contains(t, guestGot, "\x1b[6n", "a forced-command guest is the terminal for its own command; its queries must reach it")
+	require.NotContains(t, guestGot, "ORIGINAL")
+
+	_, err := io.WriteString(in, "from-host\n")
+	require.NoError(t, err)
+	readUntil(t, out, "got:from-host")
+}
+
+func TestHostDoorServesAViewerWithoutAPty(t *testing.T) {
+	h := startHost(t, &Server{Command: readsALine("VIEW", 0)})
+	in, out, _ := h.connectHost(t, nil)
+	readUntil(t, out, "VIEW")
+	// Input is still forwarded: a viewer is pty-less, not mute. This is what
+	// the functional tests drive the host through.
+	_, err := io.WriteString(in, "typed\n")
+	require.NoError(t, err)
+	readUntil(t, out, "got:typed")
+}
+
+func TestGuestDoorStillRequiresAPty(t *testing.T) {
+	h := startHost(t, &Server{Command: readsALine("X", 0)})
+	// connectGuest always requests a pty; open a bare session by hand.
+	raw, err := net.DialTimeout("tcp", h.addr, harnessTimeout)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	require.NoError(t, raw.SetDeadline(time.Now().Add(harnessTimeout)))
+	conn, chans, reqs, err := ssh.NewClientConn(raw, h.addr, &ssh.ClientConfig{
+		User: "guest", Auth: []ssh.AuthMethod{ssh.PublicKeys(h.guestSigner)}, HostKeyCallback: ssh.FixedHostKey(h.hostKey)})
+	require.NoError(t, err)
+	client := ssh.NewClient(conn, chans, reqs)
+	sess, err := client.NewSession()
+	require.NoError(t, err)
+	out, err := sess.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, sess.Shell())
+	// With no pty, the guest's ssh client leaves its terminal cooked, so a
+	// bare newline ends the line.
+	readUntil(t, out, "upterm: this session needs a terminal; run ssh without a command, or with -t.\n")
+	requireExitStatus(t, sess.Wait(), 1)
+}
+
+// When the session ends because the command exited, every shared-pty client
+// is closed with the command's status.
+func TestSharedPtyClientsReceiveTheCommandsExitStatus(t *testing.T) {
+	h := startHost(t, &Server{Command: readsALine("READY", 7)})
+	in, out, hostSess := h.connectHost(t, &hostPty{term: "xterm", cols: 80, rows: 24})
+	readUntil(t, out, "READY")
+	_, guestOut, guestSess := h.connectGuestSession(t)
+	readUntil(t, guestOut, "READY")
+
+	_, err := io.WriteString(in, "go\n")
+	require.NoError(t, err)
+
+	var exit *ssh.ExitError
+	require.ErrorAs(t, hostSess.Wait(), &exit)
+	require.Equal(t, 7, exit.ExitStatus(), "the host client must learn the command's status")
+
+	// Every shared-pty client, not just the one that typed: a guest watching
+	// the same command ends for the same reason and with the same status.
+	var guestExit *ssh.ExitError
+	require.ErrorAs(t, guestSess.Wait(), &guestExit)
+	require.Equal(t, 7, guestExit.ExitStatus(), "a guest on the shared pty must learn it too")
+}
+
+// Guests are never sent the session's end: it is for the session's own
+// terminals, the host's and attach's.
+func TestGuestsAreNeverSentTheCause(t *testing.T) {
+	h := startHost(t, &Server{Command: trapsHangupAndExits(0)})
+	guestConn, out, sess := h.connectGuestConn(t)
+	readUntil(t, out, "READY")
+
+	h.stopWith(t, ErrSessionStopped)
+
+	requireExitStatus(t, sess.Wait(), 1)
+	require.Empty(t, hostEnds(t, guestConn))
+}
+
+// A local client that never answers the session's end -- a terminal suspended
+// with ^Z -- is still sent its status, once the reply has had its bound. The
+// time since the stop takes in the command's teardown too, which has bounds of
+// its own -- the hangup's grace, and the wait for the command before the
+// session's clients are released -- so it can show that the reply was waited
+// for, but not for how long: the test below bounds that by the client's own
+// events.
+func TestAClientThatNeverRepliesDoesntHoldTheStatus(t *testing.T) {
+	h := startHost(t, &Server{Command: trapsHangupAndExits(0)})
+	conn, out, sess := h.connectHostConnIgnoringRequests(t, newHostPty(t))
+	readUntil(t, out, "READY")
+
+	start := time.Now()
+	h.stopWith(t, ErrSessionStopped)
+
+	requireExitStatus(t, sess.Wait(), 1)
+	require.GreaterOrEqual(t, time.Since(start), upterm.SessionEndReplyBound, "the status was sent without waiting for the reply")
+	require.Equal(t, []upterm.SessionEnd{{Cause: upterm.CauseStopped}}, hostEnds(t, conn))
+}
+
+// A client that never answers holds its status for the reply's bound and no
+// longer, from the session-end request it is sent to the status that follows
+// it, on a bubble's clock: the status is still unsent a moment before the
+// bound has passed, and sent the moment it has.
+func TestASilentClientHoldsItsStatusForTheReplyBoundAndNoLonger(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ln := bufconn.Listen(1 << 16)
+		log := &requestLog{ignore: true}
+		h := &sessionHandler{kind: kindHost, logger: discardLogger()}
+		sess := serveOneSessionOn(t, ln, ln.Dial, log, func(s gssh.Session) { h.exitWith(s, shutdownStopped.end(0), 1) })
+		ended := make(chan error, 1)
+		go func() { ended <- sess.Wait() }()
+
+		synctest.Wait()
+		require.Equal(t, []upterm.SessionEnd{{Cause: upterm.CauseStopped}}, hostEnds(t, log), "the client has the session-end request")
+		require.Empty(t, ended, "the status was sent without waiting for the reply")
+
+		time.Sleep(upterm.SessionEndReplyBound - time.Nanosecond)
+		synctest.Wait()
+		require.Empty(t, ended, "the status was sent before the reply had its bound")
+
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		require.Len(t, ended, 1, "the client held its status past the reply's bound")
+		requireExitStatus(t, <-ended, 1)
+	})
+}
+
+// A client that reaches the host door as the session ends is sent 1, and told
+// why, only when a shutdown overrode the session's status: a stop, a signal or
+// a cancellation. Otherwise it is sent 0 and no cause: one would say the
+// status was the command's, which it isn't, or name a join timeout whose
+// notice this client never saw.
+func TestALateHostClientIsToldWhyOnlyWhenAShutdownOverrodeItsStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cause error
+		code  int
+		ends  []upterm.SessionEnd
+	}{
+		{"the command ended", nil, 0, nil},
+		{"join timeout", ErrJoinTimeout, 0, nil},
+		{"stopped", ErrSessionStopped, 1, []upterm.SessionEnd{{Cause: upterm.CauseStopped}}},
+		{"signalled", testShutdownSignal(syscall.SIGTERM), 1, []upterm.SessionEnd{{Cause: upterm.CauseSignaled, Signal: "TERM"}}},
+		{"cancelled", context.Canceled, 1, []upterm.SessionEnd{{Cause: upterm.CauseCanceled}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var order endOrder
+			order.publish(tc.cause)
+			h := &sessionHandler{kind: kindHost, order: &order, logger: discardLogger()}
+			log, sess := serveOneSession(t, h.exitLate)
+
+			requireExitStatus(t, sess.Wait(), tc.code)
+			if tc.ends == nil {
+				require.Empty(t, hostEnds(t, log))
+			} else {
+				require.Equal(t, tc.ends, hostEnds(t, log))
+			}
+		})
+	}
+}
+
+// serveOneSession serves handler on a door of its own over loopback, opens a
+// session to it with a shell, and returns that session and the requestLog
+// answering its connection's global requests.
+func serveOneSession(t *testing.T, handler gssh.Handler) (*requestLog, *ssh.Session) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	dial := func() (net.Conn, error) { return net.DialTimeout("tcp", ln.Addr().String(), harnessTimeout) }
+	log := &requestLog{}
+	return log, serveOneSessionOn(t, ln, dial, log, handler)
+}
+
+// serveOneSessionOn is serveOneSession on ln, reached through dial, with log
+// answering the connection's global requests. On a bufconn listener made in a
+// synctest bubble, the door runs on the bubble's clock.
+func serveOneSessionOn(t *testing.T, ln net.Listener, dial func() (net.Conn, error), log *requestLog, handler gssh.Handler) *ssh.Session {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := ssh.NewSignerFromKey(key)
+	require.NoError(t, err)
+	srv := &gssh.Server{HostSigners: []gssh.Signer{signer}, Handler: handler}
+	served := make(chan struct{})
+	go func() { defer close(served); _ = srv.Serve(ln) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-served
+	})
+
+	raw, err := dial()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	require.NoError(t, raw.SetDeadline(time.Now().Add(harnessTimeout)))
+	conn, chans, reqs, err := ssh.NewClientConn(raw, ln.Addr().String(), &ssh.ClientConfig{
+		User: "host", HostKeyCallback: ssh.FixedHostKey(signer.PublicKey()),
+	})
+	require.NoError(t, err)
+	client := ssh.NewClient(conn, chans, log.serve(reqs))
+	t.Cleanup(func() { _ = client.Close() })
+	sess, err := client.NewSession()
+	require.NoError(t, err)
+	require.NoError(t, sess.Shell())
+	return sess
+}
+
+// requestLog is a client's own loop over the global requests its connection
+// receives, in place of x/crypto's, which refuses every one. It keeps each
+// session-end request and answers it, as a client that knows the request
+// does -- or, ignoring, never answers it, as a suspended one doesn't -- and
+// refuses everything else, as x/crypto would.
+type requestLog struct {
+	ignore bool
+
+	mu   sync.Mutex
+	ends []upterm.SessionEnd
+}
+
+// withRequestLog has l answer the connection's global requests.
+func withRequestLog(l *requestLog) dialOption {
+	return func(c *dialConfig) { c.requests = l }
+}
+
+// serve runs the loop over reqs, and returns what x/crypto's client is handed
+// in their place: a channel already closed, so that its own loop ends at once.
+func (l *requestLog) serve(reqs <-chan *ssh.Request) <-chan *ssh.Request {
+	go func() {
+		for req := range reqs {
+			if req.Type != upterm.SessionEndRequestType {
+				_ = req.Reply(false, nil)
+				continue
+			}
+			var end upterm.SessionEnd
+			if err := ssh.Unmarshal(req.Payload, &end); err != nil {
+				end = upterm.SessionEnd{Cause: "undecodable: " + err.Error()}
+			}
+			l.mu.Lock()
+			l.ends = append(l.ends, end)
+			l.mu.Unlock()
+			if !l.ignore {
+				_ = req.Reply(true, nil)
+			}
+		}
+	}()
+	none := make(chan *ssh.Request)
+	close(none)
+	return none
+}
+
+// hostEnds is every session-end request the connection was sent, in order.
+func hostEnds(t *testing.T, l *requestLog) []upterm.SessionEnd {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.ends)
+}
+
+// newHostPty is the terminal a local client attaches with.
+func newHostPty(t *testing.T) *hostPty {
+	t.Helper()
+	return &hostPty{term: "xterm", cols: 80, rows: 24}
+}
+
+// connectHostConn is connectHost with the connection's global requests
+// answered, and kept, by a requestLog.
+func (h *hostHarness) connectHostConn(t *testing.T, pty *hostPty) (*requestLog, io.Reader, *ssh.Session) {
+	t.Helper()
+	l := &requestLog{}
+	_, out, sess, _ := h.connectHostGated(t, pty, withRequestLog(l))
+	return l, out, sess
+}
+
+// connectHostConnIgnoringRequests is connectHostConn with the session-end
+// request read and never answered.
+func (h *hostHarness) connectHostConnIgnoringRequests(t *testing.T, pty *hostPty) (*requestLog, io.Reader, *ssh.Session) {
+	t.Helper()
+	l := &requestLog{ignore: true}
+	_, out, sess, _ := h.connectHostGated(t, pty, withRequestLog(l))
+	return l, out, sess
+}
+
+// connectGuestConn is connectGuestSession with the connection's global
+// requests answered, and kept, by a requestLog.
+func (h *hostHarness) connectGuestConn(t *testing.T) (*requestLog, io.Reader, *ssh.Session) {
+	t.Helper()
+	l := &requestLog{}
+	_, out, sess := h.connectGuestSession(t, withRequestLog(l))
+	return l, out, sess
+}
+
+// A connection is not a client. The host door authenticates a local process
+// that may never open a session, and a join announced for one of those would
+// sit in the client repo forever: nothing else ever deletes it.
+func TestHostDoorAnnouncesAClientOnlyWhenItOpensASession(t *testing.T) {
+	srv := &Server{Command: readsALine("S", 0)}
+	h := startHost(t, srv)
+	joined := srv.EventEmitter.On(upterm.EventClientJoined)
+	defer srv.EventEmitter.Off(upterm.EventClientJoined, joined)
+
+	client := h.dialHost(t)
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case evt := <-joined:
+		t.Fatalf("a connection that opened no session announced a client: %v", evt.Args[0])
+	default:
+	}
+
+	sess, err := client.NewSession()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sess.Close() })
+	require.NoError(t, sess.Shell())
+
+	select {
+	case evt := <-joined:
+		c := evt.Args[0].(*api.Client)
+		require.Equal(t, api.Client_HOST, c.Kind)
+	case <-time.After(harnessTimeout):
+		t.Fatal("no client-joined event once the connection opened a session")
+	}
+}
+
+func TestHostDoorUsesDistinctEventIDsForSessionsOnOneTransport(t *testing.T) {
+	srv := &Server{Command: []string{"sh", "-c", "while :; do sleep 1; done"}}
+	h := startHost(t, srv)
+	joined := srv.EventEmitter.On(upterm.EventClientJoined)
+	left := srv.EventEmitter.On(upterm.EventClientLeft)
+	client := h.dialHost(t)
+
+	open := func() (*ssh.Session, string) {
+		sess, err := client.NewSession()
+		require.NoError(t, err)
+		_, err = sess.StdinPipe() // keep the session open until Close
+		require.NoError(t, err)
+		require.NoError(t, sess.Shell())
+		select {
+		case evt := <-joined:
+			c := evt.Args[0].(*api.Client)
+			require.Equal(t, api.Client_HOST, c.Kind)
+			return sess, c.Id
+		case <-time.After(harnessTimeout):
+			t.Fatal("host session did not join")
+			return nil, ""
+		}
+	}
+	first, firstID := open()
+	_, secondID := open()
+	_, thirdID := open()
+	require.NotEqual(t, firstID, secondID)
+	require.NotEqual(t, secondID, thirdID)
+	require.NotEqual(t, firstID, thirdID)
+	_ = first.Close() // host sink cleanup closes this transport and all its channels
+	want := map[string]bool{firstID: true, secondID: true, thirdID: true}
+	for range 3 {
+		select {
+		case evt := <-left:
+			id := evt.Args[0].(string)
+			require.True(t, want[id], "unexpected or duplicate host departure %q", id)
+			delete(want, id)
+		case <-time.After(harnessTimeout):
+			t.Fatal("host session did not leave")
+		}
+	}
+	require.Empty(t, want)
+}
+
+func TestHostDoorReportsHostKind(t *testing.T) {
+	srv := &Server{Command: readsALine("K", 0)}
+	h := startHost(t, srv)
+	joined := srv.EventEmitter.On(upterm.EventClientJoined)
+	defer srv.EventEmitter.Off(upterm.EventClientJoined, joined)
+
+	_, out, _ := h.connectHost(t, nil)
+	readUntil(t, out, "K")
+
+	select {
+	case evt := <-joined:
+		c := evt.Args[0].(*api.Client)
+		require.Equal(t, api.Client_HOST, c.Kind)
+		require.Equal(t, "local", c.Addr)
+		require.Equal(t, upterm.AttachSSHClientVersion, c.Version)
+		require.NotEmpty(t, c.PublicKeyFingerprint)
+	case <-time.After(harnessTimeout):
+		t.Fatal("no client-joined event for the host client")
+	}
+}
+
+// A client of the host door can ask, as upterm attach does on a door, to be
+// shown a line of its own below the screen it attaches to: written after the
+// replay, which would scroll a line printed before attaching out of sight,
+// and as text alone. A guest's asking shows it nothing.
+func TestHostDoorShowsTheNoticeItsClientAsksFor(t *testing.T) {
+	h := startHost(t, &Server{Command: readsALine("READY", 0)})
+	// The command's first output is in the session's history before the
+	// client with the notice attaches, so its replay carries it.
+	_, viewer, _ := h.connectHost(t, nil)
+	readUntil(t, viewer, "READY")
+
+	sess, err := h.dialHost(t).NewSession()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sess.Close() })
+	require.NoError(t, sess.RequestPty("xterm", 24, 80, ssh.TerminalModes{}))
+	require.NoError(t, sess.Setenv(upterm.AttachInteractiveEnvVar, "1"))
+	require.NoError(t, sess.Setenv(upterm.AttachNoticeEnvVar, "upterm: this is home's door;\x1b[2J 'exit' closes it"))
+	// Held open, as attach holds it: a closed input would end this client.
+	_, err = sess.StdinPipe()
+	require.NoError(t, err)
+	out, err := sess.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, sess.Shell())
+	got := readUntil(t, out, "'exit' closes it\r\n")
+	require.Contains(t, got, "\r\nupterm: this is home's door;?[2J 'exit' closes it\r\n")
+	require.Less(t, strings.Index(got, "READY"), strings.Index(got, "upterm: this is home's door"), "below the screen the replay draws")
+
+	guest, err := h.guestClient(t).NewSession()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = guest.Close() })
+	require.NoError(t, guest.RequestPty("xterm", 24, 80, ssh.TerminalModes{}))
+	_ = guest.Setenv(upterm.AttachNoticeEnvVar, "upterm: a guest's notice")
+	guestIn, err := guest.StdinPipe()
+	require.NoError(t, err)
+	guestOut, err := guest.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, guest.Shell())
+	readUntil(t, guestOut, "READY")
+	_, err = io.WriteString(guestIn, "typed\n")
+	require.NoError(t, err)
+	require.NotContains(t, readUntil(t, guestOut, "got:typed"), "a guest's notice")
+}
+
+// The notice is written after the repaint its client's attach asks the
+// command for, not ahead of it, where the repaint draws over it at once: a
+// full-screen program redraws on that nudge, and so does a shell such as zsh,
+// redrawing its prompt. This command clears the screen and redraws on every
+// SIGWINCH.
+func TestHostDoorShowsTheNoticeAfterTheRepaintItsAttachAsksFor(t *testing.T) {
+	const notice = "upterm: this is home's door; 'exit' closes it"
+	const repaint = "\x1b[H\x1b[2JREPAINTED"
+	ready := filepath.Join(t.TempDir(), "ready")
+	started := make(chan struct{})
+	h := startHost(t, &Server{
+		// However long the repaint takes, it is waited for: this is about
+		// the order, and the cap is for a command that doesn't repaint.
+		timing: serverTiming{noticeCap: time.Hour},
+		// A shell runs a trap between foreground commands, hence the short
+		// sleeps; ready says the trap is set.
+		Command:          []string{"sh", "-c", `trap 'printf "\033[H\033[2JREPAINTED"' WINCH; : > "$1"; while :; do sleep 0.05; done`, "sh", ready},
+		OnCommandStarted: func() { close(started) },
+	})
+	// The nudge reaches the command once its pty is published, and is
+	// answered once its trap is set.
+	select {
+	case <-started:
+	case <-time.After(harnessTimeout):
+		t.Fatal("the command never started")
+	}
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(ready)
+		return err == nil
+	}, harnessTimeout, time.Millisecond, "the command never set its trap")
+
+	sess, err := h.dialHost(t).NewSession()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sess.Close() })
+	// The size the command opened at, with no terminal attached to give it
+	// one: a resize would be a SIGWINCH of its own, and the attach's nudge is
+	// to be the only one.
+	require.NoError(t, sess.RequestPty("xterm", termsize.Default.Rows, termsize.Default.Cols, ssh.TerminalModes{}))
+	require.NoError(t, sess.Setenv(upterm.AttachInteractiveEnvVar, "1"))
+	require.NoError(t, sess.Setenv(upterm.AttachNoticeEnvVar, notice))
+	_, err = sess.StdinPipe()
+	require.NoError(t, err)
+	out, err := sess.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, sess.Shell())
+	got := readUntil(t, out, "\r\n"+notice+"\r\n")
+	require.Contains(t, got[:strings.Index(got, "\r\n"+notice)], repaint, "the notice came ahead of the repaint, which draws over it")
+}
+
+func TestHostDoorIgnoresReadOnly(t *testing.T) {
+	h := startHost(t, &Server{Command: readsALine("RO", 0), ReadOnly: true})
+	in, out, _ := h.connectHost(t, &hostPty{term: "xterm", cols: 80, rows: 24})
+	readUntil(t, out, "RO")
+	_, guestOut := h.connectGuest(t)
+	readUntil(t, guestOut, "\r\nupterm: this session is read-only; what you type isn't sent.\r\n\r\n")
+
+	_, err := io.WriteString(in, "host-types\n")
+	require.NoError(t, err)
+	readUntil(t, out, "got:host-types")
+}
+
+// A read-only session's own commands for a guest's shell -- a login or a
+// forced command -- are watched as its shared terminal is: the guest is told,
+// before any output, that its typing isn't sent, and what it types is read
+// and dropped, never left to fill the channel. Without a terminal the notice
+// goes to stderr, out of the command's output.
+func TestReadOnlyPrivateCommandsDropInput(t *testing.T) {
+	const notice = "upterm: this session is read-only; what you type isn't sent.\r\n"
+	for _, mode := range []string{"login", "forced"} {
+		for _, pty := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s pty=%v", mode, pty), func(t *testing.T) {
+				done := filepath.Join(t.TempDir(), "done")
+				argv := []string{"sh", "-c", `printf READY; while [ ! -e "$1" ]; do sleep 0.05; done; printf DONE`, "sh", done}
+				srv := &Server{Command: readsALine("HOST", 0), ReadOnly: true}
+				if mode == "login" {
+					srv.LoginCommand = argv
+				} else {
+					srv.ForceCommand = argv
+				}
+				h := startHost(t, srv)
+				var in io.Writer
+				var out io.Reader
+				var stderr recordingWriter
+				var piped *ssh.Session
+				if pty {
+					in, out = h.connectGuest(t)
+				} else {
+					piped = execSession(t, h.guestClient(t), false)
+					piped.Stderr = &stderr
+					var err error
+					in, err = piped.StdinPipe()
+					require.NoError(t, err)
+					out, err = piped.StdoutPipe()
+					require.NoError(t, err)
+					require.NoError(t, piped.Shell())
+				}
+				// One read up to READY: a read for the notice alone could take the
+				// command's output with it. With a terminal the notice comes
+				// first, on the same stream, and nothing else comes before READY.
+				seen := readUntil(t, out, "READY")
+				if pty {
+					require.Equal(t, "\r\n"+notice+"\r\n"+"READY", seen)
+				}
+				// More than a channel's window: only a host that reads it takes
+				// it all, and the terminal would echo any of it the command got.
+				typed := make(chan error, 1)
+				go func() { _, err := in.Write(bytes.Repeat([]byte("x"), 4<<20)); typed <- err }()
+				select {
+				case err := <-typed:
+					require.NoError(t, err)
+				case <-time.After(harnessTimeout):
+					t.Fatal("the guest's input was never read")
+				}
+				require.NoError(t, os.WriteFile(done, nil, 0o600))
+				require.NotContains(t, readUntil(t, out, "DONE"), "x")
+				if !pty {
+					// x/crypto copies stderr on a goroutine of its own; Wait is
+					// what says that copy has finished.
+					require.NoError(t, piped.Wait())
+					require.Equal(t, notice, string(stderr.bytes()))
+				}
+			})
+		}
+	}
+}
+
+// The host door failing at runtime does not end the session.
+func TestHostDoorFailureDoesNotEndTheSession(t *testing.T) {
+	h := startHost(t, &Server{Command: readsALine("UP", 0)})
+	_, out, _ := h.connectHost(t, nil)
+	readUntil(t, out, "UP")
+
+	require.NoError(t, h.hostListener.Close())
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case err := <-h.done:
+		t.Fatalf("the session ended when the attach listener failed: %v", err)
+	default:
+	}
+	_, guestOut := h.connectGuest(t)
+	readUntil(t, guestOut, "UP")
+}
+
+// A host client leaving is not the session ending. The command keeps its pty
+// and a guest keeps its output.
+func TestHostClientLeavingDoesNotEndTheSession(t *testing.T) {
+	h := startHost(t, &Server{Command: []string{"sh", "-c",
+		`stty -echo -opost; printf 'READY\n'; IFS= read -r line; sleep 0.5; printf 'ALIVE\n'; IFS= read -r line`}})
+	hostIn, hostOut, hostSess := h.connectHost(t, &hostPty{term: "xterm", cols: 80, rows: 24})
+	readUntil(t, hostOut, "READY")
+	_, guestOut := h.connectGuest(t)
+	readUntil(t, guestOut, "READY")
+
+	_, err := io.WriteString(hostIn, "go\n")
+	require.NoError(t, err)
+	require.NoError(t, hostSess.Close())
+
+	readUntil(t, guestOut, "ALIVE")
+	select {
+	case err := <-h.done:
+		t.Fatalf("the session ended when its host client left: %v", err)
+	default:
+	}
+}
+
+// An output-only viewer that never reads is dropped, and nothing else notices.
+//
+// 6 MB, because the drop has to be the host's doing rather than the harness's:
+// 3 MB fits inside the client's SSH channel window (2 MiB) plus the secondary
+// sink's buffer (1 MiB) and never overflows, so the viewer stayed connected
+// and only the harness's own read deadline ended the wait.
+func TestUndrainedViewerDoesNotWedgeTheSession(t *testing.T) {
+	h := startHost(t, &Server{Command: []string{"sh", "-c",
+		`stty -echo -opost; printf 'READY\n'; IFS= read -r line; yes | head -c 6000000; printf 'DONE\n'; IFS= read -r line`}})
+	// Both connections outlive the harness's default deadline on purpose. Six
+	// megabytes takes a loaded runner longer than ten seconds, and a deadline
+	// firing here would not fail an assertion honestly: on the guest it ends
+	// the stream this test is reading, and on the viewer it produces exactly
+	// the error the test takes as proof that the host dropped it.
+	_, viewerOut, viewerSess := h.connectHost(t, nil, withDialDeadline(60*time.Second))
+	readUntil(t, viewerOut, "READY")
+	// The viewer reads nothing more.
+	guestIn, guestOut := h.connectGuest(t, withDialDeadline(60*time.Second))
+	readUntil(t, guestOut, "READY")
+	_, err := io.WriteString(guestIn, "go\n")
+	require.NoError(t, err)
+	// On the same budget as the connections, and for the reason they are: the
+	// payload is what this read is waiting behind.
+	readUntilWithin(t, guestOut, "DONE", 60*time.Second)
+
+	waited := make(chan error, 1)
+	go func() { waited <- viewerSess.Wait() }()
+	select {
+	case err := <-waited:
+		require.Error(t, err, "the undrained viewer is disconnected, not left holding the fan-out")
+	case <-time.After(harnessTimeout):
+		t.Fatal("the undrained viewer was neither dropped nor drained")
+	}
+}
+
+// A terminal leaving restores the size for the terminals that remain, over a
+// real door rather than through the event handler alone.
+//
+// This is the end-to-end shape its unit twin in event_test.go had to stand in
+// for, and it is here because what made it unreliable is now fixed: charm
+// closes a session's window-change channel when its request loop ends, and
+// the handler's loop read that closed channel as an endless run of 0x0
+// resizes. One landing after the departing client's own detach re-added a
+// terminal nothing would ever remove, pinning the minimum to nothing for the
+// rest of the session — the survivor read "0 0" instead of its own size,
+// seven times in fifteen runs before the fix.
+func TestASmallerTerminalLeavingRestoresTheSizeOverTheDoor(t *testing.T) {
+	// SIGWINCH is the nudge that makes the command speak: every attach sends
+	// one through Redraw, and so does every resize. A short sleep loop rather
+	// than one long sleep, because a shell runs a trap between foreground
+	// commands rather than interrupting one already running.
+	h := startHost(t, &Server{AwaitInitialClient: true,
+		Command: []string{"sh", "-c", `stty -echo -opost; trap 'stty size' WINCH; printf 'READY\n'; while :; do sleep 0.1; done`}})
+
+	_, aOut, _ := h.connectHost(t, &hostPty{term: "xterm", cols: 100, rows: 30})
+	readUntil(t, aOut, "READY")
+
+	// The smaller terminal takes the session down to its own size: the pty is
+	// sized to the smallest terminal watching it.
+	_, bOut, bSess := h.connectHost(t, &hostPty{term: "xterm", cols: 80, rows: 24})
+	readUntil(t, bOut, "READY")
+	readUntil(t, aOut, "24 80")
+
+	// And leaving gives it back. B's output is drained from here on, so its
+	// handler winds down instead of parking on a write nobody is reading.
+	go func() { _, _ = io.Copy(io.Discard, bOut) }()
+	require.NoError(t, bSess.Close())
+	readUntil(t, aOut, "30 100")
+}
+
+// A guest counts towards the minimum from the size it arrives with, not from
+// its first resize. The only geometry an SSH client sends is in its pty
+// request, until somebody drags a window.
+//
+// Written to check a suspicion that it did not — and it does, from two
+// places now: the registration in the handler, and charm seeding a session's
+// window channel with the pty request's own window, which the window-change
+// loop then reads. Kept because neither of those is this package's to
+// guarantee: the first is one line in a handler that has been rearranged
+// twice this month, and the second is a charm implementation detail that an
+// upgrade could take away without saying so.
+func TestAGuestsArrivingSizeConstrainsTheSession(t *testing.T) {
+	h := startHost(t, &Server{AwaitInitialClient: true,
+		Command: []string{"sh", "-c", `stty -echo -opost; trap 'stty size' WINCH; printf 'READY\n'; while :; do sleep 0.1; done`}})
+
+	_, aOut, _ := h.connectHost(t, &hostPty{term: "xterm", cols: 100, rows: 30})
+	readUntil(t, aOut, "READY")
+
+	// The harness's guest asks for 80x24 and never resizes.
+	_, gOut := h.connectGuest(t)
+	readUntil(t, gOut, "READY")
+	readUntil(t, aOut, "24 80")
+}
+
+// fakeSignalSession is the whole of gssh.Session HandleSession's WINCH path
+// touches, on either door: Close, Context, Exit, Pty, PublicKey, Environ,
+// SendRequest, Signals, and the Read and Write of the embedded channel. Read
+// blocks until release is closed, so the handler's actors stay up long enough
+// for a test to drive them; the rest is nil, as fakeGuestSession's comment
+// (handle_session_test.go) explains for its own smaller set.
+type fakeSignalSession struct {
+	gssh.Session
+
+	ctx     fakeHostContext
+	winCh   chan gssh.Window
+	out     io.Writer
+	key     gssh.PublicKey
+	release chan struct{}
+
+	mu         sync.Mutex
+	sigCh      chan<- gssh.Signal
+	registered chan struct{}
+}
+
+func newFakeSignalSession(sessionID string, key gssh.PublicKey) *fakeSignalSession {
+	return &fakeSignalSession{
+		ctx:        fakeHostContext{sessionID: sessionID},
+		winCh:      make(chan gssh.Window),
+		out:        io.Discard,
+		key:        key,
+		release:    make(chan struct{}),
+		registered: make(chan struct{}),
+	}
+}
+
+func (f *fakeSignalSession) Read([]byte) (int, error) { <-f.release; return 0, io.EOF }
+func (f *fakeSignalSession) Write(p []byte) (int, error) {
+	return f.out.Write(p)
+}
+func (f *fakeSignalSession) Close() error          { return nil }
+func (f *fakeSignalSession) Exit(int) error        { return nil }
+func (f *fakeSignalSession) Context() gssh.Context { return f.ctx }
+func (f *fakeSignalSession) Pty() (gssh.Pty, <-chan gssh.Window, bool) {
+	return gssh.Pty{Term: "xterm"}, f.winCh, true
+}
+func (f *fakeSignalSession) Environ() []string         { return nil }
+func (f *fakeSignalSession) PublicKey() gssh.PublicKey { return f.key }
+func (f *fakeSignalSession) SendRequest(string, bool, []byte) (bool, error) {
+	return true, nil
+}
+
+// Signals is what the host door's WINCH actor registers with. Registering
+// closes registered, so a test can wait for the actor to be listening before
+// it delivers anything.
+func (f *fakeSignalSession) Signals(c chan<- gssh.Signal) {
+	f.mu.Lock()
+	f.sigCh = c
+	f.mu.Unlock()
+	close(f.registered)
+}
+
+// signal delivers sig as the client's signal request would. Only valid after
+// registered has closed.
+func (f *fakeSignalSession) signal(sig gssh.Signal) {
+	f.mu.Lock()
+	c := f.sigCh
+	f.mu.Unlock()
+	c <- sig
+}
+
+// fakeHostContext supplies what HandleSession's host-door path asks of a
+// session's context beyond the session ID fakeGuestContext (handle_session_
+// test.go) already covers: Err, for the liveness check terminalWindows.changed
+// makes, Done, for the departure of a client with a terminal to wait on (this
+// one never goes, and a nil Done is never closed), and ClientVersion, for the
+// host client-joined event.
+type fakeHostContext struct {
+	gssh.Context
+	sessionID string
+}
+
+func (c fakeHostContext) Value(key any) any {
+	if key == gssh.ContextKeySessionID {
+		return c.sessionID
+	}
+	return nil
+}
+func (c fakeHostContext) Done() <-chan struct{} { return nil }
+func (c fakeHostContext) Err() error            { return nil }
+func (c fakeHostContext) ClientVersion() string { return "test" }
+
+// A WINCH signal request on the host door is a redraw nudge and nothing
+// else: no geometry changes, so a pinned session is nudged like any other.
+func TestHostDoor_WinchSignalNudgesThePty(t *testing.T) {
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := ssh.NewSignerFromKey(edKey)
+	require.NoError(t, err)
+
+	ptmx := &exitedPTY{}
+	sess := newFakeSignalSession(t.Name(), signer.PublicKey())
+
+	h := &sessionHandler{
+		kind:              kindHost,
+		ptmx:              ptmx,
+		writers:           uio.NewMultiWriter(uio.DefaultReplayBytes),
+		eventEmmiter:      emitter.New(1),
+		terminals:         newTerminalWindows(discardLogger()),
+		keepAliveDuration: time.Hour,
+		ctx:               context.Background(),
+		logger:            discardLogger(),
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); h.HandleSession(sess) }()
+
+	select {
+	case <-sess.registered:
+	case <-time.After(harnessTimeout):
+		t.Fatal("the host door never registered a signal channel")
+	}
+	require.Equal(t, 1, ptmx.redrawCount(), "the arrival nudge")
+
+	sess.signal(gssh.Signal("WINCH"))
+
+	deadline := time.Now().Add(harnessTimeout)
+	for ptmx.redrawCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, 2, ptmx.redrawCount(), "a WINCH signal request must nudge the pty")
+
+	// A second signal, proving the actor drains continuously rather than
+	// reading one and returning: a one-shot reader would leave this at 2
+	// forever, since nothing would be left to receive it.
+	sess.signal(gssh.Signal("WINCH"))
+	deadline = time.Now().Add(harnessTimeout)
+	for ptmx.redrawCount() < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, 3, ptmx.redrawCount(), "the actor must keep draining signals, not read one and stop")
+
+	close(sess.release)
+	select {
+	case <-done:
+	case <-time.After(harnessTimeout):
+		t.Fatal("HandleSession did not return")
+	}
+}
+
+// A guest cannot make the host's command repaint. The door registers no
+// signal channel at all, so charm buffers and drops it.
+func TestGuestDoor_WinchSignalIsIgnored(t *testing.T) {
+	ptmx := &exitedPTY{}
+	sess := newFakeSignalSession(t.Name(), nil)
+
+	h := &sessionHandler{
+		kind:              kindGuest,
+		ptmx:              ptmx,
+		writers:           uio.NewMultiWriter(uio.DefaultReplayBytes),
+		eventEmmiter:      emitter.New(1),
+		terminals:         newTerminalWindows(discardLogger()),
+		keepAliveDuration: time.Hour,
+		ctx:               context.Background(),
+		logger:            discardLogger(),
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); h.HandleSession(sess) }()
+
+	// What is under test is an absence -- sess.registered never closes -- so
+	// there is nothing to poll for; a flat wait is what that looks like.
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, 1, ptmx.redrawCount(), "the arrival nudge, and nothing past it")
+	select {
+	case <-sess.registered:
+		t.Fatal("a guest session must never register a signal channel")
+	default:
+	}
+
+	close(sess.release)
+	select {
+	case <-done:
+	case <-time.After(harnessTimeout):
+		t.Fatal("HandleSession did not return")
+	}
+}
